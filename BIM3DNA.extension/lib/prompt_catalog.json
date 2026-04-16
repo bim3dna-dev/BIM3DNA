@@ -1,0 +1,1159 @@
+[
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-doors",
+    "mode": "deterministic",
+    "prompt_text": "delete all doors",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all doors"
+  },
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-columns",
+    "mode": "deterministic",
+    "prompt_text": "delete all columns",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all columns"
+  },
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-walls",
+    "mode": "deterministic",
+    "prompt_text": "delete all walls",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all walls"
+  },
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-ceilings",
+    "mode": "deterministic",
+    "prompt_text": "delete all ceilings",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all ceilings"
+  },
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-roofs",
+    "mode": "deterministic",
+    "prompt_text": "delete all roofs",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all roofs"
+  },
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-ducts",
+    "mode": "deterministic",
+    "prompt_text": "delete all ducts",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all ducts"
+  },
+  {
+    "category": "Delete",
+    "enabled": true,
+    "id": "delete-all-lights",
+    "mode": "deterministic",
+    "prompt_text": "delete all lights",
+    "risk_level": "high",
+    "role": "modify",
+    "title": "Delete all lights"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-rebars",
+    "mode": "deterministic",
+    "prompt_text": "count rebars",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count rebars"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-columns",
+    "mode": "deterministic",
+    "prompt_text": "count columns",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count columns"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-walls",
+    "mode": "deterministic",
+    "prompt_text": "count walls",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count walls"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-floors",
+    "mode": "deterministic",
+    "prompt_text": "count floors",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count floors"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-ceilings",
+    "mode": "deterministic",
+    "prompt_text": "count ceilings",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count ceilings"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-roofs",
+    "mode": "deterministic",
+    "prompt_text": "count roofs",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count roofs"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-ducts",
+    "mode": "deterministic",
+    "prompt_text": "count ducts",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count ducts"
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-selected-ducts",
+    "mode": "deterministic",
+    "prompt_text": "count selected ducts",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count selected ducts",
+    "discipline": "HVAC / Ducting",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "count selected ducts",
+      "how many ducts are selected",
+      "how many selected ducts"
+    ],
+    "deterministic_handler": "count_selected_ducts",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-ducts-active-view",
+    "mode": "deterministic",
+    "prompt_text": "count ducts in active view",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count ducts in active view",
+    "discipline": "HVAC / Ducting",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "count ducts in active view",
+      "count all ducts in active view"
+    ],
+    "deterministic_handler": "count_ducts_in_active_view",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Count",
+    "enabled": true,
+    "id": "count-lights",
+    "mode": "deterministic",
+    "prompt_text": "count lights",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count lights"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "count-all-sheets",
+    "mode": "deterministic",
+    "prompt_text": "count all sheets",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count all sheets"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "count-all-views",
+    "mode": "deterministic",
+    "prompt_text": "count all views",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count all views"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "health-check",
+    "mode": "deterministic",
+    "prompt_text": "health check",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Health check summary"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "report-parameters",
+    "mode": "deterministic",
+    "prompt_text": "report parameters",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Report parameters of selection"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "report-phases",
+    "mode": "deterministic",
+    "prompt_text": "report phases",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Report phases of selection"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "export-schedule-names",
+    "mode": "deterministic",
+    "prompt_text": "export schedule names",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Export schedule names"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "export-all-schedule-data",
+    "mode": "deterministic",
+    "prompt_text": "export all schedule data",
+    "risk_level": "medium",
+    "role": "read",
+    "title": "Export all schedule data"
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "find-unconnected-fittings",
+    "mode": "deterministic",
+    "prompt_text": "find unconnected duct fittings",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Find unconnected duct fittings",
+    "discipline": "HVAC / Ducting",
+    "scope_type": "project",
+    "planner_aliases": [
+      "find unconnected duct fittings",
+      "find disconnected duct fittings",
+      "find unconnected fittings",
+      "disconnected duct fittings"
+    ],
+    "deterministic_handler": "find_unconnected_duct_fittings",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Reports",
+    "enabled": true,
+    "id": "report-elements-without-system-assignment",
+    "mode": "deterministic",
+    "prompt_text": "report elements without system assignment",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Report elements without system assignment"
+  },
+  {
+    "category": "Lists",
+    "enabled": true,
+    "id": "list-all-phases",
+    "mode": "deterministic",
+    "prompt_text": "list all phases",
+    "risk_level": "low",
+    "role": "read",
+    "title": "List all phases"
+  },
+  {
+    "category": "Lists",
+    "enabled": true,
+    "id": "list-all-sheets",
+    "mode": "deterministic",
+    "prompt_text": "list all sheets",
+    "risk_level": "low",
+    "role": "read",
+    "title": "List all sheets"
+  },
+  {
+    "category": "Lists",
+    "enabled": true,
+    "id": "list-all-views",
+    "mode": "deterministic",
+    "prompt_text": "list all views",
+    "risk_level": "low",
+    "role": "read",
+    "title": "List all views"
+  },
+  {
+    "category": "Lists",
+    "enabled": true,
+    "id": "list-all-families",
+    "mode": "deterministic",
+    "prompt_text": "list all families",
+    "risk_level": "low",
+    "role": "read",
+    "title": "List all families"
+  },
+  {
+    "category": "Lists",
+    "enabled": true,
+    "id": "list-all-levels",
+    "mode": "deterministic",
+    "prompt_text": "list all levels",
+    "risk_level": "low",
+    "role": "read",
+    "title": "List all levels"
+  },
+  {
+    "category": "Lists",
+    "enabled": true,
+    "id": "list-ducts-active-view",
+    "mode": "deterministic",
+    "prompt_text": "list ducts in active view",
+    "risk_level": "low",
+    "role": "read",
+    "title": "List ducts in active view",
+    "discipline": "HVAC / Ducting",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "list ducts in active view",
+      "list all ducts in active view"
+    ],
+    "deterministic_handler": "list_ducts_in_active_view",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-wall",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff wall",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff wall"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-floor",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff floor",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff floor"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-columns",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff columns",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff columns"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-beams",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff beams",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff beams"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-roofs",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff roofs",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff roofs"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-stairs",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff stairs",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff stairs"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-curtain-panel",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff curtain panel",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff curtain panel"
+  },
+  {
+    "category": "Materials",
+    "enabled": true,
+    "id": "material-takeoff-rebar",
+    "mode": "deterministic",
+    "prompt_text": "material takeoff rebar",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Material takeoff rebar"
+  },
+  {
+    "category": "Tags / Tools",
+    "enabled": true,
+    "id": "tag-selection",
+    "mode": "deterministic",
+    "prompt_text": "tag selection",
+    "risk_level": "medium",
+    "role": "modify",
+    "title": "Tag selection"
+  },
+  {
+    "category": "Tags / Tools",
+    "enabled": true,
+    "id": "super-select",
+    "mode": "deterministic",
+    "prompt_text": "super-select walls, columns, beams",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Super-select sample categories"
+  },
+  {
+    "category": "Tags / Tools",
+    "enabled": true,
+    "id": "count-loaded-families",
+    "mode": "deterministic",
+    "prompt_text": "count loaded families",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Count loaded families"
+  },
+  {
+    "category": "Tags / Tools",
+    "enabled": true,
+    "id": "create-sheet-reviewed-template",
+    "mode": "generative",
+    "prompt_text": "create sheet",
+    "risk_level": "medium",
+    "role": "modify",
+    "title": "Create sheet",
+    "discipline": "QA / BIM",
+    "scope_type": "project",
+    "planner_aliases": [
+      "create a sheet",
+      "create sheet",
+      "make a sheet"
+    ],
+    "deterministic_handler": "create_sheet_reviewed_template",
+    "requires_confirmation": true
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-columns",
+    "mode": "deterministic",
+    "prompt_text": "select all columns",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all columns"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-walls",
+    "mode": "deterministic",
+    "prompt_text": "select all walls",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all walls"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-floors",
+    "mode": "deterministic",
+    "prompt_text": "select all floors",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all floors"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-ceilings",
+    "mode": "deterministic",
+    "prompt_text": "select all ceilings",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all ceilings"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-roofs",
+    "mode": "deterministic",
+    "prompt_text": "select all roofs",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all roofs"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-beams",
+    "mode": "deterministic",
+    "prompt_text": "select all beams",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all beams"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-foundations",
+    "mode": "deterministic",
+    "prompt_text": "select all foundations",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all foundations"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-rebars",
+    "mode": "deterministic",
+    "prompt_text": "select all rebars",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all rebars"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-windows",
+    "mode": "deterministic",
+    "prompt_text": "select all windows",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all windows"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-doors",
+    "mode": "deterministic",
+    "prompt_text": "select all doors",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all doors"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-ducts",
+    "mode": "deterministic",
+    "prompt_text": "select all ducts",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all ducts",
+    "discipline": "HVAC / Ducting",
+    "scope_type": "project",
+    "planner_aliases": [
+      "select ducts",
+      "select all ducts"
+    ],
+    "deterministic_handler": "select_all_ducts",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-pipes",
+    "mode": "deterministic",
+    "prompt_text": "select all pipes",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all pipes",
+    "discipline": "Piping",
+    "scope_type": "project",
+    "planner_aliases": [
+      "select pipes",
+      "select all pipes"
+    ],
+    "deterministic_handler": "select_all_pipes",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-lights",
+    "mode": "deterministic",
+    "prompt_text": "select all lights",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all lights"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-electrical-equipment",
+    "mode": "deterministic",
+    "prompt_text": "select all electrical equipment",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all electrical equipment"
+  },
+  {
+    "category": "Select All",
+    "enabled": true,
+    "id": "select-all-cable-trays",
+    "mode": "deterministic",
+    "prompt_text": "select all cable trays",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Select all cable trays"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-structural-volume",
+    "mode": "deterministic",
+    "prompt_text": "total structural volume",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total structural volume"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-room-area",
+    "mode": "deterministic",
+    "prompt_text": "total room area",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total room area"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-duct-length",
+    "mode": "deterministic",
+    "prompt_text": "total duct length",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total duct length"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "report-selected-duct-volume-cubic-meters",
+    "mode": "deterministic",
+    "prompt_text": "report total selected duct volume in cubic meters",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Report total selected duct volume in cubic meters",
+    "discipline": "HVAC / Ducting",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "volume of selected ducts",
+      "total selected duct volume in m3",
+      "total selected duct volume in cubic meters",
+      "selected duct volume",
+      "selected duct volume in cubic meters"
+    ],
+    "deterministic_handler": "report_total_selected_duct_volume_cubic_meters",
+    "requires_confirmation": false
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-pipe-length",
+    "mode": "deterministic",
+    "prompt_text": "total pipe length",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total pipe length"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-cable-tray-length",
+    "mode": "deterministic",
+    "prompt_text": "total cable tray length",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total cable tray length"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-ceiling-area-volume",
+    "mode": "deterministic",
+    "prompt_text": "total ceiling area and volume",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total ceiling area and volume"
+  },
+  {
+    "category": "Totals",
+    "enabled": true,
+    "id": "total-roof-area-volume",
+    "mode": "deterministic",
+    "prompt_text": "total roof area and volume",
+    "risk_level": "low",
+    "role": "read",
+    "title": "Total roof area and volume"
+  },
+  {
+    "category": "Clash Check",
+    "enabled": true,
+    "id": "clash-check",
+    "mode": "deterministic",
+    "prompt_text": "clash check",
+    "risk_level": "medium",
+    "role": "read",
+    "title": "Clash check walls vs columns"
+  },
+  {
+    "category": "Clash Check",
+    "enabled": true,
+    "id": "clash-check-walls-columns",
+    "mode": "deterministic",
+    "prompt_text": "clash check walls columns",
+    "risk_level": "medium",
+    "role": "read",
+    "title": "Clash check walls vs columns"
+  },
+  {
+    "category": "Clash Check",
+    "enabled": true,
+    "id": "clash-check-ducts-beams",
+    "mode": "deterministic",
+    "prompt_text": "clash check ducts beams",
+    "risk_level": "medium",
+    "role": "read",
+    "title": "Clash check ducts vs beams"
+  },
+  {
+    "id": "report-selected-duct-length",
+    "title": "Report total selected duct length",
+    "category": "Totals",
+    "discipline": "HVAC / Ducting",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "report total selected duct length",
+      "total selected duct length",
+      "length of selected ducts",
+      "duct length",
+      "total duct length"
+    ],
+    "deterministic_handler": "report_total_selected_duct_length",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "report total selected duct length",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-ducts-without-system-assignment",
+    "title": "Report ducts without system assignment",
+    "category": "Reports",
+    "discipline": "HVAC / Ducting",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "project",
+    "planner_aliases": [
+      "report ducts without system assignment",
+      "ducts without system assignment",
+      "ducts without system info",
+      "ducts without system"
+    ],
+    "deterministic_handler": "report_ducts_without_system_assignment",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "report ducts without system assignment",
+    "mode": "deterministic"
+  },
+  {
+    "id": "count-selected-pipes",
+    "title": "Count selected pipes",
+    "category": "Count",
+    "discipline": "Piping",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "count selected pipes",
+      "how many pipes are selected"
+    ],
+    "deterministic_handler": "count_selected_pipes",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "count selected pipes",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-selected-pipe-length",
+    "title": "Report total selected pipe length",
+    "category": "Totals",
+    "discipline": "Piping",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "report total selected pipe length",
+      "total selected pipe length",
+      "length of selected pipes",
+      "pipe length"
+    ],
+    "deterministic_handler": "report_total_selected_pipe_length",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "report total selected pipe length",
+    "mode": "deterministic"
+  },
+  {
+    "id": "find-unconnected-pipe-fittings",
+    "title": "Find unconnected pipe fittings",
+    "category": "Reports",
+    "discipline": "Piping",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "project",
+    "planner_aliases": [
+      "find unconnected pipe fittings",
+      "find disconnected pipe fittings",
+      "disconnected pipe fittings"
+    ],
+    "deterministic_handler": "find_unconnected_pipe_fittings",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "find unconnected pipe fittings",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-pipes-without-system-assignment",
+    "title": "Report pipes without system assignment",
+    "category": "Reports",
+    "discipline": "Piping",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "project",
+    "planner_aliases": [
+      "report pipes without system assignment",
+      "pipes without system assignment",
+      "pipes without system"
+    ],
+    "deterministic_handler": "report_pipes_without_system_assignment",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "report pipes without system assignment",
+    "mode": "deterministic"
+  },
+  {
+    "id": "select-all-electrical-fixtures-active-view",
+    "title": "Select all electrical fixtures in active view",
+    "category": "Select All",
+    "discipline": "Electrical",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "select all electrical fixtures in active view",
+      "select electrical fixtures in active view"
+    ],
+    "deterministic_handler": "select_all_electrical_fixtures_in_active_view",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "select all electrical fixtures in active view",
+    "mode": "deterministic"
+  },
+  {
+    "id": "count-selected-fixtures-devices",
+    "title": "Count selected electrical fixtures/devices",
+    "category": "Count",
+    "discipline": "Electrical",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "count selected fixtures",
+      "count selected devices",
+      "count selected fixtures devices",
+      "count selected electrical fixtures/devices"
+    ],
+    "deterministic_handler": "count_selected_fixtures_devices",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "count selected fixtures/devices",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-devices-without-circuit-info",
+    "title": "Report devices/fixtures without circuit or system assignment",
+    "category": "Reports",
+    "discipline": "Electrical",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "report devices without circuit info",
+      "devices without circuit info",
+      "devices without system info",
+      "fixtures without circuit",
+      "devices without system",
+      "fixtures without system"
+    ],
+    "deterministic_handler": "report_devices_without_circuit_info",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "report devices without circuit/system info",
+    "mode": "deterministic"
+  },
+  {
+    "id": "list-fixtures-by-type-active-view",
+    "title": "List fixtures by type in active view",
+    "category": "Lists",
+    "discipline": "Electrical",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "list fixtures by type in active view",
+      "list electrical fixtures by type"
+    ],
+    "deterministic_handler": "list_fixtures_by_type_in_active_view",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "list fixtures by type in active view",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-selected-elements-by-category",
+    "title": "Report selected elements by category",
+    "category": "Reports",
+    "discipline": "QA / BIM",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "report selected elements by category",
+      "selected elements by category",
+      "show selected elements by category",
+      "group selected elements by category",
+      "summarize selected elements by category"
+    ],
+    "example_prompts": [
+      "show selected elements by category",
+      "group selected elements by category",
+      "summarize selected elements by category"
+    ],
+    "deterministic_handler": "report_selected_elements_by_category",
+    "requires_confirmation": false,
+    "enabled": true,
+    "validation_state": "live_validated",
+    "prompt_text": "report selected elements by category",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-selected-elements-by-type",
+    "title": "Report selected elements by type",
+    "category": "Reports",
+    "discipline": "QA / BIM",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "report selected elements by type",
+      "selected elements by type",
+      "show selected elements by type",
+      "group selected elements by type",
+      "summarize selected elements by type"
+    ],
+    "example_prompts": [
+      "show selected elements by type",
+      "group selected elements by type",
+      "summarize selected elements by type"
+    ],
+    "deterministic_handler": "report_selected_elements_by_type",
+    "requires_confirmation": false,
+    "enabled": true,
+    "validation_state": "live_validated",
+    "prompt_text": "report selected elements by type",
+    "mode": "deterministic"
+  },
+  {
+    "id": "health-check-active-view-selection",
+    "title": "Health check of active view for supported MEP categories",
+    "category": "Reports",
+    "discipline": "QA / BIM",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "health check for active view selection",
+      "selection health check",
+      "health check selection",
+      "health check of active view for supported mep categories",
+      "health check this active view",
+      "check this active view",
+      "run health check on active view",
+      "inspect active view for mep issues",
+      "summarize active view health"
+    ],
+    "example_prompts": [
+      "health check this active view",
+      "check this active view",
+      "run health check on active view",
+      "inspect active view for MEP issues",
+      "summarize active view health"
+    ],
+    "deterministic_handler": "health_check_for_active_view_selection",
+    "requires_confirmation": false,
+    "enabled": true,
+    "validation_state": "live_validated",
+    "prompt_text": "health check for active view selection",
+    "mode": "deterministic"
+  },
+  {
+    "id": "report-missing-parameters-from-selection",
+    "title": "Report missing key parameters from selected elements",
+    "category": "Reports",
+    "discipline": "QA / BIM",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "report missing parameters from selection",
+      "missing parameters from selection",
+      "report missing key parameters from selected elements",
+      "check missing key parameters in selection",
+      "show missing parameters in selected elements",
+      "find missing key parameters in selection",
+      "check selected elements for missing parameters"
+    ],
+    "example_prompts": [
+      "check missing key parameters in selection",
+      "show missing parameters in selected elements",
+      "find missing key parameters in selection",
+      "check selected elements for missing parameters"
+    ],
+    "deterministic_handler": "report_missing_parameters_from_selection",
+    "requires_confirmation": false,
+    "enabled": true,
+    "validation_state": "live_validated",
+    "prompt_text": "report missing parameters from selection",
+    "mode": "deterministic"
+  },
+  {
+    "id": "create-3d-view-from-selection",
+    "title": "Create 3D view from current selection/context",
+    "category": "Tags / Tools",
+    "discipline": "QA / BIM",
+    "role": "modify",
+    "risk_level": "medium",
+    "scope_type": "selection",
+    "planner_aliases": [
+      "create 3d view",
+      "create 3d view from selection",
+      "make a 3d view",
+      "create a 3d view from this selection"
+    ],
+    "deterministic_handler": "create_3d_view_from_selection",
+    "requires_confirmation": true,
+    "enabled": true,
+    "prompt_text": "create 3d view from selection/context",
+    "mode": "deterministic"
+  },
+  {
+    "id": "count-pipes-active-view",
+    "title": "Count pipes in active view",
+    "category": "Count",
+    "discipline": "Piping",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "count pipes in active view",
+      "count all pipes in active view"
+    ],
+    "deterministic_handler": "count_pipes_in_active_view",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "count pipes in active view",
+    "mode": "deterministic"
+  },
+  {
+    "id": "list-pipes-active-view",
+    "title": "List pipes in active view",
+    "category": "Lists",
+    "discipline": "Piping",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "list pipes in active view",
+      "list all pipes in active view"
+    ],
+    "deterministic_handler": "list_pipes_in_active_view",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "list pipes in active view",
+    "mode": "deterministic"
+  },
+  {
+    "id": "list-electrical-fixtures-active-view",
+    "title": "List electrical fixtures in active view",
+    "category": "Lists",
+    "discipline": "Electrical",
+    "role": "read",
+    "risk_level": "low",
+    "scope_type": "active_view",
+    "planner_aliases": [
+      "list electrical fixtures in active view",
+      "electrical devices in active view"
+    ],
+    "deterministic_handler": "list_electrical_fixtures_in_active_view",
+    "requires_confirmation": false,
+    "enabled": true,
+    "prompt_text": "list electrical fixtures in active view",
+    "mode": "deterministic"
+  }
+]

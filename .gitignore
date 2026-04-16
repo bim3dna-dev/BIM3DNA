@@ -1,0 +1,63 @@
+node_modules
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyd
+*.pyo
+*.pdb
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual env
+venv/
+.venv/
+env/
+ENV/
+.env
+
+# VSCode
+.vscode/
+
+# Logs & temp
+*.log
+*.tmp
+*.swp
+
+# Syncthing
+.stignore
+~syncthing~*
+.syncthing.*
+**/~syncthing~*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Revit / BIM heavy artifacts (choose what applies)
+*.rvt
+*.rfa
+*.ifc
+*.dwg
+*.dxf
+*.nwc
+*.nwd
+*.pdf
+*.zip
+*.7z
+
+# Runs
+runs/
+
+# Outputs
+outputs/
+
+# Configs
+.config.py
+config.py
+
+# AI Server
+Openai_Server/config.pyconfig.py

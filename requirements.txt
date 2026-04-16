@@ -1,0 +1,12 @@
+pandas
+openpyxl
+pyautogui
+matplotlib
+black
+pylint
+pytest
+openai==1.62.0
+requests==2.32.3
+inflect==7.5.0
+pythonnet==3.0.4
+clr-loader==0.2.6

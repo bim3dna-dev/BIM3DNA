@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="AboutWindow" Height="450" Width="600" WindowStyle="None" AllowsTransparency="True" Background="Transparent" WindowStartupLocation="CenterScreen">
+
+    <Window.Resources>
+        <!-- General button style -->
+        <Style TargetType="Button">
+            <Setter Property="FontFamily" Value="Arial" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="BorderElement" CornerRadius="8" Background="#1c1c1c" BorderBrush="#0085ff" BorderThickness="2">
+                            <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="BorderElement" Property="Background" Value="#0085ff" />
+                                <Setter TargetName="BorderElement" Property="BorderBrush" Value="#0085ff" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Border CornerRadius="20" Background="#ffffff" BorderBrush="#0085ff" BorderThickness="4" Padding="20">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Header -->
+            <DockPanel Grid.Row="0" LastChildFill="True">
+                <Image x:Name="LogoImage" Height="40" Margin="10,0,0,0" Source="https://www.zonneveld.com/images/Zonneveld_logo_web.png" Stretch="Uniform" DockPanel.Dock="Left" />
+
+                <Button x:Name="CloseButton" Content="Close" Width="60" Height="25" Margin="0,10,10,0" HorizontalAlignment="Right" Background="#1c1c1c" Foreground="#ffffff" BorderBrush="#0085ff" BorderThickness="2" VerticalAlignment="Top" DockPanel.Dock="Right" />
+            </DockPanel>
+
+            <!-- Main Content -->
+            <StackPanel Grid.Row="1" Margin="0,20,0,20" HorizontalAlignment="Center" VerticalAlignment="Center" Width="500">
+                <TextBlock Text="🎉 Welcome to Zonneveld Toolbar!" FontSize="18" FontWeight="Bold" Foreground="#111213" TextAlignment="Center" Margin="0,0,0,10" />
+                <TextBlock Text="This toolbar solves your problems, mundane and repetitive tasks so that you stay productive and motivated. It streamlines your workflow, provides innovative solutions, and helps you achieve better results in less time. Explore the features, and enjoy the efficiency it brings to your Revit experience!" FontSize="14" TextWrapping="Wrap" TextAlignment="Center" Margin="0,0,0,20" />
+
+                <Border Background="#f9f9f9" CornerRadius="10" Padding="15" Margin="0,0,0,0">
+                    <Border.Effect>
+                        <DropShadowEffect Color="#0085ff" Direction="0" ShadowDepth="0" Opacity="0.3" BlurRadius="20" />
+                    </Border.Effect>
+                    <StackPanel>
+                        <TextBlock x:Name="RevitVersionText" Text="Revit Version: Unknown" Margin="0,5" FontWeight="Bold" />
+                        <TextBlock x:Name="pyRevitVersionText" Text="pyRevit Version: Unknown" Margin="0,5" FontWeight="Bold" />
+                        <TextBlock x:Name="ActiveIronPythonVersionText" Text="Active IronPython Engine Version: Unknown" Margin="0,5" FontWeight="Bold" />
+                        <TextBlock x:Name="ActiveCPythonVersionText" Text="Active CPython Engine Version: Unknown" Margin="0,5" FontWeight="Bold" />
+                    </StackPanel>
+
+                </Border>
+            </StackPanel>
+
+            <!-- Footer -->
+            <StackPanel Grid.Row="2" Margin="0,10,0,0" HorizontalAlignment="Center">
+                <TextBlock Text="Made by Emin Avdovic" FontSize="12" Foreground="#666" />
+                <TextBlock Text="Zonneveld Toolbar Version: 1.0" FontSize="12" Foreground="#666" />
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

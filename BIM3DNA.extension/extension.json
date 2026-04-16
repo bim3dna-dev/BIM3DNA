@@ -1,0 +1,14 @@
+{
+  "builtin": "False",
+  "default_enabled": "True",
+  "type": "extension",
+  "rocket_mode_compatible": "False",
+  "name": "Zonneveld_Revit_API",
+  "description": "Extensions for PyRevit",
+  "author": "Emin Avdovic",
+  "author_profile": "https://github.com/Emin-A",
+  "url": "https://github.com/Emin-A/Zonneveld_Revit_API",
+  "website": "",
+  "image": "",
+  "dependencies": []
+}

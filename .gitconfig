@@ -1,0 +1,11 @@
+[user]
+    name = Emin-A
+    email = eminavdovic@gmail.com
+
+[core]
+    editor = code --wait
+    autocrlf = true  # This adjusts line endings for Windows
+    fscache = true   # Improves performance on Windows
+
+[init]
+    defaultBranch = main  # Default branch name
