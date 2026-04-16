@@ -1253,7 +1253,7 @@ def total_ceiling_area_volume(doc, uidoc):
     total_area_m2 = total_area_ft2 * 0.092903
     total_vol_m3 = total_vol_ft3 * 0.0283168
     return (
-        "Ceilings — Count: {} | Total Area: {:.2f} m² | Total Volume: {:.2f} m³".format(
+        "Ceilings - Count: {} | Total Area: {:.2f} m² | Total Volume: {:.2f} m³".format(
             len(ceilings), total_area_m2, total_vol_m3
         )
     )
@@ -1285,7 +1285,7 @@ def total_roof_area_volume(doc, uidoc):
                 pass
     total_area_m2 = total_area_ft2 * 0.092903
     total_vol_m3 = total_vol_ft3 * 0.0283168
-    return "Roofs — Count: {} | Total Area: {:.2f} m² | Total Volume: {:.2f} m³".format(
+    return "Roofs - Count: {} | Total Area: {:.2f} m² | Total Volume: {:.2f} m³".format(
         len(roofs), total_area_m2, total_vol_m3
     )
 
@@ -4576,9 +4576,9 @@ class OllamaAIChat(forms.WPFWindow):
         else:
             self._apply_control_style(
                 button_name,
-                palette["disabled_bg"],
-                palette["disabled_fg"],
-                palette["border"],
+                "#D7E3EA" if self.current_theme == "light" else "#334155",
+                "#52606D" if self.current_theme == "light" else "#CBD5E1",
+                "#AABBC7" if self.current_theme == "light" else "#475569",
             )
             try:
                 button.Opacity = 1.0
@@ -4635,13 +4635,13 @@ class OllamaAIChat(forms.WPFWindow):
         self._apply_button_state_style(
             "ApproveCodeButton",
             bool(self.ApproveCodeButton.IsEnabled),
-            "#e17055",
+            "#168A67",
             "#ffffff",
         )
         self._apply_button_state_style(
             "SaveRecipeButton",
             bool(self.SaveRecipeButton.IsEnabled),
-            "#3b82f6",
+            "#0E7490",
             "#ffffff",
         )
         self._apply_button_state_style(
@@ -4920,9 +4920,9 @@ class OllamaAIChat(forms.WPFWindow):
         self._apply_control_style("ReviewedCodeGroup", palette["panel_bg"], palette["text"], palette["border"])
         self._apply_control_style("ReviewedCodePreview", palette["panel_alt"], palette["text"], palette["border"])
         self._apply_control_style("ModelMindInput", palette["panel_alt"], palette["text"], palette["border"])
-        self._apply_control_style("ModelMindSendButton", palette["accent_alt"], "#ffffff", palette["accent_alt"])
-        self._apply_control_style("ApproveCodeButton", palette["accent"], "#ffffff", palette["accent"])
-        self._apply_control_style("SaveRecipeButton", palette["accent_alt"], "#ffffff", palette["accent_alt"])
+        self._apply_control_style("ModelMindSendButton", "#0F9F9A", "#ffffff", "#0B7F7A")
+        self._apply_control_style("ApproveCodeButton", "#168A67", "#ffffff", "#116149")
+        self._apply_control_style("SaveRecipeButton", "#0E7490", "#ffffff", "#155E75")
         self._apply_control_style("ToggleReviewedCodeButton", "#475569", "#ffffff", "#475569")
         self._apply_control_style("ReviewedCodeStateLabel", None, palette["accent"])
         self._apply_control_style("PromptDetailsGroup", palette["panel_bg"], palette["text"], palette["border"])

@@ -2,21 +2,47 @@
 from pyrevit.forms import WPFWindow
 import platform
 import pyrevit
+import os
 
 
 class AboutForm:
     def __init__(self):
         try:
             self.window = WPFWindow("AboutUI.xaml")
-            self.window.FindName(
-                "LogoImage"
-            ).MouseLeftButtonDown += self.navigate_to_uri
+            self.logo_button = self.window.FindName("LogoButton")
+            self.logo_image = self.window.FindName("LogoImage")
+            self.set_logo_image()
+            self.logo_button.Click += self.navigate_to_uri
             self.window.FindName("CloseButton").Click += self.button_close
             self.version_data = self.fetch_versions()
             self.update_ui()
             self.window.show()
         except Exception as ex:
             print("Initialization Error: {}".format(ex))
+
+    def set_logo_image(self):
+        """Load the local BIM3DNA logo via an absolute bundle path."""
+        try:
+            import clr
+
+            clr.AddReference("PresentationCore")
+            clr.AddReference("WindowsBase")
+            from System import Uri, UriKind
+            from System.Windows.Media.Imaging import BitmapImage
+
+            bundle_dir = os.path.dirname(__file__)
+            logo_path = os.path.join(bundle_dir, "BIM3DNA Logo Final.png")
+            if not os.path.exists(logo_path):
+                raise IOError("Logo asset not found: {}".format(logo_path))
+
+            bitmap = BitmapImage()
+            bitmap.BeginInit()
+            bitmap.UriSource = Uri(logo_path, UriKind.Absolute)
+            bitmap.EndInit()
+
+            self.logo_image.Source = bitmap
+        except Exception as ex:
+            print("Logo Load Error: {}".format(ex))
 
     def fetch_versions(self):
         """Fetch all versions properly."""
@@ -103,12 +129,13 @@ class AboutForm:
             self.version_data.get("pyRevitVersion", "Unknown")
         )
         self.window.ActiveIronPythonVersionText.Text = (
-            "Active IronPython Engine Version: {}".format(
+            "Active Python Engine Version: {} {}".format(
+                self.version_data.get("ActiveEngine", "Unknown"),
                 self.version_data.get("ActiveEngineVersion", "Unknown")
             )
         )
         self.window.ActiveCPythonVersionText.Text = (
-            "Active CPython Engine Version: {}".format(
+            "Detected CPython Version: {}".format(
                 self.version_data.get("InstalledCPythonVersion", "Unknown")
             )
         )
@@ -118,7 +145,7 @@ class AboutForm:
         try:
             import webbrowser
 
-            webbrowser.open("https://www.zonneveld.com")
+            webbrowser.open("https://bim3dna.nl/", new=2)
         except:
             pass
 

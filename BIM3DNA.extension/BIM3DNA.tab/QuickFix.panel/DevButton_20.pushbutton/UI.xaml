@@ -51,6 +51,32 @@
             <Setter Property="Foreground" Value="{DynamicResource TreeForegroundBrush}"/>
             <Setter Property="Padding" Value="2"/>
         </Style>
+        <Style x:Key="ModelMindActionButtonBaseStyle" TargetType="Button">
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Padding" Value="14,0"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="BorderThickness" Value="1.5"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Opacity" Value="1"/>
+        </Style>
+        <Style x:Key="ModelMindPrimaryButtonStyle" TargetType="Button" BasedOn="{StaticResource ModelMindActionButtonBaseStyle}">
+            <Setter Property="Background" Value="#0F9F9A"/>
+            <Setter Property="BorderBrush" Value="#0B7F7A"/>
+        </Style>
+        <Style x:Key="ModelMindNeutralButtonStyle" TargetType="Button" BasedOn="{StaticResource ModelMindActionButtonBaseStyle}">
+            <Setter Property="Background" Value="#334155"/>
+            <Setter Property="BorderBrush" Value="#1E293B"/>
+        </Style>
+        <Style x:Key="ModelMindPositiveButtonStyle" TargetType="Button" BasedOn="{StaticResource ModelMindActionButtonBaseStyle}">
+            <Setter Property="Background" Value="#168A67"/>
+            <Setter Property="BorderBrush" Value="#116149"/>
+        </Style>
+        <Style x:Key="ModelMindSecondaryButtonStyle" TargetType="Button" BasedOn="{StaticResource ModelMindActionButtonBaseStyle}">
+            <Setter Property="Background" Value="#0E7490"/>
+            <Setter Property="BorderBrush" Value="#155E75"/>
+        </Style>
     </Window.Resources>
     <Border x:Name="MainBorder" CornerRadius="16" BorderBrush="#7aaef7" BorderThickness="2" Background="White" Padding="10">
         <Grid>
@@ -224,12 +250,19 @@
                                 <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBox x:Name="ModelMindInput" Grid.Row="0" MinHeight="32" MaxHeight="90" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" FontSize="14" BorderBrush="#b3cef6" BorderThickness="1" Margin="0,0,0,10" HorizontalAlignment="Stretch" ToolTip="Enter a deterministic recipe prompt or a semi-generative BIM task request."/>
-                            <WrapPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Left" ItemHeight="32" ItemWidth="170">
-                                <Button x:Name="ModelMindSendButton" Content="Send" Width="110" Height="32" Background="#00b894" Foreground="White" FontWeight="Bold" BorderBrush="#00b894" BorderThickness="1" FontSize="14" Margin="0,0,10,8"/>
-                                <Button x:Name="ToggleReviewedCodeButton" Content="Show reviewed code" Width="150" Height="32" Background="#475569" Foreground="White" FontWeight="Bold" BorderBrush="#475569" BorderThickness="1" FontSize="12" Margin="0,0,10,8" IsEnabled="False" ToolTip="Show or hide the reviewed code draft."/>
-                                <Button x:Name="ApproveCodeButton" Content="Approve &amp; Run Code" Width="160" Height="32" Background="#e17055" Foreground="White" FontWeight="Bold" BorderBrush="#e17055" BorderThickness="1" FontSize="14" Margin="0,0,10,8" ToolTip="Run reviewed generated code only after validation."/>
-                                <Button x:Name="SaveRecipeButton" Content="Save as Approved Recipe" Width="180" Height="32" Background="#3b82f6" Foreground="White" FontWeight="Bold" BorderBrush="#3b82f6" BorderThickness="1" FontSize="13" Margin="0,0,10,8" IsEnabled="False" ToolTip="Available only after a successful reviewed-code execution."/>
-                            </WrapPanel>
+                            <Grid Grid.Row="1" HorizontalAlignment="Stretch" Margin="0,0,10,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="118"/>
+                                    <ColumnDefinition Width="160"/>
+                                    <ColumnDefinition Width="172"/>
+                                    <ColumnDefinition Width="188"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Button x:Name="ModelMindSendButton" Grid.Column="0" Style="{StaticResource ModelMindPrimaryButtonStyle}" Content="Send" MinWidth="118" Margin="0,0,10,0" HorizontalAlignment="Stretch" VerticalAlignment="Center"/>
+                                <Button x:Name="ToggleReviewedCodeButton" Grid.Column="1" Style="{StaticResource ModelMindNeutralButtonStyle}" Content="Show reviewed code" MinWidth="160" Margin="0,0,10,0" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsEnabled="False" ToolTip="Show or hide the reviewed code draft."/>
+                                <Button x:Name="ApproveCodeButton" Grid.Column="2" Style="{StaticResource ModelMindPositiveButtonStyle}" Content="Approve &amp; Run Code" MinWidth="172" Margin="0,0,10,0" HorizontalAlignment="Stretch" VerticalAlignment="Center" ToolTip="Run reviewed generated code only after validation."/>
+                                <Button x:Name="SaveRecipeButton" Grid.Column="3" Style="{StaticResource ModelMindSecondaryButtonStyle}" Content="Save as Approved Recipe" MinWidth="188" Margin="0,0,0,0" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsEnabled="False" ToolTip="Available only after a successful reviewed-code execution."/>
+                            </Grid>
                         </Grid>
 
                         <GridSplitter x:Name="ModelMindSplitter" Grid.Row="0" Grid.RowSpan="4" Grid.Column="1" Width="6" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" Background="#dbeafe" ResizeBehavior="PreviousAndNext"/>
