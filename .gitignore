@@ -61,3 +61,7 @@ config.py
 
 # AI Server
 Openai_Server/config.pyconfig.py
+
+# Setup exe
+OllamaSetup.exe
+BIM3DNA_Toolbar_Installer.exe
