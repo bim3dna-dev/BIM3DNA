@@ -3189,14 +3189,12 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
     sym_vertical = resolved.get("VERT_ARROW")
     sym_extra = resolved.get("EXTRA_HORIZONTAL")
     extra_targets, _ = find_extra_horizontal_targets(pipes)
-    pipe_bbox_rects = []
-    for pipe in pipes:
-        try:
-            bb = pipe.get_BoundingBox(view3d)
-            if bb:
-                pipe_bbox_rects.append(expand_rect(bbox_rect(bb), 10.0))
-        except Exception:
-            pass
+    crop_rect = None
+    try:
+        if view3d.CropBoxActive and view3d.CropBox:
+            crop_rect = bbox_rect(view3d.CropBox)
+    except Exception:
+        crop_rect = None
 
     with Transaction(doc, "Annotate Exploded 3D With Real Tags") as t:
         t.Start()
@@ -3364,8 +3362,8 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
             final_pt = None
             final_rect = None
             attempt_idx = 0
-            for radius_mm in [50, 70, 90, 120, 150, 190]:
-                for ang in [20, 45, 70, 110, 135, 160, 200, 225, 250, 290, 315, 340]:
+            for radius_mm in [45, 65, 85, 105]:
+                for ang in [45, 315, 0, 90, 270, 135, 225, 180]:
                     attempt_idx += 1
                     rad = math.radians(ang)
                     cand = XYZ(
@@ -3374,16 +3372,16 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                         anchor_pt.Z + mm_to_ft(20.0),
                     )
                     cand_rect = text_rect(cand)
-                    if rects_overlap(cand_rect, expand_rect(fit_rect, 12.0)):
+                    if rects_overlap(cand_rect, expand_rect(fit_rect, 6.0)):
                         continue
                     if any(rects_overlap(cand_rect, r) for r in occupied_fitting_rects):
                         continue
-                    direct_pipe_overlap = False
-                    for prect in pipe_bbox_rects:
-                        if rects_overlap(cand_rect, prect):
-                            direct_pipe_overlap = True
-                            break
-                    if direct_pipe_overlap:
+                    if crop_rect is not None and not (
+                        cand_rect[0] >= crop_rect[0]
+                        and cand_rect[1] >= crop_rect[1]
+                        and cand_rect[2] <= crop_rect[2]
+                        and cand_rect[3] <= crop_rect[3]
+                    ):
                         continue
                     final_pt = cand
                     final_rect = cand_rect
@@ -3788,15 +3786,21 @@ def cleanup_stale_prefab_annotations_in_view(
     return removed_total
 
 
-def hard_sync_scanned_pipe_tags_from_source(doc, source_view, target_view, scanned_pipe_ids):
+def hard_sync_scanned_pipe_tags_from_source(
+    doc, source_view, target_view, scanned_pipe_ids
+):
     source_tag_ids = [
         tag.Id
-        for tag in get_pipe_tags_for_hosts_in_view(doc, source_view, set(scanned_pipe_ids))
+        for tag in get_pipe_tags_for_hosts_in_view(
+            doc, source_view, set(scanned_pipe_ids)
+        )
     ]
     copied = 0
     with Transaction(doc, "Hard sync scanned pipe tags from source") as t:
         t.Start()
-        for tag in get_pipe_tags_for_hosts_in_view(doc, target_view, set(scanned_pipe_ids)):
+        for tag in get_pipe_tags_for_hosts_in_view(
+            doc, target_view, set(scanned_pipe_ids)
+        ):
             try:
                 doc.Delete(tag.Id)
             except Exception:
@@ -3936,7 +3940,10 @@ def get_schedule_field_obj_by_name(schedule, field_name):
                 col_heading = field.ColumnHeading or ""
             except Exception:
                 col_heading = ""
-            if heading.strip().lower() == target or col_heading.strip().lower() == target:
+            if (
+                heading.strip().lower() == target
+                or col_heading.strip().lower() == target
+            ):
                 return field
         except Exception:
             continue
@@ -4025,9 +4032,7 @@ def add_schedule_string_filter(schedule, field_name, filter_type, value):
     if field is None:
         return False
     try:
-        schedule.Definition.AddFilter(
-            ScheduleFilter(field.FieldId, filter_type, value)
-        )
+        schedule.Definition.AddFilter(ScheduleFilter(field.FieldId, filter_type, value))
         return True
     except Exception:
         return False
@@ -4038,9 +4043,7 @@ def add_schedule_numeric_filter(schedule, field_name, filter_type, value):
     if field is None:
         return False
     try:
-        schedule.Definition.AddFilter(
-            ScheduleFilter(field.FieldId, filter_type, value)
-        )
+        schedule.Definition.AddFilter(ScheduleFilter(field.FieldId, filter_type, value))
         return True
     except Exception:
         try:
@@ -4064,7 +4067,9 @@ def clear_schedule_sorting(schedule):
             pass
 
 
-def add_schedule_sort(schedule, field_name, ascending=True, footer_mode=None, blank_line=False):
+def add_schedule_sort(
+    schedule, field_name, ascending=True, footer_mode=None, blank_line=False
+):
     field = get_schedule_field_obj_by_name(schedule, field_name)
     if field is None:
         return False
@@ -4124,7 +4129,12 @@ def get_schedule_filter_descriptions(schedule):
             except Exception:
                 field_name = field.ColumnHeading or ""
             value = ""
-            for getter_name in ["GetStringValue", "GetDoubleValue", "GetElementIdValue", "GetIntegerValue"]:
+            for getter_name in [
+                "GetStringValue",
+                "GetDoubleValue",
+                "GetElementIdValue",
+                "GetIntegerValue",
+            ]:
                 try:
                     value = getattr(filt, getter_name)()
                     break
@@ -4199,6 +4209,57 @@ def get_schedule_visible_element_count(schedule, allowed_bics=None):
     return count
 
 
+def configure_fitting_schedule_visible_fields(schedule):
+    remove_all_schedule_fields(schedule)
+    visible_fields = [
+        ("Count", "n"),
+        ("RSen_P_c01_diameter", "DN1"),
+        ("RSen_P_c02_diameter", "DN2"),
+        ("RSen_P_c03_diameter", "DN3"),
+        ("RSen_P_c01_angle", "Angle"),
+        ("Description", "Description"),
+        ("RSen_C_info_technical", "Further info"),
+        ("RSen_C_code_article", "Articlenumber"),
+        ("RSen_C_code_gtin", "GTIN"),
+        ("RSen_S_net_mass", "Weight"),
+    ]
+    hidden_fields = ["option", "productrange", "Comments"]
+    for field_name, heading in visible_fields:
+        add_schedule_field_by_name(schedule, field_name)
+        set_schedule_field_heading(schedule, field_name, heading)
+    for field_name in hidden_fields:
+        add_schedule_field_by_name(schedule, field_name)
+        set_schedule_field_hidden(schedule, field_name, True)
+    set_schedule_field_alignment_center(schedule, "Count")
+
+
+def log_scanned_fitting_filter_check(result):
+    for eData in result.get("Elements", []):
+        if eData.get("Category") != "Pipe Fittings":
+            continue
+        eid = safe_int(eData.get("Id"), 0)
+        if eid <= 0:
+            continue
+        elem = doc.GetElement(ElementId(eid))
+        if not elem:
+            continue
+        desc = get_param_text(elem, ["Description"])
+        option_val = get_param_text(elem, ["option"])
+        code_article = get_param_text(elem, ["RSen_C_code_article"])
+        productrange = get_param_text(elem, ["productrange"])
+        comments = get_param_text(elem, ["Comments"])
+        print(
+            "FITTING FILTER CHECK -> {} | Desc={} | option={} | code_article={} | productrange={} | comments={}".format(
+                eid,
+                desc or "",
+                option_val or "",
+                code_article or "",
+                productrange or "",
+                comments or "",
+            )
+        )
+
+
 def find_master_schedule(doc, name_tokens, reject_tokens=None):
     reject_tokens = reject_tokens or []
     best = None
@@ -4234,7 +4295,9 @@ def duplicate_schedule_view(doc, master_schedule, new_name):
 
 
 def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_view):
-    schedule = ViewSchedule.CreateSchedule(doc, ElementId(BuiltInCategory.OST_PipeCurves))
+    schedule = ViewSchedule.CreateSchedule(
+        doc, ElementId(BuiltInCategory.OST_PipeCurves)
+    )
     try:
         schedule.Name = schedule_name
     except Exception:
@@ -4256,7 +4319,9 @@ def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_
     ]
     level_name = None
     try:
-        level_name = source_view.GenLevel.Name if source_view and source_view.GenLevel else None
+        level_name = (
+            source_view.GenLevel.Name if source_view and source_view.GenLevel else None
+        )
     except Exception:
         level_name = None
     if level_name:
@@ -4268,10 +4333,14 @@ def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_
     set_schedule_field_hidden(schedule, "Comments", True)
     set_schedule_length_field_to_mm(schedule, "Length")
     remove_schedule_filters_by_field_names(
-        schedule, ["Segment Description", "Manufacturer", "Reference Level", "Level", "Comments"]
+        schedule,
+        ["Segment Description", "Manufacturer", "Reference Level", "Level", "Comments"],
     )
     add_schedule_string_filter(
-        schedule, "Segment Description", ScheduleFilterType.Contains, "ACO pipe 1.4301 EPDM"
+        schedule,
+        "Segment Description",
+        ScheduleFilterType.Contains,
+        "ACO pipe 1.4301 EPDM",
     )
     add_schedule_string_filter(
         schedule, "Manufacturer", ScheduleFilterType.Equal, "ACO"
@@ -4283,7 +4352,9 @@ def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_
         if not add_schedule_string_filter(
             schedule, "Reference Level", ScheduleFilterType.Equal, level_name
         ):
-            add_schedule_string_filter(schedule, "Level", ScheduleFilterType.Equal, level_name)
+            add_schedule_string_filter(
+                schedule, "Level", ScheduleFilterType.Equal, level_name
+            )
     add_schedule_string_filter(
         schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
     )
@@ -4305,46 +4376,37 @@ def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_
     return schedule, "reconstructed"
 
 
-def build_fitting_schedule_from_scratch(doc, schedule_name, current_prefix, source_view):
+def build_fitting_schedule_from_scratch(
+    doc, schedule_name, current_prefix, source_view
+):
     schedule = ViewSchedule.CreateSchedule(doc, ElementId.InvalidElementId)
     try:
         schedule.Name = schedule_name
     except Exception:
         schedule.Name = "{} ({})".format(schedule_name, schedule.Id.IntegerValue)
-    remove_all_schedule_fields(schedule)
-    fitting_fields = [
-        "Count",
-        "Family",
-        "RSen_P_c01_diameter",
-        "RSen_P_c02_diameter",
-        "RSen_P_c03_diameter",
-        "RSen_P_c01_angle",
-        "RSen_C_description",
-        "RSen_C_type_comments",
-        "RSen_C_code_article",
-        "RSen_C_code_gtin",
-        "RSen_S_net_mass",
-        "RSen_C_info_technical",
-        "option",
-        "Manufacturer",
-        "Description",
-        "Category",
-        "productrange",
-    ]
-    for field_name in fitting_fields:
-        add_schedule_field_by_name(schedule, field_name)
-    add_schedule_field_by_name(schedule, "Comments")
-    set_schedule_field_hidden(schedule, "Comments", True)
-    set_schedule_field_heading(schedule, "Count", "n")
-    set_schedule_field_alignment_center(schedule, "Count")
+    configure_fitting_schedule_visible_fields(schedule)
     remove_schedule_filters_by_field_names(
         schedule,
-        ["option", "Description", "RSen_C_code_article", "productrange", "Level", "Reference Level", "Comments"],
+        [
+            "option",
+            "Description",
+            "RSen_C_code_article",
+            "productrange",
+            "Level",
+            "Reference Level",
+            "Comments",
+        ],
     )
     add_schedule_numeric_filter(schedule, "option", ScheduleFilterType.NotEqual, 0)
-    add_schedule_string_filter(schedule, "Description", ScheduleFilterType.Contains, "ACO pipe")
-    add_schedule_string_filter(schedule, "RSen_C_code_article", ScheduleFilterType.NotEqual, "")
-    add_schedule_string_filter(schedule, "productrange", ScheduleFilterType.Equal, "Pipe systems")
+    add_schedule_string_filter(
+        schedule, "Description", ScheduleFilterType.Contains, "ACO pipe"
+    )
+    add_schedule_string_filter(
+        schedule, "RSen_C_code_article", ScheduleFilterType.NotEqual, ""
+    )
+    add_schedule_string_filter(
+        schedule, "productrange", ScheduleFilterType.Equal, "Pipe systems"
+    )
     add_schedule_string_filter(
         schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
     )
@@ -4354,7 +4416,9 @@ def build_fitting_schedule_from_scratch(doc, schedule_name, current_prefix, sour
     except Exception:
         pass
     clear_schedule_sorting(schedule)
-    add_schedule_sort(schedule, "Description", True, footer_mode="totals", blank_line=True)
+    add_schedule_sort(
+        schedule, "Description", True, footer_mode="totals", blank_line=True
+    )
     add_schedule_sort(schedule, "RSen_P_c01_diameter", True)
     add_schedule_sort(schedule, "RSen_P_c03_diameter", True)
     add_schedule_sort(schedule, "RSen_C_code_article", True)
@@ -4371,7 +4435,11 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
     mode = "reconstructed"
     level_name = ""
     try:
-        level_name = (source_view.GenLevel.Name or "").lower() if source_view and source_view.GenLevel else ""
+        level_name = (
+            (source_view.GenLevel.Name or "").lower()
+            if source_view and source_view.GenLevel
+            else ""
+        )
     except Exception:
         level_name = ""
     if kind == "pipe":
@@ -4381,22 +4449,33 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
                 doc, master, "{} - Pipe Schedule".format(sheet_code)
             )
             mode = "duplicated"
-            remove_schedule_filters_by_field_names(schedule, ["Reference Level", "Level", "Comments"])
+            remove_schedule_filters_by_field_names(
+                schedule, ["Reference Level", "Level", "Comments"]
+            )
             add_schedule_field_by_name(schedule, "Comments")
             set_schedule_field_hidden(schedule, "Comments", True)
             if level_name:
                 if not add_schedule_string_filter(
-                    schedule, "Reference Level", ScheduleFilterType.Equal, source_view.GenLevel.Name
+                    schedule,
+                    "Reference Level",
+                    ScheduleFilterType.Equal,
+                    source_view.GenLevel.Name,
                 ):
                     add_schedule_string_filter(
-                        schedule, "Level", ScheduleFilterType.Equal, source_view.GenLevel.Name
+                        schedule,
+                        "Level",
+                        ScheduleFilterType.Equal,
+                        source_view.GenLevel.Name,
                     )
             add_schedule_string_filter(
                 schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
             )
         else:
             schedule, mode = build_pipe_schedule_from_scratch(
-                doc, "{} - Pipe Schedule".format(sheet_code), current_prefix, source_view
+                doc,
+                "{} - Pipe Schedule".format(sheet_code),
+                current_prefix,
+                source_view,
             )
     else:
         master = find_master_schedule(doc, ["aco pipe fittings"])
@@ -4405,11 +4484,10 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
                 doc, master, "{} - Pipe Fittings Schedule".format(sheet_code)
             )
             mode = "duplicated"
+            configure_fitting_schedule_visible_fields(schedule)
             remove_schedule_filters_by_field_names(
                 schedule, ["Level", "Reference Level", "Comments"]
             )
-            add_schedule_field_by_name(schedule, "Comments")
-            set_schedule_field_hidden(schedule, "Comments", True)
             add_schedule_string_filter(
                 schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
             )
@@ -4939,6 +5017,7 @@ def main():
             comment_sync_stats.get("written_fittings", 0)
         )
     )
+    log_scanned_fitting_filter_check(result)
 
     if workflow_choice == "apply_only":
         target_view = source_view
@@ -5462,6 +5541,7 @@ def main():
             "Bunge Sheet Gen",
             "Sheet creation failed, but tags/text are kept.\n\n{}".format(ex),
         )
+
 
 print(
     "HAS cleanup_stale_prefab_text_notes_only_in_view = {}".format(
