@@ -1,9 +1,9 @@
 #define MyAppName "BIM3DNA Toolbar"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyPublisher "BIM3DNA"
 #define MyPublisherURL "https://bim3dna.nl/"
 #define MyExtensionName "BIM3DNA.extension"
-#define MyOutputBaseFilename "BIM3DNA_Toolbar_Installer"
+#define MyOutputBaseFilename "BIM3DNA_Toolbar_Installer_0.2.0"
 
 [Setup]
 AppName={#MyAppName}

@@ -1,0 +1,5 @@
+title: Coordination
+tooltip: Coordination tools for Revit link position checks and model integrity.
+author: BIM3DNA
+layout:
+  - Link Position Guard

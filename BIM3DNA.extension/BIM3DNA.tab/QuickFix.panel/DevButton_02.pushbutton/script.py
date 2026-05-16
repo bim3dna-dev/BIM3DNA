@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 __title__ = "Select Same \n Family "
 __doc__ = """Selects all elements in the current project that belong to the same family as the selected element."""
 

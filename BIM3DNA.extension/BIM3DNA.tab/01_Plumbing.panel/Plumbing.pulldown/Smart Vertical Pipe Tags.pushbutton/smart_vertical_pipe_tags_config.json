@@ -1,0 +1,18 @@
+{
+  "last_loaded_family_path": "C:\\Users\\User\\Downloads\\M_Vertical_Pipe_Tag_MEPcontent.rfa", 
+  "last_selected_family_compatibility": "compatible", 
+  "last_selected_family_missing_types": [], 
+  "tag_level_zone_above_mm": 750.0, 
+  "tag_level_zone_below_mm": 750.0, 
+  "target_family_name": "M_Vertical_Pipe_Tag_MEPcontent", 
+  "target_type_mapping": {
+    "COMING_DOWN": "Coming Down", 
+    "COMING_TOGETHER": "Coming Together", 
+    "COMING_UP": "Coming Up", 
+    "CONTINUOUS_DOWN": "Continuous Down", 
+    "CONTINUOUS_UP": "Continuous Up", 
+    "GOING_DOWN": "Going Down", 
+    "GOING_OUT": "Going Out", 
+    "GOING_UP": "Going Up"
+  }
+}

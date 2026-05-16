@@ -3361,9 +3361,20 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
             print("FIT GROUP", idx, "anchor:", anchor_pt)
             final_pt = None
             final_rect = None
+            placed_with_fallback = False
+            reject_direct_cluster_overlap = 0
+            reject_existing_number_overlap = 0
+            reject_crop_overflow = 0
+            reject_other = 0
             attempt_idx = 0
-            for radius_mm in [45, 65, 85, 105]:
-                for ang in [45, 315, 0, 90, 270, 135, 225, 180]:
+            fit_w = fit_rect[2] - fit_rect[0]
+            fit_h = fit_rect[3] - fit_rect[1]
+            if fit_w >= fit_h:
+                candidate_angles = [90, 270, 45, 315, 135, 225, 0, 180]
+            else:
+                candidate_angles = [0, 180, 45, 315, 90, 270, 135, 225]
+            for radius_mm in [35, 50, 70, 90]:
+                for ang in candidate_angles:
                     attempt_idx += 1
                     rad = math.radians(ang)
                     cand = XYZ(
@@ -3373,8 +3384,10 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                     )
                     cand_rect = text_rect(cand)
                     if rects_overlap(cand_rect, expand_rect(fit_rect, 6.0)):
+                        reject_direct_cluster_overlap += 1
                         continue
                     if any(rects_overlap(cand_rect, r) for r in occupied_fitting_rects):
+                        reject_existing_number_overlap += 1
                         continue
                     if crop_rect is not None and not (
                         cand_rect[0] >= crop_rect[0]
@@ -3382,6 +3395,7 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                         and cand_rect[2] <= crop_rect[2]
                         and cand_rect[3] <= crop_rect[3]
                     ):
+                        reject_crop_overflow += 1
                         continue
                     final_pt = cand
                     final_rect = cand_rect
@@ -3389,7 +3403,60 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                 if final_pt is not None:
                     break
             fitting_retry_count += max(0, attempt_idx - 1)
+            if final_pt is None and nt is not None:
+                fallback_offsets = []
+                if fit_w >= fit_h:
+                    fallback_offsets = [
+                        XYZ(0, mm_to_ft(42), mm_to_ft(20)),
+                        XYZ(0, -mm_to_ft(42), mm_to_ft(20)),
+                        XYZ(mm_to_ft(42), 0, mm_to_ft(20)),
+                        XYZ(-mm_to_ft(42), 0, mm_to_ft(20)),
+                    ]
+                else:
+                    fallback_offsets = [
+                        XYZ(mm_to_ft(42), 0, mm_to_ft(20)),
+                        XYZ(-mm_to_ft(42), 0, mm_to_ft(20)),
+                        XYZ(0, mm_to_ft(42), mm_to_ft(20)),
+                        XYZ(0, -mm_to_ft(42), mm_to_ft(20)),
+                    ]
+                severe_pad = mm_to_ft(120.0)
+                for off in fallback_offsets:
+                    cand = XYZ(
+                        anchor_pt.X + off.X, anchor_pt.Y + off.Y, anchor_pt.Z + off.Z
+                    )
+                    cand_rect = text_rect(cand)
+                    if any(rects_overlap(cand_rect, r) for r in occupied_fitting_rects):
+                        reject_existing_number_overlap += 1
+                        continue
+                    if crop_rect is not None:
+                        severely_outside = (
+                            cand_rect[2] < crop_rect[0] - severe_pad
+                            or cand_rect[0] > crop_rect[2] + severe_pad
+                            or cand_rect[3] < crop_rect[1] - severe_pad
+                            or cand_rect[1] > crop_rect[3] + severe_pad
+                        )
+                        if severely_outside:
+                            reject_crop_overflow += 1
+                            continue
+                    final_pt = cand
+                    final_rect = cand_rect
+                    placed_with_fallback = True
+                    break
+            print(
+                "FIT GROUP {} -> reject counts: cluster={} existing={} crop={} other={}".format(
+                    idx,
+                    reject_direct_cluster_overlap,
+                    reject_existing_number_overlap,
+                    reject_crop_overflow,
+                    reject_other,
+                )
+            )
             if final_pt is None or nt is None:
+                print(
+                    "FIT GROUP {} -> final skipped only if actual create failed".format(
+                        idx
+                    )
+                )
                 print("3D EXPLODED -> fitting number skipped:", idx)
                 fitting_numbering_skipped = True
                 fitting_skipped_after_retries += 1
@@ -3401,7 +3468,16 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                 )
                 occupied_fitting_rects.append(final_rect)
                 fitting_number_count += 1
+                if placed_with_fallback:
+                    print("FIT GROUP {} -> placed with fallback".format(idx))
+                else:
+                    print("FIT GROUP {} -> placed with primary candidate".format(idx))
             except Exception:
+                print(
+                    "FIT GROUP {} -> final skipped only if actual create failed".format(
+                        idx
+                    )
+                )
                 print("3D EXPLODED -> fitting number skipped:", idx)
                 fitting_numbering_skipped = True
                 fitting_skipped_after_retries += 1
@@ -4233,6 +4309,46 @@ def configure_fitting_schedule_visible_fields(schedule):
     set_schedule_field_alignment_center(schedule, "Count")
 
 
+def apply_fitting_schedule_filters_and_sorting(schedule, current_prefix):
+    remove_schedule_filters_by_field_names(
+        schedule,
+        [
+            "option",
+            "Description",
+            "RSen_C_code_article",
+            "productrange",
+            "Level",
+            "Reference Level",
+            "Comments",
+        ],
+    )
+    add_schedule_numeric_filter(schedule, "option", ScheduleFilterType.NotEqual, 0)
+    add_schedule_string_filter(
+        schedule, "Description", ScheduleFilterType.Contains, "ACO pipe"
+    )
+    add_schedule_string_filter(
+        schedule, "RSen_C_code_article", ScheduleFilterType.NotEqual, ""
+    )
+    add_schedule_string_filter(
+        schedule, "productrange", ScheduleFilterType.Equal, "Pipe systems"
+    )
+    add_schedule_string_filter(
+        schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+    )
+    clear_schedule_sorting(schedule)
+    add_schedule_sort(
+        schedule, "Description", True, footer_mode="totals", blank_line=True
+    )
+    add_schedule_sort(schedule, "RSen_P_c01_diameter", True)
+    add_schedule_sort(schedule, "RSen_P_c03_diameter", True)
+    add_schedule_sort(schedule, "RSen_C_code_article", True)
+    try:
+        schedule.Definition.IsItemized = False
+        schedule.Definition.ShowGrandTotal = False
+    except Exception:
+        pass
+
+
 def log_scanned_fitting_filter_check(result):
     for eData in result.get("Elements", []):
         if eData.get("Category") != "Pipe Fittings":
@@ -4385,43 +4501,7 @@ def build_fitting_schedule_from_scratch(
     except Exception:
         schedule.Name = "{} ({})".format(schedule_name, schedule.Id.IntegerValue)
     configure_fitting_schedule_visible_fields(schedule)
-    remove_schedule_filters_by_field_names(
-        schedule,
-        [
-            "option",
-            "Description",
-            "RSen_C_code_article",
-            "productrange",
-            "Level",
-            "Reference Level",
-            "Comments",
-        ],
-    )
-    add_schedule_numeric_filter(schedule, "option", ScheduleFilterType.NotEqual, 0)
-    add_schedule_string_filter(
-        schedule, "Description", ScheduleFilterType.Contains, "ACO pipe"
-    )
-    add_schedule_string_filter(
-        schedule, "RSen_C_code_article", ScheduleFilterType.NotEqual, ""
-    )
-    add_schedule_string_filter(
-        schedule, "productrange", ScheduleFilterType.Equal, "Pipe systems"
-    )
-    add_schedule_string_filter(
-        schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
-    )
-    try:
-        schedule.Definition.IsItemized = False
-        schedule.Definition.ShowGrandTotal = False
-    except Exception:
-        pass
-    clear_schedule_sorting(schedule)
-    add_schedule_sort(
-        schedule, "Description", True, footer_mode="totals", blank_line=True
-    )
-    add_schedule_sort(schedule, "RSen_P_c01_diameter", True)
-    add_schedule_sort(schedule, "RSen_P_c03_diameter", True)
-    add_schedule_sort(schedule, "RSen_C_code_article", True)
+    apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
     try:
         schedule.ShowHeaders = True
         schedule.ShowTitle = True
@@ -4485,12 +4565,7 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
             )
             mode = "duplicated"
             configure_fitting_schedule_visible_fields(schedule)
-            remove_schedule_filters_by_field_names(
-                schedule, ["Level", "Reference Level", "Comments"]
-            )
-            add_schedule_string_filter(
-                schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
-            )
+            apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
             duplicated_visible = get_schedule_visible_element_count(
                 schedule, [BuiltInCategory.OST_PipeFitting]
             )
@@ -4525,6 +4600,26 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
                 current_prefix,
                 source_view,
             )
+        print(
+            "FITTING SCHEDULE -> final field list: {}".format(
+                ", ".join(get_schedule_field_names(schedule))
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> final filters: {}".format(
+                " | ".join(get_schedule_filter_descriptions(schedule))
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> final sorting/grouping: {}".format(
+                " | ".join(get_schedule_sort_descriptions(schedule))
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> visible rows after config: {}".format(
+                get_schedule_body_row_count(schedule)
+            )
+        )
         print(
             "FITTING SCHEDULE -> final visible elements: {}".format(
                 get_schedule_visible_element_count(

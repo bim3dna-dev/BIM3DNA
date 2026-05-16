@@ -1,0 +1,16 @@
+[
+  {
+    "approved_utc": "2026-04-08T20:40:23Z", 
+    "category": "Tags / Tools", 
+    "enabled": true, 
+    "id": "create-sheet-reviewed-template-20260408-223929", 
+    "mode": "generative", 
+    "prompt_text": "create sheet", 
+    "risk_level": "medium", 
+    "role": "modify", 
+    "source": "approved_recipe", 
+    "source_prompt": "create sheet", 
+    "stored_code": "from Autodesk.Revit.DB import BuiltInCategory, FilteredElementCollector, ViewSheet, Transaction\ntitle_block_types = FilteredElementCollector(doc) \\\n    .OfCategory(BuiltInCategory.OST_TitleBlocks) \\\n    .WhereElementIsElementType() \\\n    .ToElements()\nif not title_block_types:\n    result = \"Failed: no title block type exists in the current project.\"\nelse:\n    title_block_type = title_block_types[0]\n    transaction = Transaction(doc, \"Create AI Sheet\")\n    transaction.Start()\n    try:\n        new_sheet = ViewSheet.Create(doc, title_block_type.Id)\n        if new_sheet:\n            try:\n                new_sheet.Name = \"AI Generated Sheet\"\n            except:\n                pass\n            try:\n                new_sheet.SheetNumber = \"AI-001\"\n            except:\n                pass\n            transaction.Commit()\n            result = \"Created sheet: {0} ({1})\".format(new_sheet.SheetNumber, new_sheet.Name)\n        else:\n            transaction.RollBack()\n            result = \"Failed: ViewSheet.Create returned no sheet.\"\n    except Exception as create_error:\n        try:\n            transaction.RollBack()\n        except:\n            pass\n        result = \"Failed to create sheet: {0}\".format(str(create_error))", 
+    "title": "Create sheet (reviewed template) [2026-04-08 22:39]"
+  }
+]
