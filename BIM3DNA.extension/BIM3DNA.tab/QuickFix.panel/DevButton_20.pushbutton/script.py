@@ -128,6 +128,9 @@ from System.Windows.Forms import (
     Application,
     FlowLayoutPanel,
     FlowDirection,
+    RadioButton,
+    FormBorderStyle,
+    FormStartPosition,
     MessageBoxButtons,
     MessageBoxIcon,
 )
@@ -213,6 +216,27 @@ TAGCFG_EXTRA_H = dict(
     leader=True,
     offset_mm=350,
 )
+
+REGULAR_PIPE_TAG_MODE_OPTIONS = [
+    dict(
+        key="DIAMETER_LENGTH",
+        label="Diameter + pipe length",
+        family="RSen_GA_tag pipe_ACO",
+        type="RED TypeMark + DN + \u00f8",
+        leader=True,
+        offset_mm=500,
+    ),
+    dict(
+        key="DIAMETER_HEIGHT",
+        label="Diameter + height",
+        family="BvdK_Pipe_Riolering_Afm + spot elev_bb_L RED",
+        type="RED sys + afm. + hoogte cl",
+        leader=True,
+        offset_mm=350,
+    ),
+]
+REGULAR_PIPE_TAG_MODE_DEFAULT_KEY = "DIAMETER_LENGTH"
+SELECTED_REGULAR_PIPE_TAG_MODE = None
 
 
 def points_are_close(pt1, pt2, tol=1e-6):
@@ -591,6 +615,71 @@ def ensure_symbol_active(doc, sym_or_id):
         doc.Regenerate()
         t.Commit()
     return True
+
+
+def clone_regular_pipe_tag_mode(option, fallback_used=False, symbol=None):
+    return dict(
+        key=option.get("key"),
+        label=option.get("label"),
+        family=option.get("family"),
+        type=option.get("type"),
+        leader=option.get("leader", True),
+        offset_mm=option.get("offset_mm", SAFE_CFG.get("tag_offset_mm", 250)),
+        fallback_used=bool(fallback_used),
+        symbol=symbol,
+    )
+
+
+def get_regular_pipe_tag_mode_option(key):
+    for option in REGULAR_PIPE_TAG_MODE_OPTIONS:
+        if option.get("key") == key:
+            return option
+    return REGULAR_PIPE_TAG_MODE_OPTIONS[0]
+
+
+def find_regular_pipe_tag_symbol(mode):
+    if mode is None:
+        return None
+    sym = find_family_symbol_by_family_and_type(
+        doc, mode.get("family"), mode.get("type")
+    )
+    if sym is None:
+        sym = find_tag_symbol(doc, mode.get("family"), mode.get("type"))
+    if sym is not None:
+        ensure_symbol_active(doc, sym)
+    return sym
+
+
+def apply_regular_pipe_tag_mode(mode):
+    global SELECTED_REGULAR_PIPE_TAG_MODE
+    global TAGCFG_ACO
+    SELECTED_REGULAR_PIPE_TAG_MODE = mode
+    TAGCFG_ACO["family"] = mode.get("family")
+    TAGCFG_ACO["type"] = mode.get("type")
+    TAGCFG_ACO["leader"] = mode.get("leader", True)
+    TAGCFG_ACO["offset_mm"] = mode.get("offset_mm", SAFE_CFG.get("tag_offset_mm", 250))
+    TAG_CFG["ACO_PIPE"] = (mode.get("family"), mode.get("type"))
+    _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = mode.get("symbol")
+
+
+def get_current_regular_pipe_tag_mode():
+    if SELECTED_REGULAR_PIPE_TAG_MODE is not None:
+        return SELECTED_REGULAR_PIPE_TAG_MODE
+    option = get_regular_pipe_tag_mode_option(REGULAR_PIPE_TAG_MODE_DEFAULT_KEY)
+    sym = find_regular_pipe_tag_symbol(option)
+    mode = clone_regular_pipe_tag_mode(option, False, sym)
+    apply_regular_pipe_tag_mode(mode)
+    return mode
+
+
+def get_regular_pipe_tag_symbol(doc):
+    mode = get_current_regular_pipe_tag_mode()
+    sym = mode.get("symbol")
+    if sym is None:
+        sym = find_regular_pipe_tag_symbol(mode)
+        mode["symbol"] = sym
+        _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = sym
+    return sym
 
 
 def get_pipe_tag_type_from_existing_tags(doc, view):
@@ -1595,6 +1684,115 @@ def choose_post_editor_workflow():
     if r == TaskDialogResult.CommandLink1:
         return "apply_only"
     return "cancel"
+
+
+class RegularPipeTagModeForm(Form):
+    def __init__(self):
+        self.Text = "Regular Pipe Tag Style"
+        self.Width = 520
+        self.Height = 220
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.SelectedKey = REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+
+        label = Label()
+        label.Text = "Choose regular pipe tag style for this run:"
+        label.Location = Point(12, 12)
+        label.Size = Size(480, 24)
+        self.Controls.Add(label)
+
+        self.radio_a = RadioButton()
+        self.radio_a.Text = "Diameter + pipe length"
+        self.radio_a.Location = Point(20, 48)
+        self.radio_a.Size = Size(460, 28)
+        self.radio_a.Checked = True
+        self.Controls.Add(self.radio_a)
+
+        self.radio_b = RadioButton()
+        self.radio_b.Text = "Diameter + height"
+        self.radio_b.Location = Point(20, 82)
+        self.radio_b.Size = Size(460, 28)
+        self.Controls.Add(self.radio_b)
+
+        ok = Button()
+        ok.Text = "OK"
+        ok.Location = Point(300, 135)
+        ok.DialogResult = DialogResult.OK
+        self.Controls.Add(ok)
+
+        cancel = Button()
+        cancel.Text = "Cancel"
+        cancel.Location = Point(390, 135)
+        cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(cancel)
+
+        self.AcceptButton = ok
+        self.CancelButton = cancel
+
+    def get_selected_key(self):
+        if self.radio_b.Checked:
+            return "DIAMETER_HEIGHT"
+        return "DIAMETER_LENGTH"
+
+
+def prompt_regular_pipe_tag_mode():
+    form = RegularPipeTagModeForm()
+    if form.ShowDialog() != DialogResult.OK:
+        selected_option = get_regular_pipe_tag_mode_option(
+            REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        )
+        sym = find_regular_pipe_tag_symbol(selected_option)
+        mode = clone_regular_pipe_tag_mode(selected_option, True, sym)
+        apply_regular_pipe_tag_mode(mode)
+        log_regular_pipe_tag_mode(mode)
+        return mode
+
+    selected_option = get_regular_pipe_tag_mode_option(form.get_selected_key())
+    sym = find_regular_pipe_tag_symbol(selected_option)
+    fallback_used = False
+    if sym is None:
+        fallback_option = get_regular_pipe_tag_mode_option(
+            REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        )
+        td = TaskDialog("Missing Regular Pipe Tag Type")
+        td.MainInstruction = "Selected regular pipe tag type was not found"
+        td.MainContent = "Could not find selected regular pipe tag:\n{} - {}\n\nUse fallback?\n{} - {}".format(
+            selected_option.get("family"),
+            selected_option.get("type"),
+            fallback_option.get("family"),
+            fallback_option.get("type"),
+        )
+        td.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+        use_fallback = td.Show()
+        selected_option = fallback_option
+        sym = find_regular_pipe_tag_symbol(selected_option)
+        fallback_used = True
+        if use_fallback != TaskDialogResult.Yes:
+            print(
+                "TAG MODE -> fallback used to preserve default behavior after missing selection."
+            )
+        if sym is None:
+            TaskDialog.Show(
+                "Missing Regular Pipe Tag Type",
+                "Fallback regular pipe tag type was also not found:\n{} - {}\n\nThe run will continue with the existing default behavior and Revit will report missing tag types if tagging cannot proceed.".format(
+                    fallback_option.get("family"),
+                    fallback_option.get("type"),
+                ),
+            )
+
+    mode = clone_regular_pipe_tag_mode(selected_option, fallback_used, sym)
+    apply_regular_pipe_tag_mode(mode)
+    log_regular_pipe_tag_mode(mode)
+    return mode
+
+
+def log_regular_pipe_tag_mode(mode):
+    print("TAG MODE SELECTED -> {}".format(mode.get("key")))
+    print("TAG FAMILY -> {}".format(mode.get("family")))
+    print("TAG TYPE -> {}".format(mode.get("type")))
+    print("TAG MODE FALLBACK USED -> {}".format(bool(mode.get("fallback_used"))))
 
 
 # ==================================================
@@ -3183,9 +3381,7 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
     )
 
     resolved, _ = resolve_required_tag_symbols(doc)
-    sym_regular = choose_best_symbol_for_family(
-        doc, "RSen_GA_tag pipe_ACO", ["TypeMark + DN + ø"]
-    )
+    sym_regular = get_regular_pipe_tag_symbol(doc)
     sym_vertical = resolved.get("VERT_ARROW")
     sym_extra = resolved.get("EXTRA_HORIZONTAL")
     extra_targets, _ = find_extra_horizontal_targets(pipes)
@@ -3559,9 +3755,7 @@ def annotate_prefab_3d_view(doc, uidoc, view3d, scanned_elems, code_map):
         print("3D TAGGING SKIPPED -> view not locked:", view3d.Name)
         return {"tags": 0, "text": 0, "mode": "skipped"}
     resolved, _ = resolve_required_tag_symbols(doc)
-    sym_regular = choose_best_symbol_for_family(
-        doc, "RSen_GA_tag pipe_ACO", ["TypeMark + DN + ø"]
-    )
+    sym_regular = get_regular_pipe_tag_symbol(doc)
     sym_vertical = resolved.get("VERT_ARROW")
     sym_extra = resolved.get("EXTRA_HORIZONTAL")
     with Transaction(doc, "Annotate 3D View") as t:
@@ -4712,7 +4906,13 @@ def try_place_schedule_on_sheet(doc, sheet, schedule, point_xyz):
 
 
 def apply_prefab_changes_to_view(
-    doc, uidoc, target_view, result, polygon, gathered_elements
+    doc,
+    uidoc,
+    target_view,
+    result,
+    polygon,
+    gathered_elements,
+    regular_pipe_tag_mode=None,
 ):
     """
     Must:
@@ -4729,6 +4929,8 @@ def apply_prefab_changes_to_view(
         target_view.Name,
         target_view.Id.IntegerValue,
     )
+    if regular_pipe_tag_mode is not None:
+        apply_regular_pipe_tag_mode(regular_pipe_tag_mode)
     scanned_pipes = []
     scanned_pipe_ids = set()
     for e in gathered_elements:
@@ -5048,6 +5250,10 @@ def main():
     if result is None:
         return
 
+    regular_pipe_tag_mode = prompt_regular_pipe_tag_mode()
+    if regular_pipe_tag_mode is None:
+        return
+
     workflow_choice = choose_post_editor_workflow()
     if workflow_choice == "cancel":
         return
@@ -5098,7 +5304,13 @@ def main():
         )
 
     apply_info = apply_prefab_changes_to_view(
-        doc, uidoc, source_view, result, polygon, gathered_elements
+        doc,
+        uidoc,
+        source_view,
+        result,
+        polygon,
+        gathered_elements,
+        regular_pipe_tag_mode,
     )
 
     comment_sync_stats = sync_prefab_comments_for_current_run(doc, result)
