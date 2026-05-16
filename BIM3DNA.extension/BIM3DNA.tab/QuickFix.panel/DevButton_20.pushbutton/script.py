@@ -129,6 +129,11 @@ from System.Windows.Forms import (
     FlowLayoutPanel,
     FlowDirection,
     RadioButton,
+    ComboBox,
+    ComboBoxStyle,
+    CheckBox,
+    GroupBox,
+    OpenFileDialog,
     FormBorderStyle,
     FormStartPosition,
     MessageBoxButtons,
@@ -136,7 +141,7 @@ from System.Windows.Forms import (
 )
 from System.Drawing import Point, Color, Rectangle, Size
 from System import Array
-import math, re, sys
+import math, re, sys, json
 
 print("BUTTON TITLE DEBUG -> __title__ = {}".format(__title__))
 
@@ -166,6 +171,14 @@ def debug(*args):
 # ==================================================
 # Utilities
 # ==================================================
+def get_runtime_window_title():
+    try:
+        title = str(__title__).replace("\n", " ").strip()
+        return title or "Piping Sheet Gen"
+    except Exception:
+        return "Piping Sheet Gen"
+
+
 def safe_int(value, default=0):
     try:
         return int(str(value))
@@ -237,6 +250,7 @@ REGULAR_PIPE_TAG_MODE_OPTIONS = [
 ]
 REGULAR_PIPE_TAG_MODE_DEFAULT_KEY = "DIAMETER_LENGTH"
 SELECTED_REGULAR_PIPE_TAG_MODE = None
+RUN_PROFILE_FILE = "piping_sheet_gen_project_profiles.json"
 
 
 def points_are_close(pt1, pt2, tol=1e-6):
@@ -588,7 +602,7 @@ def list_pipe_tag_symbols(doc):
         )
     else:
         msg = "No pipe tag symbols found."
-    TaskDialog.Show("Pipe Tag Symbols", msg[:3800])
+    TaskDialog.Show(get_runtime_window_title(), msg[:3800])
     return lines
 
 
@@ -680,6 +694,351 @@ def get_regular_pipe_tag_symbol(doc):
         mode["symbol"] = sym
         _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = sym
     return sym
+
+
+def get_script_dir():
+    try:
+        return System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(__file__))
+    except Exception:
+        return "."
+
+
+def get_run_profile_path():
+    return System.IO.Path.Combine(get_script_dir(), RUN_PROFILE_FILE)
+
+
+def get_project_profile_key(doc):
+    try:
+        central = doc.GetWorksharingCentralModelPath()
+        if central:
+            central_path = ModelPathUtils.ConvertModelPathToUserVisiblePath(central)
+            if central_path:
+                return central_path
+    except Exception:
+        pass
+    try:
+        if doc.PathName:
+            return doc.PathName
+    except Exception:
+        pass
+    try:
+        return doc.Title
+    except Exception:
+        return "UNTITLED_PROJECT"
+
+
+def load_project_profile(doc):
+    path = get_run_profile_path()
+    key = get_project_profile_key(doc)
+    try:
+        if not System.IO.File.Exists(path):
+            print("PROFILE -> loaded project config from {}: none".format(path))
+            print("PROFILE -> loaded values: {}")
+            return {}
+        raw = System.IO.File.ReadAllText(path)
+        data = json.loads(raw) if raw else {}
+        profile = data.get(key, {})
+        print("PROFILE -> loaded project config from {}".format(path))
+        print("PROFILE -> loaded values: {}".format(profile or {}))
+        return profile or {}
+    except Exception as ex:
+        print("PROFILE -> loaded project config from {} failed: {}".format(path, ex))
+        return {}
+
+
+def save_project_profile(doc, runtime_config):
+    path = get_run_profile_path()
+    key = get_project_profile_key(doc)
+    profile = {
+        "regular_tag_mode": runtime_config.get("regular_tag_mode"),
+        "regular_tag_family_name": runtime_config.get("regular_tag_family_name"),
+        "regular_tag_type_name": runtime_config.get("regular_tag_type_name"),
+        "vertical_tag_override_enabled": runtime_config.get(
+            "vertical_tag_override_enabled"
+        ),
+        "vertical_tag_family_name": runtime_config.get("vertical_tag_family_name"),
+        "vertical_tag_type_name": runtime_config.get("vertical_tag_type_name"),
+        "titleblock_display": runtime_config.get("titleblock_display"),
+        "schedule_mode": runtime_config.get("schedule_mode"),
+        "use_selected_schedule_masters": runtime_config.get(
+            "use_selected_schedule_masters"
+        ),
+        "pipe_schedule_master_name": runtime_config.get("pipe_schedule_master_name"),
+        "fitting_schedule_master_name": runtime_config.get(
+            "fitting_schedule_master_name"
+        ),
+    }
+    try:
+        data = {}
+        if System.IO.File.Exists(path):
+            raw = System.IO.File.ReadAllText(path)
+            data = json.loads(raw) if raw else {}
+        data[key] = profile
+        System.IO.File.WriteAllText(path, json.dumps(data, indent=2, sort_keys=True))
+        print("PROFILE -> saved project config to {}".format(path))
+        print("PROFILE -> saved values: {}".format(profile))
+    except Exception as ex:
+        print("PROFILE -> saved project config to {} failed: {}".format(path, ex))
+
+
+def is_pipe_tag_symbol(sym):
+    try:
+        return sym.Category is not None and sym.Category.Id.IntegerValue == int(
+            BuiltInCategory.OST_PipeTags
+        )
+    except Exception:
+        return False
+
+
+def collect_loaded_pipe_tag_options(doc):
+    rows = []
+    seen = set()
+    try:
+        symbols = (
+            FilteredElementCollector(doc)
+            .OfClass(FamilySymbol)
+            .OfCategory(BuiltInCategory.OST_PipeTags)
+            .ToElements()
+        )
+    except Exception:
+        symbols = []
+    for sym in symbols:
+        try:
+            fam = sym.Family.Name if sym.Family else getattr(sym, "FamilyName", "")
+            typ = get_symbol_type_name(sym)
+            if not fam or not typ:
+                continue
+            key = (_norm(fam), _norm(typ))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"family": fam, "type": typ, "symbol": sym})
+        except Exception:
+            continue
+    rows.sort(key=lambda x: (x.get("family", ""), x.get("type", "")))
+    return rows
+
+
+def describe_pipe_tag_option(family_name, type_name):
+    sym = find_tag_symbol(doc, family_name, type_name)
+    if sym is None:
+        return "unresolved"
+    try:
+        cat = sym.Category.Name if sym.Category else ""
+        return "{} / {} / {} / {}".format(
+            family_name, type_name, cat, sym.Id.IntegerValue
+        )
+    except Exception:
+        return "{} / {} / Pipe Tags / {}".format(
+            family_name, type_name, sym.Id.IntegerValue
+        )
+
+
+def pipe_tag_family_names(tag_options):
+    names = []
+    seen = set()
+    for item in tag_options:
+        fam = item.get("family")
+        key = _norm(fam)
+        if fam and key not in seen:
+            seen.add(key)
+            names.append(fam)
+    return names
+
+
+def pipe_tag_type_names(tag_options, family_name):
+    names = []
+    fam_n = _norm(family_name)
+    for item in tag_options:
+        if _norm(item.get("family")) == fam_n:
+            names.append(item.get("type"))
+    return sorted([x for x in names if x])
+
+
+def get_symbol_display(sym):
+    try:
+        fam = sym.Family.Name if sym.Family else ""
+        typ = get_symbol_type_name(sym)
+        return "{} - {}".format(fam, typ)
+    except Exception:
+        return ""
+
+
+def collect_titleblock_options(doc):
+    rows = []
+    try:
+        symbols = (
+            FilteredElementCollector(doc)
+            .OfCategory(BuiltInCategory.OST_TitleBlocks)
+            .OfClass(FamilySymbol)
+            .ToElements()
+        )
+    except Exception:
+        symbols = []
+    for sym in symbols:
+        try:
+            display = get_symbol_display(sym)
+            if display:
+                rows.append({"display": display, "symbol": sym})
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x.get("display", ""))
+    return rows
+
+
+def get_schedule_category_text(schedule):
+    try:
+        cat_id = schedule.Definition.CategoryId
+        if cat_id and cat_id != ElementId.InvalidElementId:
+            cat = Category.GetCategory(doc, cat_id)
+            if cat:
+                return cat.Name or ""
+    except Exception:
+        pass
+    try:
+        if schedule.Definition.IsMultiCategory:
+            return "Multi-Category"
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def is_irrelevant_schedule_name(name_value):
+    name_lc = (name_value or "").lower()
+    reject_tokens = [
+        "revision",
+        "keynote",
+        "material",
+        "takeoff",
+        "sheet list",
+        "view list",
+        "internal",
+        "helper",
+        "working",
+    ]
+    return any(token in name_lc for token in reject_tokens)
+
+
+def schedule_matches_kind(schedule, kind):
+    name_lc = (schedule.Name or "").lower()
+    cat_lc = (get_schedule_category_text(schedule) or "").lower()
+    if kind == "pipe":
+        if "fitting" in name_lc or "fitting" in cat_lc:
+            return False
+        return (
+            "pipe" in cat_lc
+            or "pipes" in cat_lc
+            or ("pipe" in name_lc and "fitting" not in name_lc)
+        )
+    if kind == "fitting":
+        return (
+            "pipe fitting" in cat_lc
+            or "fitting" in cat_lc
+            or "multi-category" in cat_lc
+            or "multi category" in cat_lc
+            or "fitting" in name_lc
+        )
+    return True
+
+
+def collect_schedule_master_options(doc, kind=None):
+    rows = []
+    kind_lc = (kind or "").lower()
+    try:
+        schedules = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
+    except Exception:
+        schedules = []
+    for sched in schedules:
+        try:
+            if sched.IsTemplate:
+                continue
+            name_value = sched.Name or ""
+            if is_irrelevant_schedule_name(name_value):
+                continue
+            if kind_lc and not schedule_matches_kind(sched, kind_lc):
+                continue
+            name_lc = name_value.lower()
+            cat_text = get_schedule_category_text(sched)
+            score = 0
+            if kind_lc == "pipe":
+                if "pipe" in name_lc or "pipe" in cat_text.lower():
+                    score += 5
+                if "fitting" in name_lc:
+                    score -= 10
+            elif kind_lc == "fitting":
+                if "fitting" in name_lc or "fitting" in cat_text.lower():
+                    score += 5
+                if "multi" in cat_text.lower():
+                    score += 2
+                if "pipe" in name_lc:
+                    score += 1
+            if "master" in name_lc:
+                score += 2
+            if "template" in name_lc:
+                score += 1
+            rows.append(
+                {
+                    "name": name_value,
+                    "schedule": sched,
+                    "score": score,
+                    "category": cat_text,
+                }
+            )
+        except Exception:
+            continue
+    rows.sort(key=lambda x: (-x.get("score", 0), x.get("name", "")))
+    return rows
+
+
+def load_tag_family_from_file(doc):
+    before_options = collect_loaded_pipe_tag_options(doc)
+    before_count = len(before_options)
+    dlg = OpenFileDialog()
+    dlg.Title = "Load tag family from file"
+    dlg.Filter = "Revit Family (*.rfa)|*.rfa"
+    dlg.Multiselect = False
+    if dlg.ShowDialog() != DialogResult.OK:
+        return False
+    path = dlg.FileName
+    if not path or not path.lower().endswith(".rfa"):
+        TaskDialog.Show(get_runtime_window_title(), "Select a Revit family (*.rfa).")
+        return False
+    try:
+        loaded = False
+        with Transaction(doc, "Piping Sheet Gen - Load Tag Family") as t:
+            t.Start()
+            loaded = bool(doc.LoadFamily(path))
+            t.Commit()
+        if not loaded:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Family load did not report success:\n{}".format(path),
+            )
+            return False
+        after_options = collect_loaded_pipe_tag_options(doc)
+        file_family_hint = _norm(System.IO.Path.GetFileNameWithoutExtension(path))
+        matching_loaded_pipe_tags = [
+            item
+            for item in after_options
+            if _norm(item.get("family")) == file_family_hint
+        ]
+        if len(after_options) <= before_count and not matching_loaded_pipe_tags:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Loaded family is not a usable pipe tag family:\n{}".format(path),
+            )
+            print(
+                "CONFIG -> loaded tag family rejected as non-pipe-tag: {}".format(path)
+            )
+            return False
+        print("CONFIG -> loaded tag family from file: {}".format(path))
+        return True
+    except Exception as ex:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Could not load tag family:\n{}\n\n{}".format(path, ex),
+        )
+        return False
 
 
 def get_pipe_tag_type_from_existing_tags(doc, view):
@@ -780,7 +1139,7 @@ def resolve_required_tag_symbols(doc):
         if not _MISSING_TAG_TYPES_DIALOG_SHOWN:
             _MISSING_TAG_TYPES_DIALOG_SHOWN = True
             TaskDialog.Show(
-                "Missing Pipe Tag Types",
+                get_runtime_window_title(),
                 "Could not find required tag types:\n- " + "\n- ".join(missing),
             )
 
@@ -1069,7 +1428,7 @@ def is_nested_familyinstance(elem):
 def select_boundary_and_gather():
     if not isinstance(uidoc.ActiveView, ViewPlan):
         TaskDialog.Show(
-            "Bunge Sheet Generator",
+            get_runtime_window_title(),
             "Run this tool from a Floor Plan/Callout (ViewPlan) for reliable prefab scanning.",
         )
         return None, None
@@ -1096,14 +1455,17 @@ def select_boundary_and_gather():
 
     polygon = order_segments_to_polygon(segments[:])
     if polygon is None:
-        MessageBox.Show("The selected lines do not form a closed loop.", "Error")
+        MessageBox.Show(
+            "The selected lines do not form a closed loop.", get_runtime_window_title()
+        )
         return None, None
 
     active_plan = uidoc.ActiveView
     ground, first = get_scan_levels(active_plan)
     if ground is None:
         TaskDialog.Show(
-            "Bunge Sheet Generator", "Could not determine base level from active plan."
+            get_runtime_window_title(),
+            "Could not determine base level from active plan.",
         )
         return None, None
     z_min = ground.Elevation - mm_to_ft(500.0)
@@ -1166,7 +1528,8 @@ def select_boundary_and_gather():
 
     print("SCAN -> excluded NLRS pipes:", excluded_scan_nlrs)
     MessageBox.Show(
-        "Found {0} element(s) in region.".format(len(elements_inside)), "Boundary"
+        "Found {0} element(s) in region.".format(len(elements_inside)),
+        get_runtime_window_title(),
     )
     return elements_inside, polygon
 
@@ -1184,7 +1547,7 @@ from System.Windows.Forms import (
 
 class ElementEditorForm(Form):
     def __init__(self, elements_data, region_elements=None):
-        self.Text = "Edit Element Codes"
+        self.Text = "{} - Edit Element Codes".format(get_runtime_window_title())
         self.Width = 1050
         self.Height = 500
         self.MinimumSize = Size(700, 400)
@@ -1401,7 +1764,7 @@ class ElementEditorForm(Form):
         except Exception as ex:
             doc.Delete(tag.Id)
             TaskDialog.Show(
-                "Tag Type Error",
+                get_runtime_window_title(),
                 "Failed to apply tag type to created tag.\nHost: {}\nError: {}".format(
                     host.Id.IntegerValue, ex
                 ),
@@ -1442,10 +1805,12 @@ class ElementEditorForm(Form):
     def placePrefabTextNote(self, sender, e):
         raw = self.txtTextNoteCode.Text.strip()
         if not raw:
-            MessageBox.Show("Please enter a prefab text first.", "Info")
+            MessageBox.Show(
+                "Please enter a prefab text first.", get_runtime_window_title()
+            )
             return
         if not self.regionPolygon:
-            MessageBox.Show("No region polygon available.", "Error")
+            MessageBox.Show("No region polygon available.", get_runtime_window_title())
             return
         pminx, pminy, _, _ = polygon_bounds_xy(self.regionPolygon)
         note_pt = XYZ(pminx + XY_PAD, pminy + XY_PAD, 0)
@@ -1485,7 +1850,7 @@ class ElementEditorForm(Form):
     def bulkAddRemoveTags(self, sender, e):
         choice = MessageBox.Show(
             "Yes: Remove all pipe tags for all pipes in region.\nNo: Add missing pipe tags for all pipes in region.",
-            "Bulk Add/Remove Tags",
+            get_runtime_window_title(),
             MessageBoxButtons.YesNoCancel,
             MessageBoxIcon.Question,
         )
@@ -1516,14 +1881,14 @@ class ElementEditorForm(Form):
         self.refresh_pipe_tag_rows_and_status()
         if missing_types:
             TaskDialog.Show(
-                "Missing Pipe Tag Types",
+                get_runtime_window_title(),
                 "Could not find required tag types:\n- {}".format(
                     "\n- ".join(sorted(missing_types))
                 ),
             )
         if failures:
             TaskDialog.Show(
-                "Tag Failures",
+                get_runtime_window_title(),
                 "Tag creation failed for pipe ids:\n- {}".format(
                     "\n- ".join([str(x) for x in sorted(set(failures))])
                 ),
@@ -1533,7 +1898,9 @@ class ElementEditorForm(Form):
         raw = self.txtTextNoteCode.Text.strip()
         m = re.search(r"([\d\.]+)", raw)
         if not m:
-            MessageBox.Show("Could not parse base code from text note.", "Error")
+            MessageBox.Show(
+                "Could not parse base code from text note.", get_runtime_window_title()
+            )
             return
         base = m.group(1)
 
@@ -1596,14 +1963,14 @@ class ElementEditorForm(Form):
             self.refresh_pipe_tag_rows_and_status()
             if missing_types:
                 TaskDialog.Show(
-                    "Missing Pipe Tag Type",
+                    get_runtime_window_title(),
                     "Could not find required tag type:\n- {}".format(
                         "\n- ".join(sorted(missing_types))
                     ),
                 )
             elif failures:
                 TaskDialog.Show(
-                    "Tag Creation Failed",
+                    get_runtime_window_title(),
                     "Could not create a pipe tag for host id {}".format(
                         host.Id.IntegerValue
                     ),
@@ -1666,7 +2033,7 @@ def show_element_editor(elements_data, region_elements=None, region_polygon=None
 
 
 def choose_post_editor_workflow():
-    td = TaskDialog("Bunge Sheet Generator")
+    td = TaskDialog(get_runtime_window_title())
     td.MainInstruction = "Choose what to do next"
     td.MainContent = "Apply changes only, or continue with plan sheet creation."
     td.AddCommandLink(
@@ -1688,7 +2055,7 @@ def choose_post_editor_workflow():
 
 class RegularPipeTagModeForm(Form):
     def __init__(self):
-        self.Text = "Regular Pipe Tag Style"
+        self.Text = "{} - Regular Pipe Tag Style".format(get_runtime_window_title())
         self.Width = 520
         self.Height = 220
         self.FormBorderStyle = FormBorderStyle.FixedDialog
@@ -1756,7 +2123,7 @@ def prompt_regular_pipe_tag_mode():
         fallback_option = get_regular_pipe_tag_mode_option(
             REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
         )
-        td = TaskDialog("Missing Regular Pipe Tag Type")
+        td = TaskDialog(get_runtime_window_title())
         td.MainInstruction = "Selected regular pipe tag type was not found"
         td.MainContent = "Could not find selected regular pipe tag:\n{} - {}\n\nUse fallback?\n{} - {}".format(
             selected_option.get("family"),
@@ -1775,7 +2142,7 @@ def prompt_regular_pipe_tag_mode():
             )
         if sym is None:
             TaskDialog.Show(
-                "Missing Regular Pipe Tag Type",
+                get_runtime_window_title(),
                 "Fallback regular pipe tag type was also not found:\n{} - {}\n\nThe run will continue with the existing default behavior and Revit will report missing tag types if tagging cannot proceed.".format(
                     fallback_option.get("family"),
                     fallback_option.get("type"),
@@ -1793,6 +2160,876 @@ def log_regular_pipe_tag_mode(mode):
     print("TAG FAMILY -> {}".format(mode.get("family")))
     print("TAG TYPE -> {}".format(mode.get("type")))
     print("TAG MODE FALLBACK USED -> {}".format(bool(mode.get("fallback_used"))))
+
+
+class RunConfigurationForm(Form):
+    TITLEBLOCK_FALLBACK = "<Choose during sheet creation>"
+    SCHEDULE_FALLBACK = "<Use existing schedule fallback>"
+    SCHEDULE_MODE_AS_IS = "Use selected master as-is"
+    SCHEDULE_MODE_NORMALIZE = "Use selected master, then normalize to tool standard"
+    SCHEDULE_MODE_FALLBACK = (
+        "Ignore selected masters and use current fallback/build logic"
+    )
+
+    def __init__(self, profile):
+        self.profile = profile or {}
+        self.tag_options = collect_loaded_pipe_tag_options(doc)
+        self.titleblock_options = collect_titleblock_options(doc)
+        self.pipe_schedule_options = collect_schedule_master_options(doc, "pipe")
+        self.fitting_schedule_options = collect_schedule_master_options(doc, "fitting")
+
+        self.Text = "{} - Run Configuration".format(get_runtime_window_title())
+        self.Width = 820
+        self.Height = 820
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.MinimizeBox = False
+
+        self._build_regular_group()
+        self._build_vertical_group()
+        self._build_sheet_group()
+        self._build_buttons()
+        self._load_profile_defaults()
+        self._log_available_counts()
+        self._sync_enabled_state()
+        self._update_all_previews()
+
+    def _log_available_counts(self):
+        print(
+            "CONFIG UI -> available regular custom tag families: {}".format(
+                len(pipe_tag_family_names(self.tag_options))
+            )
+        )
+        print(
+            "CONFIG UI -> available vertical custom tag families: {}".format(
+                len(pipe_tag_family_names(self.tag_options))
+            )
+        )
+        print(
+            "CONFIG UI -> available titleblocks: {}".format(
+                len(self.titleblock_options)
+            )
+        )
+        print(
+            "CONFIG UI -> available pipe schedule masters: {}".format(
+                len(self.pipe_schedule_options)
+            )
+        )
+        print(
+            "CONFIG UI -> available fitting schedule masters: {}".format(
+                len(self.fitting_schedule_options)
+            )
+        )
+
+    def _build_regular_group(self):
+        group = GroupBox()
+        group.Text = "A. Regular pipe tag"
+        group.Location = Point(12, 12)
+        group.Size = Size(780, 185)
+        self.Controls.Add(group)
+
+        self.rb_regular_length = RadioButton()
+        self.rb_regular_length.Text = "Diameter + pipe length"
+        self.rb_regular_length.Location = Point(14, 24)
+        self.rb_regular_length.Size = Size(220, 22)
+        self.rb_regular_length.Checked = True
+        group.Controls.Add(self.rb_regular_length)
+
+        self.rb_regular_height = RadioButton()
+        self.rb_regular_height.Text = "Diameter + height"
+        self.rb_regular_height.Location = Point(14, 50)
+        self.rb_regular_height.Size = Size(220, 22)
+        group.Controls.Add(self.rb_regular_height)
+
+        self.rb_regular_custom = RadioButton()
+        self.rb_regular_custom.Text = "Custom loaded family/type"
+        self.rb_regular_custom.Location = Point(14, 76)
+        self.rb_regular_custom.Size = Size(220, 22)
+        self.rb_regular_custom.CheckedChanged += self._on_regular_mode_changed
+        group.Controls.Add(self.rb_regular_custom)
+
+        fam_label = Label()
+        fam_label.Text = "Family"
+        fam_label.Location = Point(250, 24)
+        fam_label.Size = Size(80, 18)
+        group.Controls.Add(fam_label)
+
+        self.cbo_regular_family = ComboBox()
+        self.cbo_regular_family.Location = Point(330, 22)
+        self.cbo_regular_family.Size = Size(420, 24)
+        self.cbo_regular_family.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_regular_family.SelectedIndexChanged += self._on_regular_family_changed
+        group.Controls.Add(self.cbo_regular_family)
+
+        type_label = Label()
+        type_label.Text = "Type"
+        type_label.Location = Point(250, 58)
+        type_label.Size = Size(80, 18)
+        group.Controls.Add(type_label)
+
+        self.cbo_regular_type = ComboBox()
+        self.cbo_regular_type.Location = Point(330, 56)
+        self.cbo_regular_type.Size = Size(420, 24)
+        self.cbo_regular_type.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_regular_type.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_regular_type)
+
+        refresh = Button()
+        refresh.Text = "Refresh loaded tags"
+        refresh.Location = Point(330, 98)
+        refresh.Size = Size(160, 28)
+        refresh.Click += self._on_refresh_tags
+        group.Controls.Add(refresh)
+
+        load = Button()
+        load.Text = "Load tag family from file..."
+        load.Location = Point(500, 98)
+        load.Size = Size(210, 28)
+        load.Click += self._on_load_tag_family
+        group.Controls.Add(load)
+
+        self.lbl_regular_preview = Label()
+        self.lbl_regular_preview.Text = (
+            "Regular pipe tag resolved to: fallback to built-in regular preset"
+        )
+        self.lbl_regular_preview.Location = Point(14, 136)
+        self.lbl_regular_preview.Size = Size(730, 36)
+        group.Controls.Add(self.lbl_regular_preview)
+
+    def _build_vertical_group(self):
+        group = GroupBox()
+        group.Text = "B. Vertical pipe tag"
+        group.Location = Point(12, 205)
+        group.Size = Size(780, 160)
+        self.Controls.Add(group)
+
+        self.chk_vertical_override = CheckBox()
+        self.chk_vertical_override.Text = "Use custom vertical tag family/type"
+        self.chk_vertical_override.Location = Point(14, 26)
+        self.chk_vertical_override.Size = Size(260, 22)
+        self.chk_vertical_override.CheckedChanged += self._on_vertical_override_changed
+        group.Controls.Add(self.chk_vertical_override)
+
+        fam_label = Label()
+        fam_label.Text = "Family"
+        fam_label.Location = Point(250, 26)
+        fam_label.Size = Size(80, 18)
+        group.Controls.Add(fam_label)
+
+        self.cbo_vertical_family = ComboBox()
+        self.cbo_vertical_family.Location = Point(330, 24)
+        self.cbo_vertical_family.Size = Size(420, 24)
+        self.cbo_vertical_family.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_vertical_family.SelectedIndexChanged += (
+            self._on_vertical_family_changed
+        )
+        group.Controls.Add(self.cbo_vertical_family)
+
+        type_label = Label()
+        type_label.Text = "Type"
+        type_label.Location = Point(250, 60)
+        type_label.Size = Size(80, 18)
+        group.Controls.Add(type_label)
+
+        self.cbo_vertical_type = ComboBox()
+        self.cbo_vertical_type.Location = Point(330, 58)
+        self.cbo_vertical_type.Size = Size(420, 24)
+        self.cbo_vertical_type.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_vertical_type.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_vertical_type)
+
+        refresh = Button()
+        refresh.Text = "Refresh loaded tags"
+        refresh.Location = Point(330, 96)
+        refresh.Size = Size(160, 28)
+        refresh.Click += self._on_refresh_tags
+        group.Controls.Add(refresh)
+
+        load = Button()
+        load.Text = "Load tag family from file..."
+        load.Location = Point(500, 96)
+        load.Size = Size(210, 28)
+        load.Click += self._on_load_tag_family
+        group.Controls.Add(load)
+
+        self.lbl_vertical_preview = Label()
+        self.lbl_vertical_preview.Text = (
+            "Vertical pipe tag resolved to: fallback to existing vertical behavior"
+        )
+        self.lbl_vertical_preview.Location = Point(14, 128)
+        self.lbl_vertical_preview.Size = Size(730, 24)
+        group.Controls.Add(self.lbl_vertical_preview)
+
+    def _build_sheet_group(self):
+        group = GroupBox()
+        group.Text = "C. Sheet creation assets"
+        group.Location = Point(12, 375)
+        group.Size = Size(780, 320)
+        self.Controls.Add(group)
+
+        tb_label = Label()
+        tb_label.Text = "Titleblock"
+        tb_label.Location = Point(14, 30)
+        tb_label.Size = Size(150, 18)
+        group.Controls.Add(tb_label)
+
+        self.cbo_titleblock = ComboBox()
+        self.cbo_titleblock.Location = Point(180, 28)
+        self.cbo_titleblock.Size = Size(570, 24)
+        self.cbo_titleblock.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_titleblock.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_titleblock)
+
+        pipe_label = Label()
+        pipe_label.Text = "Pipe schedule master"
+        pipe_label.Location = Point(14, 70)
+        pipe_label.Size = Size(150, 18)
+        group.Controls.Add(pipe_label)
+
+        self.cbo_pipe_schedule = ComboBox()
+        self.cbo_pipe_schedule.Location = Point(180, 68)
+        self.cbo_pipe_schedule.Size = Size(570, 24)
+        self.cbo_pipe_schedule.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_pipe_schedule.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_pipe_schedule)
+
+        fit_label = Label()
+        fit_label.Text = "Fitting schedule master"
+        fit_label.Location = Point(14, 110)
+        fit_label.Size = Size(150, 18)
+        group.Controls.Add(fit_label)
+
+        self.cbo_fitting_schedule = ComboBox()
+        self.cbo_fitting_schedule.Location = Point(180, 108)
+        self.cbo_fitting_schedule.Size = Size(570, 24)
+        self.cbo_fitting_schedule.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_fitting_schedule.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_fitting_schedule)
+
+        mode_label = Label()
+        mode_label.Text = "Schedule mode"
+        mode_label.Location = Point(14, 150)
+        mode_label.Size = Size(150, 18)
+        group.Controls.Add(mode_label)
+
+        self.cbo_schedule_mode = ComboBox()
+        self.cbo_schedule_mode.Location = Point(180, 148)
+        self.cbo_schedule_mode.Size = Size(570, 24)
+        self.cbo_schedule_mode.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_schedule_mode.Items.Add(self.SCHEDULE_MODE_AS_IS)
+        self.cbo_schedule_mode.Items.Add(self.SCHEDULE_MODE_NORMALIZE)
+        self.cbo_schedule_mode.Items.Add(self.SCHEDULE_MODE_FALLBACK)
+        self.cbo_schedule_mode.SelectedIndex = 2
+        self.cbo_schedule_mode.SelectedIndexChanged += self._on_schedule_mode_changed
+        group.Controls.Add(self.cbo_schedule_mode)
+
+        self.chk_use_schedule_masters = CheckBox()
+        self.chk_use_schedule_masters.Text = (
+            "Use selected master schedules when creating sheet"
+        )
+        self.chk_use_schedule_masters.Location = Point(180, 180)
+        self.chk_use_schedule_masters.Size = Size(380, 22)
+        self.chk_use_schedule_masters.Visible = False
+        group.Controls.Add(self.chk_use_schedule_masters)
+
+        self.chk_remember_project = CheckBox()
+        self.chk_remember_project.Text = "Remember selections for this project"
+        self.chk_remember_project.Location = Point(180, 205)
+        self.chk_remember_project.Size = Size(300, 22)
+        group.Controls.Add(self.chk_remember_project)
+
+        self.lbl_titleblock_preview = Label()
+        self.lbl_titleblock_preview.Location = Point(14, 232)
+        self.lbl_titleblock_preview.Size = Size(730, 18)
+        group.Controls.Add(self.lbl_titleblock_preview)
+
+        self.lbl_pipe_schedule_preview = Label()
+        self.lbl_pipe_schedule_preview.Location = Point(14, 254)
+        self.lbl_pipe_schedule_preview.Size = Size(730, 18)
+        group.Controls.Add(self.lbl_pipe_schedule_preview)
+
+        self.lbl_fitting_schedule_preview = Label()
+        self.lbl_fitting_schedule_preview.Location = Point(14, 276)
+        self.lbl_fitting_schedule_preview.Size = Size(730, 18)
+        group.Controls.Add(self.lbl_fitting_schedule_preview)
+
+    def _build_buttons(self):
+        ok = Button()
+        ok.Text = "OK"
+        ok.Location = Point(615, 710)
+        ok.Size = Size(80, 30)
+        ok.DialogResult = DialogResult.OK
+        self.Controls.Add(ok)
+
+        cancel = Button()
+        cancel.Text = "Cancel"
+        cancel.Location = Point(710, 710)
+        cancel.Size = Size(80, 30)
+        cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(cancel)
+
+        self.AcceptButton = ok
+        self.CancelButton = cancel
+
+    def _load_profile_defaults(self):
+        self._refresh_tag_dropdowns()
+        self._refresh_sheet_dropdowns()
+        mode = self.profile.get("regular_tag_mode") or REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        if mode == "DIAMETER_HEIGHT":
+            self.rb_regular_height.Checked = True
+        elif mode == "CUSTOM":
+            self.rb_regular_custom.Checked = True
+        else:
+            self.rb_regular_length.Checked = True
+        self._select_combo_text(
+            self.cbo_regular_family, self.profile.get("regular_tag_family_name")
+        )
+        self._refresh_type_combo(
+            self.cbo_regular_type, self.cbo_regular_family.SelectedItem
+        )
+        self._select_combo_text(
+            self.cbo_regular_type, self.profile.get("regular_tag_type_name")
+        )
+        self.chk_vertical_override.Checked = bool(
+            self.profile.get("vertical_tag_override_enabled", False)
+        )
+        self._select_combo_text(
+            self.cbo_vertical_family, self.profile.get("vertical_tag_family_name")
+        )
+        self._refresh_type_combo(
+            self.cbo_vertical_type, self.cbo_vertical_family.SelectedItem
+        )
+        self._select_combo_text(
+            self.cbo_vertical_type, self.profile.get("vertical_tag_type_name")
+        )
+        self._select_combo_text(
+            self.cbo_titleblock, self.profile.get("titleblock_display")
+        )
+        self._select_combo_text(
+            self.cbo_pipe_schedule, self.profile.get("pipe_schedule_master_name")
+        )
+        self._select_combo_text(
+            self.cbo_fitting_schedule, self.profile.get("fitting_schedule_master_name")
+        )
+        schedule_mode = self.profile.get("schedule_mode")
+        if not schedule_mode:
+            schedule_mode = (
+                self.SCHEDULE_MODE_AS_IS
+                if self.profile.get("use_selected_schedule_masters", False)
+                else self.SCHEDULE_MODE_FALLBACK
+            )
+        self._select_combo_text(self.cbo_schedule_mode, schedule_mode)
+        self.chk_use_schedule_masters.Checked = (
+            str(self.cbo_schedule_mode.SelectedItem or "")
+            != self.SCHEDULE_MODE_FALLBACK
+        )
+
+    def _select_combo_text(self, combo, value):
+        if not value:
+            return False
+        for i in range(combo.Items.Count):
+            if str(combo.Items[i]) == str(value):
+                combo.SelectedIndex = i
+                return True
+        return False
+
+    def _refresh_tag_dropdowns(self):
+        self.tag_options = collect_loaded_pipe_tag_options(doc)
+        families = pipe_tag_family_names(self.tag_options)
+        for combo in [self.cbo_regular_family, self.cbo_vertical_family]:
+            current = combo.SelectedItem
+            combo.Items.Clear()
+            for fam in families:
+                combo.Items.Add(fam)
+            if current and not self._select_combo_text(combo, current):
+                combo.SelectedIndex = -1
+            elif combo.Items.Count > 0 and combo.SelectedIndex < 0:
+                combo.SelectedIndex = 0
+        self._refresh_type_combo(
+            self.cbo_regular_type, self.cbo_regular_family.SelectedItem
+        )
+        self._refresh_type_combo(
+            self.cbo_vertical_type, self.cbo_vertical_family.SelectedItem
+        )
+
+    def _refresh_type_combo(self, combo, family_name):
+        current = combo.SelectedItem
+        combo.Items.Clear()
+        for typ in pipe_tag_type_names(self.tag_options, family_name):
+            combo.Items.Add(typ)
+        if current and self._select_combo_text(combo, current):
+            return
+        if combo.Items.Count > 0:
+            combo.SelectedIndex = 0
+        self._update_all_previews()
+
+    def _refresh_sheet_dropdowns(self):
+        self.cbo_titleblock.Items.Clear()
+        self.cbo_titleblock.Items.Add(self.TITLEBLOCK_FALLBACK)
+        for item in self.titleblock_options:
+            self.cbo_titleblock.Items.Add(item.get("display"))
+        self.cbo_titleblock.SelectedIndex = 0
+
+        self.cbo_pipe_schedule.Items.Clear()
+        self.cbo_pipe_schedule.Items.Add(self.SCHEDULE_FALLBACK)
+        for item in self.pipe_schedule_options:
+            self.cbo_pipe_schedule.Items.Add(item.get("name"))
+        self.cbo_pipe_schedule.SelectedIndex = 0
+
+        self.cbo_fitting_schedule.Items.Clear()
+        self.cbo_fitting_schedule.Items.Add(self.SCHEDULE_FALLBACK)
+        for item in self.fitting_schedule_options:
+            self.cbo_fitting_schedule.Items.Add(item.get("name"))
+        self.cbo_fitting_schedule.SelectedIndex = 0
+
+    def _sync_enabled_state(self):
+        custom_regular = self.rb_regular_custom.Checked
+        self.cbo_regular_family.Enabled = custom_regular
+        self.cbo_regular_type.Enabled = custom_regular
+        vertical_custom = self.chk_vertical_override.Checked
+        self.cbo_vertical_family.Enabled = vertical_custom
+        self.cbo_vertical_type.Enabled = vertical_custom
+        self._update_all_previews()
+
+    def _on_regular_mode_changed(self, sender, event):
+        self._sync_enabled_state()
+
+    def _on_vertical_override_changed(self, sender, event):
+        self._sync_enabled_state()
+
+    def _on_regular_family_changed(self, sender, event):
+        self._refresh_type_combo(
+            self.cbo_regular_type, self.cbo_regular_family.SelectedItem
+        )
+        self._update_all_previews()
+
+    def _on_vertical_family_changed(self, sender, event):
+        self._refresh_type_combo(
+            self.cbo_vertical_type, self.cbo_vertical_family.SelectedItem
+        )
+        self._update_all_previews()
+
+    def _on_schedule_mode_changed(self, sender, event):
+        self.chk_use_schedule_masters.Checked = (
+            str(self.cbo_schedule_mode.SelectedItem or "")
+            != self.SCHEDULE_MODE_FALLBACK
+        )
+        self._update_all_previews()
+
+    def _on_selection_changed(self, sender, event):
+        self._update_all_previews()
+
+    def _on_refresh_tags(self, sender, event):
+        self._refresh_tag_dropdowns()
+
+    def _on_load_tag_family(self, sender, event):
+        before_regular_family = str(self.cbo_regular_family.SelectedItem or "")
+        before_regular_type = str(self.cbo_regular_type.SelectedItem or "")
+        before_vertical_family = str(self.cbo_vertical_family.SelectedItem or "")
+        before_vertical_type = str(self.cbo_vertical_type.SelectedItem or "")
+        if load_tag_family_from_file(doc):
+            self._refresh_tag_dropdowns()
+            if (
+                str(self.cbo_regular_family.SelectedItem or "") != before_regular_family
+                or str(self.cbo_regular_type.SelectedItem or "") != before_regular_type
+            ):
+                print(
+                    "CONFIG -> first loaded regular tag type selected after refresh: {} / {}".format(
+                        self.cbo_regular_family.SelectedItem,
+                        self.cbo_regular_type.SelectedItem,
+                    )
+                )
+            if (
+                str(self.cbo_vertical_family.SelectedItem or "")
+                != before_vertical_family
+                or str(self.cbo_vertical_type.SelectedItem or "")
+                != before_vertical_type
+            ):
+                print(
+                    "CONFIG -> first loaded vertical tag type selected after refresh: {} / {}".format(
+                        self.cbo_vertical_family.SelectedItem,
+                        self.cbo_vertical_type.SelectedItem,
+                    )
+                )
+            print("CONFIG -> loaded family; refreshed tag dropdowns")
+            self._update_all_previews()
+
+    def _find_titleblock_display_item(self, display):
+        for item in self.titleblock_options:
+            if item.get("display") == display:
+                return item
+        return None
+
+    def _find_schedule_item(self, options, name):
+        for item in options:
+            if item.get("name") == name:
+                return item
+        return None
+
+    def _update_all_previews(self):
+        try:
+            if self.rb_regular_custom.Checked:
+                self.lbl_regular_preview.Text = (
+                    "Regular pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(
+                            self.cbo_regular_family.SelectedItem,
+                            self.cbo_regular_type.SelectedItem,
+                        )
+                    )
+                )
+            elif self.rb_regular_height.Checked:
+                opt = get_regular_pipe_tag_mode_option("DIAMETER_HEIGHT")
+                self.lbl_regular_preview.Text = (
+                    "Regular pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(opt.get("family"), opt.get("type"))
+                    )
+                )
+            else:
+                opt = get_regular_pipe_tag_mode_option("DIAMETER_LENGTH")
+                self.lbl_regular_preview.Text = (
+                    "Regular pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(opt.get("family"), opt.get("type"))
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            if self.chk_vertical_override.Checked:
+                self.lbl_vertical_preview.Text = (
+                    "Vertical pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(
+                            self.cbo_vertical_family.SelectedItem,
+                            self.cbo_vertical_type.SelectedItem,
+                        )
+                    )
+                )
+            else:
+                self.lbl_vertical_preview.Text = "Vertical pipe tag resolved to: fallback to existing vertical behavior"
+        except Exception:
+            pass
+        try:
+            tb_display = str(self.cbo_titleblock.SelectedItem or "")
+            tb_item = self._find_titleblock_display_item(tb_display)
+            if tb_item:
+                sym = tb_item.get("symbol")
+                self.lbl_titleblock_preview.Text = (
+                    "Titleblock resolved to: {} / {}".format(
+                        tb_display, sym.Id.IntegerValue
+                    )
+                )
+            else:
+                self.lbl_titleblock_preview.Text = (
+                    "Titleblock resolved to: choose during sheet creation"
+                )
+        except Exception:
+            pass
+        try:
+            schedule_mode = str(self.cbo_schedule_mode.SelectedItem or "")
+            if schedule_mode == self.SCHEDULE_MODE_FALLBACK:
+                self.lbl_pipe_schedule_preview.Text = "Pipe schedule master resolved to: fallback to schedule auto-build logic"
+                self.lbl_fitting_schedule_preview.Text = "Fitting schedule master resolved to: fallback to schedule auto-build logic"
+                return
+            pipe_name = str(self.cbo_pipe_schedule.SelectedItem or "")
+            pipe_item = self._find_schedule_item(self.pipe_schedule_options, pipe_name)
+            if pipe_item:
+                sched = pipe_item.get("schedule")
+                self.lbl_pipe_schedule_preview.Text = (
+                    "Pipe schedule master resolved to: {} / {} / {}".format(
+                        pipe_name,
+                        pipe_item.get("category") or get_schedule_category_text(sched),
+                        sched.Id.IntegerValue,
+                    )
+                )
+            else:
+                self.lbl_pipe_schedule_preview.Text = "Pipe schedule master resolved to: fallback to schedule auto-build logic"
+        except Exception:
+            pass
+        try:
+            fit_name = str(self.cbo_fitting_schedule.SelectedItem or "")
+            fit_item = self._find_schedule_item(self.fitting_schedule_options, fit_name)
+            if fit_item:
+                sched = fit_item.get("schedule")
+                self.lbl_fitting_schedule_preview.Text = (
+                    "Fitting schedule master resolved to: {} / {} / {}".format(
+                        fit_name,
+                        fit_item.get("category") or get_schedule_category_text(sched),
+                        sched.Id.IntegerValue,
+                    )
+                )
+            else:
+                self.lbl_fitting_schedule_preview.Text = "Fitting schedule master resolved to: fallback to schedule auto-build logic"
+        except Exception:
+            pass
+
+    def get_config(self):
+        if self.rb_regular_custom.Checked:
+            regular_mode = "CUSTOM"
+            regular_family = str(self.cbo_regular_family.SelectedItem or "")
+            regular_type = str(self.cbo_regular_type.SelectedItem or "")
+        elif self.rb_regular_height.Checked:
+            opt = get_regular_pipe_tag_mode_option("DIAMETER_HEIGHT")
+            regular_mode = opt.get("key")
+            regular_family = opt.get("family")
+            regular_type = opt.get("type")
+        else:
+            opt = get_regular_pipe_tag_mode_option("DIAMETER_LENGTH")
+            regular_mode = opt.get("key")
+            regular_family = opt.get("family")
+            regular_type = opt.get("type")
+
+        titleblock_display = str(self.cbo_titleblock.SelectedItem or "")
+        if titleblock_display == self.TITLEBLOCK_FALLBACK:
+            titleblock_display = ""
+        pipe_schedule_name = str(self.cbo_pipe_schedule.SelectedItem or "")
+        if pipe_schedule_name == self.SCHEDULE_FALLBACK:
+            pipe_schedule_name = ""
+        fitting_schedule_name = str(self.cbo_fitting_schedule.SelectedItem or "")
+        if fitting_schedule_name == self.SCHEDULE_FALLBACK:
+            fitting_schedule_name = ""
+        schedule_mode = str(self.cbo_schedule_mode.SelectedItem or "")
+        if not schedule_mode:
+            schedule_mode = self.SCHEDULE_MODE_FALLBACK
+
+        return {
+            "regular_tag_mode": regular_mode,
+            "regular_tag_family_name": regular_family,
+            "regular_tag_type_name": regular_type,
+            "vertical_tag_override_enabled": bool(self.chk_vertical_override.Checked),
+            "vertical_tag_family_name": str(
+                self.cbo_vertical_family.SelectedItem or ""
+            ),
+            "vertical_tag_type_name": str(self.cbo_vertical_type.SelectedItem or ""),
+            "selected_titleblock_id": None,
+            "titleblock_display": titleblock_display,
+            "schedule_mode": schedule_mode,
+            "use_selected_schedule_masters": schedule_mode
+            != self.SCHEDULE_MODE_FALLBACK,
+            "selected_pipe_schedule_master_id": None,
+            "pipe_schedule_master_name": pipe_schedule_name,
+            "selected_fitting_schedule_master_id": None,
+            "fitting_schedule_master_name": fitting_schedule_name,
+            "remember_for_project": bool(self.chk_remember_project.Checked),
+        }
+
+
+def find_titleblock_by_display(display):
+    if not display:
+        return None
+    for item in collect_titleblock_options(doc):
+        if item.get("display") == display:
+            return item.get("symbol")
+    return None
+
+
+def find_schedule_by_name(name, kind=None):
+    if not name:
+        return None
+    for item in collect_schedule_master_options(doc, kind):
+        if item.get("name") == name:
+            return item.get("schedule")
+    return None
+
+
+def resolve_runtime_config(runtime_config):
+    if runtime_config is None:
+        return None
+
+    regular_sym = find_tag_symbol(
+        doc,
+        runtime_config.get("regular_tag_family_name"),
+        runtime_config.get("regular_tag_type_name"),
+    )
+    fallback_used = False
+    if regular_sym is None:
+        fallback_used = True
+        fallback_option = get_regular_pipe_tag_mode_option(
+            REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        )
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Selected regular pipe tag was not found:\n{} - {}\n\nUsing fallback:\n{} - {}".format(
+                runtime_config.get("regular_tag_family_name"),
+                runtime_config.get("regular_tag_type_name"),
+                fallback_option.get("family"),
+                fallback_option.get("type"),
+            ),
+        )
+        runtime_config["regular_tag_mode"] = fallback_option.get("key")
+        runtime_config["regular_tag_family_name"] = fallback_option.get("family")
+        runtime_config["regular_tag_type_name"] = fallback_option.get("type")
+        regular_sym = find_regular_pipe_tag_symbol(fallback_option)
+    else:
+        ensure_symbol_active(doc, regular_sym)
+
+    regular_mode = dict(
+        key=runtime_config.get("regular_tag_mode") or "CUSTOM",
+        label=runtime_config.get("regular_tag_mode") or "Custom loaded family/type",
+        family=runtime_config.get("regular_tag_family_name"),
+        type=runtime_config.get("regular_tag_type_name"),
+        leader=True,
+        offset_mm=SAFE_CFG.get("tag_offset_mm", 250),
+        fallback_used=fallback_used,
+        symbol=regular_sym,
+    )
+    if runtime_config.get("regular_tag_mode") == "DIAMETER_LENGTH":
+        regular_mode["offset_mm"] = 500
+    elif runtime_config.get("regular_tag_mode") == "DIAMETER_HEIGHT":
+        regular_mode["offset_mm"] = 350
+    apply_regular_pipe_tag_mode(regular_mode)
+    runtime_config["regular_tag_mode_config"] = regular_mode
+    print(
+        "CONFIG RESOLVE -> regular tag: {}".format(
+            "fallback" if fallback_used else "resolved"
+        )
+    )
+
+    vertical_override = bool(runtime_config.get("vertical_tag_override_enabled"))
+    if vertical_override:
+        vertical_sym = find_tag_symbol(
+            doc,
+            runtime_config.get("vertical_tag_family_name"),
+            runtime_config.get("vertical_tag_type_name"),
+        )
+        if vertical_sym is None:
+            print("CONFIG RESOLVE -> vertical tag: fallback selected type missing")
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Selected vertical pipe tag was not found:\n{} - {}\n\nUsing existing vertical tag behavior.".format(
+                    runtime_config.get("vertical_tag_family_name"),
+                    runtime_config.get("vertical_tag_type_name"),
+                ),
+            )
+            runtime_config["vertical_tag_override_enabled"] = False
+        else:
+            ensure_symbol_active(doc, vertical_sym)
+            TAGCFG_VERD["family"] = runtime_config.get("vertical_tag_family_name")
+            TAGCFG_VERD["type"] = runtime_config.get("vertical_tag_type_name")
+            _RESOLVED_TAG_SYMBOLS["PIPE_VERTICAL"] = vertical_sym
+            print("CONFIG RESOLVE -> vertical tag: resolved")
+    else:
+        print("CONFIG RESOLVE -> vertical tag: fallback existing behavior")
+
+    tb = find_titleblock_by_display(runtime_config.get("titleblock_display"))
+    if tb is not None:
+        runtime_config["selected_titleblock_id"] = tb.Id.IntegerValue
+        print(
+            "CONFIG RESOLVE -> titleblock: resolved {}".format(
+                runtime_config.get("titleblock_display")
+            )
+        )
+    else:
+        runtime_config["selected_titleblock_id"] = None
+        print("CONFIG RESOLVE -> titleblock: fallback choose during sheet creation")
+
+    pipe_sched = find_schedule_by_name(
+        runtime_config.get("pipe_schedule_master_name"), "pipe"
+    )
+    if pipe_sched is not None:
+        runtime_config["selected_pipe_schedule_master_id"] = pipe_sched.Id.IntegerValue
+        print(
+            "CONFIG RESOLVE -> pipe schedule master: resolved {}".format(
+                pipe_sched.Name
+            )
+        )
+    else:
+        runtime_config["selected_pipe_schedule_master_id"] = None
+        if runtime_config.get("use_selected_schedule_masters"):
+            print(
+                "CONFIG RESOLVE -> pipe schedule master: fallback existing build logic"
+            )
+
+    fit_sched = find_schedule_by_name(
+        runtime_config.get("fitting_schedule_master_name"), "fitting"
+    )
+    if fit_sched is not None:
+        runtime_config["selected_fitting_schedule_master_id"] = (
+            fit_sched.Id.IntegerValue
+        )
+        print(
+            "CONFIG RESOLVE -> fitting schedule master: resolved {}".format(
+                fit_sched.Name
+            )
+        )
+    else:
+        runtime_config["selected_fitting_schedule_master_id"] = None
+        if runtime_config.get("use_selected_schedule_masters"):
+            print(
+                "CONFIG RESOLVE -> fitting schedule master: fallback existing build logic"
+            )
+    print(
+        "CONFIG RESOLVE -> schedule mode: {}".format(
+            runtime_config.get("schedule_mode")
+        )
+    )
+
+    log_runtime_config(runtime_config)
+    if runtime_config.get("remember_for_project"):
+        save_project_profile(doc, runtime_config)
+    return runtime_config
+
+
+def log_runtime_config(runtime_config):
+    print(
+        "CONFIG -> regular tag mode = {}".format(runtime_config.get("regular_tag_mode"))
+    )
+    print(
+        "CONFIG -> regular tag family = {}".format(
+            runtime_config.get("regular_tag_family_name")
+        )
+    )
+    print(
+        "CONFIG -> regular tag type = {}".format(
+            runtime_config.get("regular_tag_type_name")
+        )
+    )
+    print(
+        "CONFIG -> vertical override = {}".format(
+            bool(runtime_config.get("vertical_tag_override_enabled"))
+        )
+    )
+    print(
+        "CONFIG -> vertical family = {}".format(
+            runtime_config.get("vertical_tag_family_name")
+        )
+    )
+    print(
+        "CONFIG -> vertical type = {}".format(
+            runtime_config.get("vertical_tag_type_name")
+        )
+    )
+    print("CONFIG -> schedule mode = {}".format(runtime_config.get("schedule_mode")))
+    print(
+        "CONFIG -> use schedule masters = {}".format(
+            bool(runtime_config.get("use_selected_schedule_masters"))
+        )
+    )
+    print(
+        "CONFIG -> pipe schedule master = {}".format(
+            runtime_config.get("pipe_schedule_master_name")
+        )
+    )
+    print(
+        "CONFIG -> fitting schedule master = {}".format(
+            runtime_config.get("fitting_schedule_master_name")
+        )
+    )
+    print("CONFIG -> titleblock = {}".format(runtime_config.get("titleblock_display")))
+    print(
+        "CONFIG -> remember for project = {}".format(
+            bool(runtime_config.get("remember_for_project"))
+        )
+    )
+
+
+def prompt_run_configuration():
+    profile = load_project_profile(doc)
+    form = RunConfigurationForm(profile)
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+    runtime_config = form.get_config()
+    return resolve_runtime_config(runtime_config)
 
 
 # ==================================================
@@ -2099,7 +3336,7 @@ def auto_tag_pipes_in_view(doc, view, use_leader=False, tag_aco=None, tag_vert=N
     )
     if missing:
         TaskDialog.Show(
-            "Missing Pipe Tag Types",
+            get_runtime_window_title(),
             "Could not find required tag types:\n- {}".format(
                 "\n- ".join(sorted(missing))
             ),
@@ -3349,6 +4586,7 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
     text_count = 0
     fitting_number_count = 0
     displaced_vertical_tags = 0
+    exploded_vertical_tag_ids = []
     occupied_pipe_label_rects = []
     relevant_elems, pipes, fittings, excluded_nlrs_pipe_count = get_prefab_3d_elements(
         scanned_elems
@@ -3441,6 +4679,10 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                     pass
                 successful_real_tag_count += 1
                 displaced_vertical_tags += 1
+                try:
+                    exploded_vertical_tag_ids.append(tag.Id.IntegerValue)
+                except Exception:
+                    pass
                 print(
                     "EXP PIPE TAG",
                     pipe.Id.IntegerValue,
@@ -3709,6 +4951,8 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
         "failed": failed_real_tag_count,
         "vertical_real": displaced_vertical_tags,
         "vertical_onhost": displaced_vertical_tags,
+        "vertical_no_leader": len(exploded_vertical_tag_ids),
+        "vertical_tag_ids": exploded_vertical_tag_ids,
         "regular_real": regular_tag_count,
         "regular_leader": regular_tag_count,
         "extra_real": extra_tag_count,
@@ -4612,6 +5856,11 @@ def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_
         schedule.Name = schedule_name
     except Exception:
         schedule.Name = "{} ({})".format(schedule_name, schedule.Id.IntegerValue)
+    configure_pipe_schedule_tool_standard(schedule, current_prefix, source_view)
+    return schedule, "reconstructed"
+
+
+def configure_pipe_schedule_tool_standard(schedule, current_prefix, source_view):
     remove_all_schedule_fields(schedule)
     pipe_fields = [
         "Segment Description",
@@ -4683,7 +5932,7 @@ def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_
         schedule.ShowTitle = True
     except Exception:
         pass
-    return schedule, "reconstructed"
+    return schedule
 
 
 def build_fitting_schedule_from_scratch(
@@ -4704,7 +5953,18 @@ def build_fitting_schedule_from_scratch(
     return schedule, "reconstructed"
 
 
-def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
+def apply_current_run_comments_filter(schedule, current_prefix):
+    remove_schedule_filters_by_field_names(schedule, ["Comments"])
+    add_schedule_field_by_name(schedule, "Comments")
+    set_schedule_field_hidden(schedule, "Comments", True)
+    return add_schedule_string_filter(
+        schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+    )
+
+
+def create_prefab_schedule(
+    doc, kind, sheet_code, current_prefix, source_view, runtime_config=None
+):
     schedule = None
     mode = "reconstructed"
     level_name = ""
@@ -4716,34 +5976,72 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
         )
     except Exception:
         level_name = ""
+    selected_master = None
+    schedule_mode = (
+        runtime_config.get("schedule_mode")
+        if runtime_config
+        else "Ignore selected masters and use current fallback/build logic"
+    )
+    use_selected_master_as_is = schedule_mode == "Use selected master as-is"
+    use_selected_master_normalize = (
+        schedule_mode == "Use selected master, then normalize to tool standard"
+    )
+    use_selected_master = use_selected_master_as_is or use_selected_master_normalize
+    if runtime_config and use_selected_master:
+        key = (
+            "selected_pipe_schedule_master_id"
+            if kind == "pipe"
+            else "selected_fitting_schedule_master_id"
+        )
+        master_id = runtime_config.get(key)
+        if master_id:
+            try:
+                selected_master = doc.GetElement(ElementId(int(master_id)))
+            except Exception:
+                selected_master = None
+        if selected_master is None:
+            print(
+                "CONFIG RESOLVE -> {} schedule master: fallback existing build logic".format(
+                    kind
+                )
+            )
     if kind == "pipe":
-        master = find_master_schedule(doc, ["aco pipe"], ["fitting"])
+        master = selected_master or find_master_schedule(doc, ["aco pipe"], ["fitting"])
         if master is not None:
             schedule = duplicate_schedule_view(
                 doc, master, "{} - Pipe Schedule".format(sheet_code)
             )
-            mode = "duplicated"
-            remove_schedule_filters_by_field_names(
-                schedule, ["Reference Level", "Level", "Comments"]
-            )
-            add_schedule_field_by_name(schedule, "Comments")
-            set_schedule_field_hidden(schedule, "Comments", True)
-            if level_name:
-                if not add_schedule_string_filter(
-                    schedule,
-                    "Reference Level",
-                    ScheduleFilterType.Equal,
-                    source_view.GenLevel.Name,
-                ):
-                    add_schedule_string_filter(
+            mode = "duplicated_selected_master" if selected_master else "duplicated"
+            if selected_master:
+                if use_selected_master_normalize:
+                    configure_pipe_schedule_tool_standard(
+                        schedule, current_prefix, source_view
+                    )
+                    mode = "duplicated_selected_master_normalized"
+                else:
+                    apply_current_run_comments_filter(schedule, current_prefix)
+            else:
+                remove_schedule_filters_by_field_names(
+                    schedule, ["Reference Level", "Level", "Comments"]
+                )
+                add_schedule_field_by_name(schedule, "Comments")
+                set_schedule_field_hidden(schedule, "Comments", True)
+                if level_name:
+                    if not add_schedule_string_filter(
                         schedule,
-                        "Level",
+                        "Reference Level",
                         ScheduleFilterType.Equal,
                         source_view.GenLevel.Name,
-                    )
-            add_schedule_string_filter(
-                schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
-            )
+                    ):
+                        add_schedule_string_filter(
+                            schedule,
+                            "Level",
+                            ScheduleFilterType.Equal,
+                            source_view.GenLevel.Name,
+                        )
+                add_schedule_string_filter(
+                    schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+                )
         else:
             schedule, mode = build_pipe_schedule_from_scratch(
                 doc,
@@ -4752,39 +6050,56 @@ def create_prefab_schedule(doc, kind, sheet_code, current_prefix, source_view):
                 source_view,
             )
     else:
-        master = find_master_schedule(doc, ["aco pipe fittings"])
+        master = selected_master or find_master_schedule(doc, ["aco pipe fittings"])
         if master is not None:
             schedule = duplicate_schedule_view(
                 doc, master, "{} - Pipe Fittings Schedule".format(sheet_code)
             )
-            mode = "duplicated"
-            configure_fitting_schedule_visible_fields(schedule)
-            apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
-            duplicated_visible = get_schedule_visible_element_count(
-                schedule, [BuiltInCategory.OST_PipeFitting]
-            )
-            print(
-                "FITTING SCHEDULE -> duplicated visible elements: {}".format(
-                    duplicated_visible
+            mode = "duplicated_selected_master" if selected_master else "duplicated"
+            if selected_master:
+                if use_selected_master_normalize:
+                    configure_fitting_schedule_visible_fields(schedule)
+                    apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
+                    mode = "duplicated_selected_master_normalized"
+                else:
+                    apply_current_run_comments_filter(schedule, current_prefix)
+                duplicated_visible = get_schedule_visible_element_count(
+                    schedule, [BuiltInCategory.OST_PipeFitting]
                 )
-            )
-            fallback_rebuild = duplicated_visible <= 0
-            print(
-                "FITTING SCHEDULE -> fallback rebuild triggered: {}".format(
-                    "yes" if fallback_rebuild else "no"
+                print(
+                    "FITTING SCHEDULE -> duplicated visible elements: {}".format(
+                        duplicated_visible
+                    )
                 )
-            )
-            if fallback_rebuild:
-                try:
-                    doc.Delete(schedule.Id)
-                except Exception:
-                    pass
-                schedule, mode = build_fitting_schedule_from_scratch(
-                    doc,
-                    "{} - Pipe Fittings Schedule".format(sheet_code),
-                    current_prefix,
-                    source_view,
+                print("FITTING SCHEDULE -> fallback rebuild triggered: no")
+            else:
+                configure_fitting_schedule_visible_fields(schedule)
+                apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
+                duplicated_visible = get_schedule_visible_element_count(
+                    schedule, [BuiltInCategory.OST_PipeFitting]
                 )
+                print(
+                    "FITTING SCHEDULE -> duplicated visible elements: {}".format(
+                        duplicated_visible
+                    )
+                )
+                fallback_rebuild = duplicated_visible <= 0
+                print(
+                    "FITTING SCHEDULE -> fallback rebuild triggered: {}".format(
+                        "yes" if fallback_rebuild else "no"
+                    )
+                )
+                if fallback_rebuild:
+                    try:
+                        doc.Delete(schedule.Id)
+                    except Exception:
+                        pass
+                    schedule, mode = build_fitting_schedule_from_scratch(
+                        doc,
+                        "{} - Pipe Fittings Schedule".format(sheet_code),
+                        current_prefix,
+                        source_view,
+                    )
         else:
             print("FITTING SCHEDULE -> duplicated visible elements: 0")
             print("FITTING SCHEDULE -> fallback rebuild triggered: yes")
@@ -5198,14 +6513,14 @@ def apply_prefab_changes_to_view(
 
     if missing_types:
         TaskDialog.Show(
-            "Missing Pipe Tag Types",
+            get_runtime_window_title(),
             "Could not find required tag types:\n- {}".format(
                 "\n- ".join(sorted(missing_types))
             ),
         )
     if failures:
         TaskDialog.Show(
-            "Tag Failures",
+            get_runtime_window_title(),
             "Tag creation failed for pipe ids:\n- {}".format(
                 "\n- ".join([str(x) for x in sorted(set(failures))])
             ),
@@ -5227,6 +6542,7 @@ def apply_prefab_changes_to_view(
 
 
 def main():
+    print("WINDOW TITLE USED -> {}".format(get_runtime_window_title()))
     scanned_source_view = uidoc.ActiveView
     scanned_source_view_id = scanned_source_view.Id
     print(
@@ -5236,12 +6552,16 @@ def main():
     )
     gathered_elements, polygon = select_boundary_and_gather()
     if not gathered_elements:
-        MessageBox.Show("No elements were gathered. Cancelled.", "Error")
+        MessageBox.Show(
+            "No elements were gathered. Cancelled.", get_runtime_window_title()
+        )
         return
 
     filtered = filter_relevant_elements(gathered_elements)
     if not filtered:
-        MessageBox.Show("No relevant elements found in region.", "Error")
+        MessageBox.Show(
+            "No relevant elements found in region.", get_runtime_window_title()
+        )
         return
 
     result = show_element_editor(
@@ -5250,9 +6570,10 @@ def main():
     if result is None:
         return
 
-    regular_pipe_tag_mode = prompt_regular_pipe_tag_mode()
-    if regular_pipe_tag_mode is None:
+    runtime_config = prompt_run_configuration()
+    if runtime_config is None:
         return
+    regular_pipe_tag_mode = runtime_config.get("regular_tag_mode_config")
 
     workflow_choice = choose_post_editor_workflow()
     if workflow_choice == "cancel":
@@ -5293,13 +6614,15 @@ def main():
 
     source_view = scanned_source_view
     if not isinstance(source_view, ViewPlan):
-        MessageBox.Show("Active view is not a plan/callout view.", "Error")
+        MessageBox.Show(
+            "Active view is not a plan/callout view.", get_runtime_window_title()
+        )
         return
 
     resolved_syms, missing_req = resolve_required_tag_symbols(doc)
     if missing_req:
         TaskDialog.Show(
-            "Missing Pipe Tag Types",
+            get_runtime_window_title(),
             "Could not find required tag types:\n- " + "\n- ".join(missing_req),
         )
 
@@ -5373,7 +6696,7 @@ def main():
                 print("APPLY ONLY -> failed hidden check:", ex)
 
         TaskDialog.Show(
-            "Bunge Sheet Gen",
+            get_runtime_window_title(),
             "Prefab text and tags were applied to the current scanned view:\n{}\n\nKept tags: {}\nAdded tags: {}\nRemoved tags: {}\nText note placed: {}\nTemplate detached: {}".format(
                 target_view.Name,
                 apply_info.get("kept_tags", 0),
@@ -5467,14 +6790,28 @@ def main():
         .OfClass(FamilySymbol)
         .ToElements()
     )
-    if not all_tbs:
-        MessageBox.Show("No title-block types found.", "Error")
+    selected_titleblock = None
+    try:
+        selected_titleblock_id = runtime_config.get("selected_titleblock_id")
+        if selected_titleblock_id:
+            selected_titleblock = doc.GetElement(ElementId(int(selected_titleblock_id)))
+    except Exception:
+        selected_titleblock = None
+    if selected_titleblock is not None:
+        all_tbs = [selected_titleblock]
+        print(
+            "RESOLVE -> titleblock resolved/fallback using runtime selection: {}".format(
+                get_symbol_display(selected_titleblock)
+            )
+        )
+    elif not all_tbs:
+        MessageBox.Show("No title-block types found.", get_runtime_window_title())
         return
 
     class TBPicker(Form):
         def __init__(self, tbs):
             self.tbs = tbs
-            self.Text = "Choose a Title-Block"
+            self.Text = "{} - Choose a Title-Block".format(get_runtime_window_title())
             self.ClientSize = Size(340, 360)
             self.lb = ListBox()
             self.lb.Bounds = Rectangle(10, 10, 320, 300)
@@ -5502,12 +6839,17 @@ def main():
     existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
     existing_numbers = {s.SheetNumber for s in existing_sheets}
 
-    picker = TBPicker(all_tbs)
-    if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
-        MessageBox.Show("Sheet creation cancelled. Tags/text are kept.", "Info")
-        return
-
-    title_block = all_tbs[picker.lb.SelectedIndex]
+    if selected_titleblock is not None:
+        title_block = selected_titleblock
+    else:
+        picker = TBPicker(all_tbs)
+        if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
+            MessageBox.Show(
+                "Sheet creation cancelled. Tags/text are kept.",
+                get_runtime_window_title(),
+            )
+            return
+        title_block = all_tbs[picker.lb.SelectedIndex]
     sheet_code = base
     if sheet_code in existing_numbers:
         sheet_code = "{} ({})".format(base, source_view.Id.IntegerValue)
@@ -5662,14 +7004,24 @@ def main():
             t4.Start()
             try:
                 pipe_schedule, pipe_schedule_mode = create_prefab_schedule(
-                    doc, "pipe", sheet_code, current_prefix, source_view
+                    doc,
+                    "pipe",
+                    sheet_code,
+                    current_prefix,
+                    source_view,
+                    runtime_config,
                 )
             except Exception as ex:
                 print("SCHEDULES -> pipe schedule build failed:", ex)
                 pipe_schedule = None
             try:
                 fitting_schedule, fitting_schedule_mode = create_prefab_schedule(
-                    doc, "fitting", sheet_code, current_prefix, source_view
+                    doc,
+                    "fitting",
+                    sheet_code,
+                    current_prefix,
+                    source_view,
+                    runtime_config,
                 )
             except Exception as ex:
                 print("SCHEDULES -> fitting schedule build failed:", ex)
@@ -5791,7 +7143,7 @@ def main():
                 pipe_schedule.Name if pipe_schedule else "failed",
                 fitting_schedule.Name if fitting_schedule else "failed",
             ),
-            "Done",
+            get_runtime_window_title(),
         )
         regular_pipe_tag_count = count_pipe_tags_for_scanned_pipes(
             doc, target_view, scanned_pipe_ids
@@ -5799,6 +7151,7 @@ def main():
         extra_horizontal_tag_count = count_specific_pipe_tags_in_view(
             doc, target_view, TAGCFG_EXTRA_H["family"], TAGCFG_EXTRA_H["type"]
         )
+        print("WINDOW TITLE USED -> {}".format(get_runtime_window_title()))
         print("FINAL -> floor plan regular pipe tags:", regular_pipe_tag_count)
         print("FINAL -> floor plan extra horizontal tags:", extra_horizontal_tag_count)
         print("FINAL -> floor plan extra tags:", extra_horizontal_tag_count)
@@ -5814,7 +7167,7 @@ def main():
         )
         print(
             "FINAL -> 3D exploded vertical no-leader:",
-            expl_annot.get("vertical_no_leader", 0),
+            len(expl_annot.get("vertical_tag_ids", [])),
         )
         print(
             "FINAL -> 3D exploded regular leader tags:",
@@ -5834,6 +7187,10 @@ def main():
             "FINAL -> 3D exploded vertical on-host tags:",
             expl_annot.get("vertical_onhost", 0),
         )
+        print(
+            "FINAL -> 3D exploded vertical tag ids:",
+            expl_annot.get("vertical_tag_ids", []),
+        )
         for dist_mm in getattr(expl_annot, "get", lambda *a, **k: [])(
             "sample_head_distances", []
         )[:5]:
@@ -5845,7 +7202,7 @@ def main():
         print("FINAL -> 3D exploded connected groups:", exploded_group_count)
     except Exception as ex:
         TaskDialog.Show(
-            "Bunge Sheet Gen",
+            get_runtime_window_title(),
             "Sheet creation failed, but tags/text are kept.\n\n{}".format(ex),
         )
 
