@@ -20,10 +20,15 @@ from Autodesk.Revit.DB import (
     FamilySymbol,
     FilteredElementCollector,
     IFamilyLoadOptions,
+    IndependentTag,
     Level,
     LocationCurve,
+    Reference,
+    TagMode,
+    TagOrientation,
     Transaction,
     ViewPlan,
+    XYZ,
 )
 from Autodesk.Revit.UI import TaskDialog, TaskDialogCommonButtons, TaskDialogResult
 
@@ -76,10 +81,13 @@ MIN_STORY_HEIGHT_FT = 1.64
 
 INTENT_GOING_UP = "GOING_UP"
 INTENT_GOING_DOWN = "GOING_DOWN"
+INTENT_COMING_UP = "COMING_UP"
+INTENT_COMING_DOWN = "COMING_DOWN"
 INTENT_CONTINUOUS_UP = "CONTINUOUS_UP"
 INTENT_CONTINUOUS_DOWN = "CONTINUOUS_DOWN"
 INTENT_OUTSIDE_ACTIVE_LEVEL_BAND = "OUTSIDE_ACTIVE_LEVEL_BAND"
 INTENT_UNKNOWN_VERTICAL_DUCT = "UNKNOWN_VERTICAL_DUCT"
+INTENT_GEOMETRY_FALLBACK = "GEOMETRY_FALLBACK"
 
 STATUS_VERTICAL_CANDIDATE = "VERTICAL_DUCT_CANDIDATE"
 STATUS_SKIPPED_NO_LOCATION = "SKIPPED_NO_LOCATION_CURVE"
@@ -116,8 +124,24 @@ DEFAULT_CONFIG = {
     "selected_family_api_compatible": False,
     "selected_family_vertical_intent_match": False,
     "selected_family_semantic_warning": "",
+    "system_intent_overrides": {},
+    "tag_offset_x_ft": 0.0,
+    "tag_offset_y_ft": 0.0,
+    "tag_offset_x_mm": 0.0,
+    "tag_offset_y_mm": 0.0,
+    "tag_add_leader": False,
     "last_used_action": "",
 }
+
+ALLOWED_SYSTEM_INTENT_OVERRIDES = [
+    INTENT_GEOMETRY_FALLBACK,
+    INTENT_CONTINUOUS_UP,
+    INTENT_CONTINUOUS_DOWN,
+    INTENT_GOING_UP,
+    INTENT_GOING_DOWN,
+    INTENT_COMING_UP,
+    INTENT_COMING_DOWN,
+]
 
 CONFIG = None
 
@@ -277,6 +301,121 @@ def get_type_family_name(elem):
     return ""
 
 
+def safe_param_to_text(param):
+    if param is None:
+        return "-"
+    try:
+        value = param.AsValueString()
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        value = param.AsString()
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        elem_id = param.AsElementId()
+        if elem_id is not None and elem_id.IntegerValue > 0:
+            elem = doc.GetElement(elem_id)
+            name = safe_name(elem)
+            if name:
+                return name
+            return str(elem_id.IntegerValue)
+    except Exception:
+        pass
+    try:
+        value = param.AsInteger()
+        return str(value)
+    except Exception:
+        pass
+    try:
+        value = param.AsDouble()
+        return str(value)
+    except Exception:
+        pass
+    return "-"
+
+
+def get_builtin_param_value(elem, bip_name):
+    try:
+        bip = getattr(BuiltInParameter, bip_name)
+    except Exception:
+        return "-"
+    try:
+        return safe_param_to_text(elem.get_Parameter(bip))
+    except Exception:
+        return "-"
+
+
+def get_lookup_param_value(elem, param_name):
+    try:
+        return safe_param_to_text(elem.LookupParameter(param_name))
+    except Exception:
+        return "-"
+
+
+def first_non_empty(values):
+    for value in values:
+        if value is None:
+            continue
+        text = str(value)
+        if text and text != "-":
+            return text
+    return "-"
+
+
+def get_mep_system_metadata(duct):
+    mep_system_name = "-"
+    mep_system_type = "-"
+    try:
+        mep_system = duct.MEPSystem
+        if mep_system is not None:
+            mep_system_name = safe_name(mep_system) or "-"
+            try:
+                type_elem = doc.GetElement(mep_system.GetTypeId())
+                type_name = safe_name(type_elem)
+                if type_name:
+                    mep_system_type = type_name
+            except Exception:
+                pass
+            if mep_system_type == "-":
+                try:
+                    mep_system_type = mep_system.GetType().Name or "-"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    system_name = first_non_empty(
+        [
+            get_builtin_param_value(duct, "RBS_SYSTEM_NAME_PARAM"),
+            get_lookup_param_value(duct, "System Name"),
+        ]
+    )
+    system_type = first_non_empty(
+        [
+            get_builtin_param_value(duct, "RBS_DUCT_SYSTEM_TYPE_PARAM"),
+            get_lookup_param_value(duct, "System Type"),
+        ]
+    )
+    system_classification = first_non_empty(
+        [
+            get_builtin_param_value(duct, "RBS_SYSTEM_CLASSIFICATION_PARAM"),
+            get_lookup_param_value(duct, "System Classification"),
+        ]
+    )
+    return {
+        "system_name": system_name,
+        "system_type": system_type,
+        "system_classification": system_classification,
+        "mep_system_name": mep_system_name,
+        "mep_system_type": mep_system_type,
+    }
+
+
 def get_family_name_from_symbol(symbol):
     try:
         if symbol.Family is not None:
@@ -366,6 +505,46 @@ def ask_yes_no(title, message):
         title, message, TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
     )
     return result == TaskDialogResult.Yes
+
+
+def prompt_string(title, default_value):
+    if forms is not None:
+        try:
+            return forms.ask_for_string(default=str(default_value), prompt=title)
+        except Exception:
+            pass
+    options = [str(default_value), ""]
+    return select_one(title, "Enter a value, or choose blank to keep current.", options)
+
+
+def get_tag_offset_x_ft(cfg):
+    if "tag_offset_x_mm" in cfg:
+        try:
+            return ft_from_mm(float(cfg.get("tag_offset_x_mm") or 0.0))
+        except Exception:
+            pass
+    return float(cfg.get("tag_offset_x_ft", 0.0) or 0.0)
+
+
+def get_tag_offset_y_ft(cfg):
+    if "tag_offset_y_mm" in cfg:
+        try:
+            return ft_from_mm(float(cfg.get("tag_offset_y_mm") or 0.0))
+        except Exception:
+            pass
+    return float(cfg.get("tag_offset_y_ft", 0.0) or 0.0)
+
+
+def sync_tag_offset_feet_from_mm(cfg):
+    try:
+        cfg["tag_offset_x_ft"] = ft_from_mm(float(cfg.get("tag_offset_x_mm") or 0.0))
+    except Exception:
+        cfg["tag_offset_x_ft"] = float(cfg.get("tag_offset_x_ft", 0.0) or 0.0)
+    try:
+        cfg["tag_offset_y_ft"] = ft_from_mm(float(cfg.get("tag_offset_y_mm") or 0.0))
+    except Exception:
+        cfg["tag_offset_y_ft"] = float(cfg.get("tag_offset_y_ft", 0.0) or 0.0)
+    return cfg
 
 
 # =========================
@@ -787,10 +966,16 @@ def get_duct_line_endpoints(duct):
 
 def classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg):
     p0, p1, endpoint_status = get_duct_line_endpoints(duct)
+    system_metadata = get_mep_system_metadata(duct)
     row = {
         "duct_id": duct.Id.IntegerValue,
         "type_name": get_type_name(duct),
         "type_family_name": get_type_family_name(duct),
+        "system_name": system_metadata.get("system_name", "-"),
+        "system_type": system_metadata.get("system_type", "-"),
+        "system_classification": system_metadata.get("system_classification", "-"),
+        "mep_system_name": system_metadata.get("mep_system_name", "-"),
+        "mep_system_type": system_metadata.get("mep_system_type", "-"),
         "start_z": None,
         "end_z": None,
         "min_z": None,
@@ -855,10 +1040,110 @@ def classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg):
     return row
 
 
+def get_system_summary_key(row):
+    return first_non_empty(
+        [
+            row.get("system_type"),
+            row.get("system_name"),
+            row.get("mep_system_name"),
+            row.get("system_classification"),
+            "-",
+        ]
+    )
+
+
+def get_system_intent_overrides(cfg):
+    overrides = cfg.get("system_intent_overrides", {})
+    if isinstance(overrides, dict):
+        return dict(overrides)
+    return {}
+
+
+def apply_system_intent_override(row, cfg):
+    geometry_intent = row.get("intent") or INTENT_UNKNOWN_VERTICAL_DUCT
+    system_key = get_system_summary_key(row)
+    overrides = get_system_intent_overrides(cfg)
+    override_intent = overrides.get(system_key, INTENT_GEOMETRY_FALLBACK)
+    if override_intent not in ALLOWED_SYSTEM_INTENT_OVERRIDES:
+        print(
+            "CONFIG RESOLVE -> system intent override invalid for {}: {}".format(
+                system_key, override_intent
+            )
+        )
+        override_intent = INTENT_GEOMETRY_FALLBACK
+
+    final_intent = geometry_intent
+    if override_intent != INTENT_GEOMETRY_FALLBACK:
+        final_intent = override_intent
+
+    row["system_key"] = system_key
+    row["geometry_intent"] = geometry_intent
+    row["override_intent"] = override_intent
+    row["final_intent"] = final_intent
+    row["system_rule_matched"] = override_intent != INTENT_GEOMETRY_FALLBACK
+    row["system_rule_changed_intent"] = final_intent != geometry_intent
+    row["intent"] = final_intent
+    if final_intent != geometry_intent:
+        row["reason"] = row.get(
+            "reason", ""
+        ) + " System override changed intent from {} to {}.".format(
+            geometry_intent, final_intent
+        )
+        print(
+            "CONFIG RESOLVE -> system intent override {}: {} -> {}".format(
+                system_key, geometry_intent, final_intent
+            )
+        )
+    elif override_intent != INTENT_GEOMETRY_FALLBACK:
+        row["reason"] = row.get(
+            "reason", ""
+        ) + " System rule confirmed intent from {}.".format(system_key)
+        print(
+            "CONFIG RESOLVE -> system intent override {} confirmed {}".format(
+                system_key, final_intent
+            )
+        )
+    return row
+
+
+def build_system_summary(candidate_rows):
+    grouped = {}
+    for row in candidate_rows:
+        key = row.get("system_key") or get_system_summary_key(row)
+        if key not in grouped:
+            grouped[key] = {
+                "system_key": key,
+                "count": 0,
+                "candidate_ids": [],
+                "geometry_intents": [],
+                "override_intents": [],
+                "final_intents": [],
+                "suggested_tag_types": [],
+            }
+        item = grouped[key]
+        item["count"] += 1
+        item["candidate_ids"].append(row.get("duct_id"))
+        geometry_intent = row.get("geometry_intent") or row.get("intent") or "-"
+        if geometry_intent not in item["geometry_intents"]:
+            item["geometry_intents"].append(geometry_intent)
+        override_intent = row.get("override_intent") or INTENT_GEOMETRY_FALLBACK
+        if override_intent not in item["override_intents"]:
+            item["override_intents"].append(override_intent)
+        final_intent = row.get("final_intent") or row.get("intent") or "-"
+        if final_intent not in item["final_intents"]:
+            item["final_intents"].append(final_intent)
+        suggested = row.get("suggested_tag_type") or "-"
+        if suggested not in item["suggested_tag_types"]:
+            item["suggested_tag_types"].append(suggested)
+    return [grouped[key] for key in sorted(grouped.keys())]
+
+
 def loose_match_type_for_intent(intent, symbols):
     intent_keywords = {
         INTENT_GOING_UP: ["goingup", "up", "comingup", "riser", "vertical"],
         INTENT_GOING_DOWN: ["goingdown", "down", "comingdown", "riser", "vertical"],
+        INTENT_COMING_UP: ["comingup", "up", "goingup", "riser", "vertical"],
+        INTENT_COMING_DOWN: ["comingdown", "down", "goingdown", "riser", "vertical"],
         INTENT_CONTINUOUS_UP: ["continuousup", "continuous", "up", "riser", "vertical"],
         INTENT_CONTINUOUS_DOWN: [
             "continuousdown",
@@ -880,6 +1165,528 @@ def loose_match_type_for_intent(intent, symbols):
             if keyword in normalize_name(type_name):
                 return get_symbol_type_name(symbol)
     return ""
+
+
+def get_selected_family_symbols(cfg):
+    selected_family = cfg.get("selected_duct_tag_family_name") or ""
+    selected_norm = normalize_name(selected_family)
+    family_symbols = []
+    for symbol in collect_loaded_duct_tag_symbols():
+        if selected_norm and normalize_name(get_family_name_from_symbol(symbol)) != selected_norm:
+            continue
+        family_symbols.append(symbol)
+    return family_symbols
+
+
+def resolve_symbol_for_final_intent(intent, symbols):
+    preferred_type_names = {
+        INTENT_CONTINUOUS_UP: ["continuousup"],
+        INTENT_CONTINUOUS_DOWN: ["continuousdown"],
+        INTENT_GOING_UP: ["goingup"],
+        INTENT_GOING_DOWN: ["goingdown"],
+        INTENT_COMING_UP: ["comingup"],
+        INTENT_COMING_DOWN: ["comingdown"],
+    }
+    for preferred in preferred_type_names.get(intent, []):
+        for symbol in symbols:
+            if preferred in normalize_name(get_symbol_type_name(symbol)):
+                return symbol
+    matched_type_name = loose_match_type_for_intent(intent, symbols)
+    if matched_type_name:
+        matched_norm = normalize_name(matched_type_name)
+        for symbol in symbols:
+            if normalize_name(get_symbol_type_name(symbol)) == matched_norm:
+                return symbol
+    return None
+
+
+def get_existing_tagged_element_ids_in_view(view):
+    tagged_ids = set()
+    try:
+        tags = (
+            FilteredElementCollector(doc, view.Id)
+            .OfClass(IndependentTag)
+            .WhereElementIsNotElementType()
+        )
+        for tag in tags:
+            try:
+                ids = tag.GetTaggedLocalElementIds()
+                if ids:
+                    for elem_id in ids:
+                        tagged_ids.add(elem_id.IntegerValue)
+                    continue
+            except Exception:
+                pass
+            try:
+                elem_id = tag.TaggedLocalElementId
+                if elem_id is not None and elem_id.IntegerValue > 0:
+                    tagged_ids.add(elem_id.IntegerValue)
+            except Exception:
+                pass
+    except Exception as ex:
+        print("PLACE HVAC VERTICAL DUCT TAGS -> duplicate scan failed: {}".format(ex))
+    return tagged_ids
+
+
+def get_vertical_duct_tag_point(row, cfg):
+    start_z = row.get("start_z")
+    end_z = row.get("end_z")
+    p0, p1, status = get_duct_line_endpoints(doc.GetElement(ElementId(int(row["duct_id"]))))
+    if p0 is None or p1 is None:
+        return None
+    x = (p0.X + p1.X) / 2.0 + get_tag_offset_x_ft(cfg)
+    y = (p0.Y + p1.Y) / 2.0 + get_tag_offset_y_ft(cfg)
+    z = start_z if start_z is not None else p0.Z
+    try:
+        active_level = get_active_level(doc.ActiveView)
+        if active_level is not None:
+            z = active_level.Elevation
+    except Exception:
+        if end_z is not None and start_z is not None:
+            z = (start_z + end_z) / 2.0
+    return XYZ(x, y, z)
+
+
+def fmt_xyz_mm(point):
+    if point is None:
+        return "-"
+    return "X {}, Y {}, Z {}".format(fmt_mm(point.X), fmt_mm(point.Y), fmt_mm(point.Z))
+
+
+def activate_symbols_in_transaction(symbols):
+    activated = False
+    for symbol in symbols:
+        if symbol is None:
+            continue
+        try:
+            if not symbol.IsActive:
+                symbol.Activate()
+                activated = True
+        except Exception as ex:
+            print(
+                "PLACE HVAC VERTICAL DUCT TAGS -> symbol activation failed {}: {}".format(
+                    get_symbol_type_name(symbol), ex
+                )
+            )
+            raise
+    if activated:
+        try:
+            doc.Regenerate()
+        except Exception:
+            pass
+
+
+def create_duct_tag(view, duct, symbol, tag_point, add_leader):
+    reference = Reference(duct)
+    tag = IndependentTag.Create(
+        doc,
+        view.Id,
+        reference,
+        bool(add_leader),
+        TagMode.TM_ADDBY_CATEGORY,
+        TagOrientation.Horizontal,
+        tag_point,
+    )
+    if symbol is not None:
+        try:
+            if tag.GetTypeId().IntegerValue != symbol.Id.IntegerValue:
+                tag.ChangeTypeId(symbol.Id)
+        except Exception:
+            try:
+                tag.ChangeTypeId(symbol.Id)
+            except Exception as ex:
+                raise Exception("Tag created but type change failed: {}".format(ex))
+    return tag
+
+
+def prepare_selected_vertical_duct_tag_candidates():
+    cfg = get_config()
+    view = doc.ActiveView
+    active_level = get_active_level(view)
+    if active_level is None:
+        return [], [], "HVAC vertical duct tagging works only in floor plan views with a valid level."
+    levels = collect_project_levels()
+    band_bottom, band_top = get_active_level_band(active_level, levels)
+    selected_ids = list(uidoc.Selection.GetElementIds())
+    print(
+        "PLACE HVAC VERTICAL DUCT TAGS -> selected ids: {}".format(
+            [eid.IntegerValue for eid in selected_ids]
+        )
+    )
+
+    if not bool(cfg.get("selected_family_api_compatible", False)) or not bool(
+        cfg.get("selected_family_vertical_intent_match", False)
+    ):
+        return [], [], (
+            "No selected vertical-intent-compatible duct tag family is configured. "
+            "Choose loaded vertical duct tag family first."
+        )
+
+    family_symbols = get_selected_family_symbols(cfg)
+    if not family_symbols:
+        return [], [], "Selected duct tag family was not found in the current document."
+
+    already_tagged = get_existing_tagged_element_ids_in_view(view)
+    candidates = []
+    skipped = []
+    for elem_id in selected_ids:
+        elem = doc.GetElement(elem_id)
+        if not is_duct_curve(elem):
+            skipped.append(
+                {
+                    "duct_id": elem_id.IntegerValue,
+                    "reason": "SKIPPED_INVALID_NOT_DUCT_CURVE",
+                }
+            )
+            continue
+        row = classify_vertical_duct(elem, active_level, band_bottom, band_top, cfg)
+        if row["status"] != STATUS_VERTICAL_CANDIDATE:
+            skipped.append({"duct_id": elem_id.IntegerValue, "reason": row["status"]})
+            continue
+        row = apply_system_intent_override(row, cfg)
+        symbol = resolve_symbol_for_final_intent(row.get("final_intent"), family_symbols)
+        if symbol is None:
+            skipped.append(
+                {
+                    "duct_id": elem_id.IntegerValue,
+                    "reason": "SKIPPED_NO_MATCHING_TAG_TYPE_FOR_{}".format(
+                        row.get("final_intent") or "-"
+                    ),
+                }
+            )
+            continue
+        if elem_id.IntegerValue in already_tagged:
+            skipped.append(
+                {
+                    "duct_id": elem_id.IntegerValue,
+                    "reason": "SKIPPED_ALREADY_TAGGED",
+                }
+            )
+            continue
+        tag_point = get_vertical_duct_tag_point(row, cfg)
+        if tag_point is None:
+            skipped.append(
+                {
+                    "duct_id": elem_id.IntegerValue,
+                    "reason": "SKIPPED_TAG_POINT_UNRESOLVED",
+                }
+            )
+            continue
+        row["tag_symbol"] = symbol
+        row["tag_type"] = get_symbol_type_name(symbol)
+        row["tag_point"] = tag_point
+        candidates.append(row)
+    return candidates, skipped, ""
+
+
+def confirm_vertical_duct_tag_placement(candidates):
+    cfg = get_config()
+    output = script.get_output() if script is not None else None
+    output_emit(output, "# Smart HVAC Vertical Duct Tags - Placement Preview")
+    output_emit(output, "")
+    output_emit(output, "## Placement Settings")
+    output_emit(output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0)))
+    output_emit(output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0)))
+    output_emit(output, "- Add leader: `{}`".format(fmt_bool(cfg.get("tag_add_leader", False))))
+    output_emit(output, "")
+    headers = [
+        "Duct ElementId",
+        "System Type",
+        "System key",
+        "Geometry intent",
+        "Override intent",
+        "Final intent",
+        "Tag type to place",
+    ]
+    output_emit(output, "|" + "|".join(headers) + "|")
+    output_emit(output, "|" + "|".join(["---"] * len(headers)) + "|")
+    for row in candidates:
+        values = [
+            linkify(output, row["duct_id"]),
+            row.get("system_type") or "-",
+            row.get("system_key") or "-",
+            row.get("geometry_intent") or "-",
+            row.get("override_intent") or "-",
+            row.get("final_intent") or "-",
+            row.get("tag_type") or "-",
+        ]
+        output_emit(
+            output, "|" + "|".join([str(v).replace("\n", " ") for v in values]) + "|"
+        )
+    return ask_yes_no(
+        "Place vertical duct tags",
+        "Place {} vertical duct tag(s) in the active view?".format(len(candidates)),
+    )
+
+
+def place_vertical_duct_tags_for_selected_candidates():
+    cfg = get_config()
+    cfg["last_used_action"] = "Place vertical duct tags for selected candidates"
+    write_config(cfg)
+    candidates, skipped, error = prepare_selected_vertical_duct_tag_candidates()
+    if error:
+        TaskDialog.Show("Place vertical duct tags for selected candidates", error)
+        return
+    if not candidates:
+        output = script.get_output() if script is not None else None
+        output_emit(output, "# Smart HVAC Vertical Duct Tags - Placement Report")
+        output_emit(output, "")
+        output_emit(output, "## Placement Summary")
+        output_emit(
+            output,
+            "- Selected elements checked: `{}`".format(
+                len(list(uidoc.Selection.GetElementIds()))
+            ),
+        )
+        output_emit(output, "- Valid candidates: `0`")
+        output_emit(output, "- Tags created: `0`")
+        output_emit(output, "- Skipped / failed: `{}`".format(len(skipped)))
+        output_emit(output, "")
+        output_emit(output, "## Skipped / Failed")
+        output_emit(output, "|Duct id|Reason|")
+        output_emit(output, "|---|---|")
+        for row in skipped:
+            output_emit(
+                output,
+                "|{}|{}|".format(
+                    linkify(output, row.get("duct_id")), str(row.get("reason", "-"))
+                ),
+            )
+        if not skipped:
+            output_emit(output, "|-|-|")
+        TaskDialog.Show(
+            "Place vertical duct tags for selected candidates",
+            "No selected vertical duct candidates can be tagged. See output report for skipped reasons.",
+        )
+        print("PLACE HVAC VERTICAL DUCT TAGS -> valid candidates: 0")
+        return
+    print(
+        "PLACE HVAC VERTICAL DUCT TAGS -> valid candidates: {}".format(
+            [r["duct_id"] for r in candidates]
+        )
+    )
+    if not confirm_vertical_duct_tag_placement(candidates):
+        print("PLACE HVAC VERTICAL DUCT TAGS -> user cancelled before transaction")
+        return
+
+    view = doc.ActiveView
+    add_leader = bool(cfg.get("tag_add_leader", False))
+    created = []
+    failed = []
+    symbols_to_activate = []
+    for row in candidates:
+        symbol = row.get("tag_symbol")
+        if symbol is not None and symbol not in symbols_to_activate:
+            symbols_to_activate.append(symbol)
+
+    t = Transaction(doc, "Place Smart HVAC Vertical Duct Tags")
+    try:
+        t.Start()
+        activate_symbols_in_transaction(symbols_to_activate)
+        for row in candidates:
+            try:
+                duct = doc.GetElement(ElementId(int(row["duct_id"])))
+                tag = create_duct_tag(
+                    view,
+                    duct,
+                    row.get("tag_symbol"),
+                    row.get("tag_point"),
+                    add_leader,
+                )
+                created.append(
+                    {
+                        "duct_id": row["duct_id"],
+                        "tag_id": tag.Id.IntegerValue,
+                        "system_type": row.get("system_type") or "-",
+                        "final_intent": row.get("final_intent") or "-",
+                        "tag_type": row.get("tag_type") or "-",
+                        "tag_point": row.get("tag_point"),
+                    }
+                )
+            except Exception as ex:
+                failed.append({"duct_id": row["duct_id"], "reason": str(ex)})
+        t.Commit()
+    except Exception as ex:
+        try:
+            if t.HasStarted() and not t.HasEnded():
+                t.RollBack()
+        except Exception:
+            pass
+        TaskDialog.Show(
+            "Place vertical duct tags for selected candidates",
+            "Placement transaction failed: {}".format(ex),
+        )
+        return
+
+    skipped_already = [r for r in skipped if r.get("reason") == "SKIPPED_ALREADY_TAGGED"]
+    print(
+        "PLACE HVAC VERTICAL DUCT TAGS -> created tags: {}".format(
+            [r["tag_id"] for r in created]
+        )
+    )
+    print(
+        "PLACE HVAC VERTICAL DUCT TAGS -> skipped already tagged: {}".format(
+            [r["duct_id"] for r in skipped_already]
+        )
+    )
+    print("PLACE HVAC VERTICAL DUCT TAGS -> failed: {}".format(failed))
+
+    output = script.get_output() if script is not None else None
+    output_emit(output, "# Smart HVAC Vertical Duct Tags - Placement Report")
+    output_emit(output, "")
+    output_emit(output, "## Placement Summary")
+    output_emit(output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0)))
+    output_emit(output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0)))
+    output_emit(output, "- Add leader: `{}`".format(fmt_bool(add_leader)))
+    output_emit(
+        output,
+        "- Selected elements checked: `{}`".format(
+            len(list(uidoc.Selection.GetElementIds()))
+        ),
+    )
+    output_emit(output, "- Valid candidates: `{}`".format(len(candidates)))
+    output_emit(output, "- Tags created: `{}`".format(len(created)))
+    output_emit(output, "- Skipped already tagged: `{}`".format(len(skipped_already)))
+    output_emit(output, "- Skipped invalid: `{}`".format(len(skipped) - len(skipped_already)))
+    output_emit(output, "- Failed: `{}`".format(len(failed)))
+
+    output_emit(output, "")
+    output_emit(output, "## Created Tags")
+    created_headers = [
+        "Duct id",
+        "Tag id",
+        "System type",
+        "Final intent",
+        "Tag type",
+        "Placement point",
+    ]
+    output_emit(output, "|" + "|".join(created_headers) + "|")
+    output_emit(output, "|" + "|".join(["---"] * len(created_headers)) + "|")
+    for row in created:
+        values = [
+            linkify(output, row["duct_id"]),
+            linkify(output, row["tag_id"]),
+            row["system_type"],
+            row["final_intent"],
+            row["tag_type"],
+            fmt_xyz_mm(row["tag_point"]),
+        ]
+        output_emit(
+            output, "|" + "|".join([str(v).replace("\n", " ") for v in values]) + "|"
+        )
+    if not created:
+        output_emit(output, "|" + "|".join(["-"] * len(created_headers)) + "|")
+
+    output_emit(output, "")
+    output_emit(output, "## Skipped / Failed")
+    skipped_headers = ["Duct id", "Reason"]
+    output_emit(output, "|" + "|".join(skipped_headers) + "|")
+    output_emit(output, "|" + "|".join(["---"] * len(skipped_headers)) + "|")
+    for row in skipped + failed:
+        output_emit(
+            output,
+            "|{}|{}|".format(
+                linkify(output, row.get("duct_id")), str(row.get("reason", "-"))
+            ),
+        )
+    if not skipped and not failed:
+        output_emit(output, "|-|-|")
+
+    if created:
+        try:
+            id_list = List[ElementId]()
+            for row in created:
+                id_list.Add(ElementId(int(row["tag_id"])))
+            uidoc.Selection.SetElementIds(id_list)
+        except Exception as ex:
+            print("PLACE HVAC VERTICAL DUCT TAGS -> tag selection failed: {}".format(ex))
+    else:
+        try:
+            id_list = List[ElementId]()
+            for row in candidates:
+                id_list.Add(ElementId(int(row["duct_id"])))
+            uidoc.Selection.SetElementIds(id_list)
+        except Exception:
+            pass
+
+
+def parse_float_or_keep(value, current_value, label, warnings):
+    if value is None:
+        return current_value
+    text = str(value).strip()
+    if text == "":
+        return current_value
+    try:
+        return float(text.replace(",", "."))
+    except Exception:
+        warnings.append("{} invalid input `{}`; kept current value `{}`.".format(label, text, current_value))
+        return current_value
+
+
+def configure_vertical_duct_tag_placement_settings():
+    cfg = get_config()
+    warnings = []
+    current_x = float(cfg.get("tag_offset_x_mm", mm_from_ft(float(cfg.get("tag_offset_x_ft", 0.0) or 0.0))) or 0.0)
+    current_y = float(cfg.get("tag_offset_y_mm", mm_from_ft(float(cfg.get("tag_offset_y_ft", 0.0) or 0.0))) or 0.0)
+    current_leader = bool(cfg.get("tag_add_leader", False))
+
+    value_x = prompt_string(
+        "Smart HVAC Vertical Duct Tags - X offset in mm",
+        current_x,
+    )
+    new_x = parse_float_or_keep(value_x, current_x, "X offset mm", warnings)
+
+    value_y = prompt_string(
+        "Smart HVAC Vertical Duct Tags - Y offset in mm",
+        current_y,
+    )
+    new_y = parse_float_or_keep(value_y, current_y, "Y offset mm", warnings)
+
+    leader_choice = select_one(
+        "Smart HVAC Vertical Duct Tags - Add leader",
+        "Choose whether new vertical duct tags should be created with a leader.",
+        [
+            "false - No leader",
+            "true - Add leader",
+            "Skip - keep current ({})".format(fmt_bool(current_leader)),
+        ],
+    )
+    new_leader = current_leader
+    if leader_choice:
+        if leader_choice.startswith("true"):
+            new_leader = True
+        elif leader_choice.startswith("false"):
+            new_leader = False
+
+    cfg["tag_offset_x_mm"] = new_x
+    cfg["tag_offset_y_mm"] = new_y
+    cfg["tag_add_leader"] = bool(new_leader)
+    cfg["last_used_action"] = "Configure vertical duct tag placement settings"
+    sync_tag_offset_feet_from_mm(cfg)
+    write_config(cfg)
+
+    lines = [
+        "Vertical duct tag placement settings saved:",
+        "",
+        "X offset mm: {}".format(new_x),
+        "Y offset mm: {}".format(new_y),
+        "Add leader: {}".format(fmt_bool(new_leader)),
+    ]
+    if warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for warning in warnings:
+            lines.append(warning)
+            print("CONFIG UI -> placement settings warning: {}".format(warning))
+    print(
+        "CONFIG UI -> placement settings x_mm={} y_mm={} add_leader={}".format(
+            new_x, new_y, new_leader
+        )
+    )
+    TaskDialog.Show(
+        "Configure vertical duct tag placement settings",
+        "\n".join(lines),
+    )
 
 
 def scan_active_view_vertical_ducts():
@@ -921,8 +1728,10 @@ def scan_active_view_vertical_ducts():
                 continue
             checked += 1
             row = classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg)
+            if row["status"] == STATUS_VERTICAL_CANDIDATE:
+                row = apply_system_intent_override(row, cfg)
             row["suggested_tag_type"] = loose_match_type_for_intent(
-                row["intent"], family_symbols
+                row.get("final_intent") or row["intent"], family_symbols
             )
             if (
                 row["status"] == STATUS_VERTICAL_CANDIDATE
@@ -940,6 +1749,7 @@ def scan_active_view_vertical_ducts():
 
     candidate_count = len([r for r in rows if r["status"] == STATUS_VERTICAL_CANDIDATE])
     candidate_rows = [r for r in rows if r["status"] == STATUS_VERTICAL_CANDIDATE]
+    system_summary = build_system_summary(candidate_rows)
     skipped_rows = [r for r in rows if r["status"] != STATUS_VERTICAL_CANDIDATE]
     outside_count = len(
         [r for r in rows if r["status"] == STATUS_OUTSIDE_ACTIVE_LEVEL_BAND]
@@ -965,6 +1775,59 @@ def scan_active_view_vertical_ducts():
 
     print("SCAN HVAC VERTICAL DUCTS -> checked: {}".format(checked))
     print("SCAN HVAC VERTICAL DUCTS -> candidates: {}".format(candidate_count))
+    print(
+        "SCAN HVAC VERTICAL DUCTS -> system summary: {}".format(
+            [
+                {
+                    "system_key": item["system_key"],
+                    "count": item["count"],
+                    "candidate_ids": item["candidate_ids"],
+                    "geometry_intents": item["geometry_intents"],
+                    "override_intents": item["override_intents"],
+                    "final_intents": item["final_intents"],
+                    "suggested_tag_types": item["suggested_tag_types"],
+                }
+                for item in system_summary
+            ]
+        )
+    )
+    matched_system_rules = [
+        {
+            "duct_id": r["duct_id"],
+            "system_key": r.get("system_key"),
+            "geometry_intent": r.get("geometry_intent"),
+            "override_intent": r.get("override_intent"),
+            "final_intent": r.get("final_intent"),
+        }
+        for r in candidate_rows
+        if r.get("system_rule_matched")
+    ]
+    system_intent_changes = [
+        {
+            "duct_id": r["duct_id"],
+            "system_key": r.get("system_key"),
+            "geometry_intent": r.get("geometry_intent"),
+            "override_intent": r.get("override_intent"),
+            "final_intent": r.get("final_intent"),
+        }
+        for r in candidate_rows
+        if r.get("system_rule_changed_intent")
+    ]
+    print(
+        "SCAN HVAC VERTICAL DUCTS -> system rules matched: {}".format(
+            len(matched_system_rules)
+        )
+    )
+    print(
+        "SCAN HVAC VERTICAL DUCTS -> system rules changed intent: {}".format(
+            len(system_intent_changes)
+        )
+    )
+    print(
+        "SCAN HVAC VERTICAL DUCTS -> system intent changes: {}".format(
+            system_intent_changes
+        )
+    )
     print(
         "SCAN HVAC VERTICAL DUCTS -> outside active level band: {}".format(
             outside_count
@@ -1010,6 +1873,13 @@ def scan_active_view_vertical_ducts():
     output_emit(
         output, "- Selected duct tag family: `{}`".format(selected_family or "-")
     )
+    output_emit(
+        output, "- System rules matched: `{}`".format(len(matched_system_rules))
+    )
+    output_emit(
+        output,
+        "- System rules changed intent: `{}`".format(len(system_intent_changes)),
+    )
     unresolved_intent = (
         selected_family
         and bool(cfg.get("selected_family_api_compatible", False))
@@ -1020,6 +1890,11 @@ def scan_active_view_vertical_ducts():
         output_emit(
             output,
             "- Tag intent status: Selected duct tag family is API-compatible, but no vertical/riser intent type was resolved.",
+        )
+    if system_intent_changes:
+        output_emit(
+            output,
+            "- System override changed intent: `{}`".format(len(system_intent_changes)),
         )
     output_emit(output, "")
     output_emit(output, "## Vertical Duct Candidates")
@@ -1034,7 +1909,14 @@ def scan_active_view_vertical_ducts():
         "Height mm",
         "XY offset mm",
         "Angle deg",
-        "Intent",
+        "System Name",
+        "System Type",
+        "System Classification",
+        "MEPSystem Name",
+        "System key",
+        "Geometry intent",
+        "Override intent",
+        "Final intent",
         "Suggested tag type",
         "Reason",
     ]
@@ -1056,7 +1938,14 @@ def scan_active_view_vertical_ducts():
                 if row["vertical_angle"] is not None
                 else "-"
             ),
-            row["intent"],
+            row.get("system_name") or "-",
+            row.get("system_type") or "-",
+            row.get("system_classification") or "-",
+            row.get("mep_system_name") or "-",
+            row.get("system_key") or "-",
+            row.get("geometry_intent") or row["intent"],
+            row.get("override_intent") or INTENT_GEOMETRY_FALLBACK,
+            row.get("final_intent") or row["intent"],
             row["suggested_tag_type"] or "-",
             row["reason"],
         ]
@@ -1065,7 +1954,36 @@ def scan_active_view_vertical_ducts():
         )
 
     if not candidate_rows:
-        output_emit(output, "|-|-|-|-|-|-|-|-|-|-|-|-|-|")
+        output_emit(output, "|" + "|".join(["-"] * len(headers)) + "|")
+
+    output_emit(output, "")
+    output_emit(output, "## System Type Summary")
+    summary_headers = [
+        "System key",
+        "Count",
+        "Candidate element ids",
+        "Geometry intents",
+        "Override intent",
+        "Final intents",
+        "Suggested tag types",
+    ]
+    output_emit(output, "|" + "|".join(summary_headers) + "|")
+    output_emit(output, "|" + "|".join(["---"] * len(summary_headers)) + "|")
+    for item in system_summary:
+        values = [
+            item["system_key"],
+            item["count"],
+            ", ".join([str(v) for v in item["candidate_ids"]]),
+            ", ".join(item["geometry_intents"]),
+            ", ".join(item["override_intents"]),
+            ", ".join(item["final_intents"]),
+            ", ".join(item["suggested_tag_types"]),
+        ]
+        output_emit(
+            output, "|" + "|".join([str(v).replace("\n", " ") for v in values]) + "|"
+        )
+    if not system_summary:
+        output_emit(output, "|" + "|".join(["-"] * len(summary_headers)) + "|")
 
     output_emit(output, "")
     output_emit(output, "## Skipped Duct Summary")
@@ -1127,6 +2045,175 @@ def scan_active_view_vertical_ducts():
             )
 
 
+def collect_active_view_vertical_duct_system_keys(cfg):
+    view = doc.ActiveView
+    active_level = get_active_level(view)
+    if active_level is None:
+        return None, "Active view is not a floor plan view with a valid level."
+    levels = collect_project_levels()
+    band_bottom, band_top = get_active_level_band(active_level, levels)
+    system_keys = []
+    checked = 0
+    candidates = 0
+    try:
+        collector = (
+            FilteredElementCollector(doc, view.Id)
+            .OfCategory(BuiltInCategory.OST_DuctCurves)
+            .WhereElementIsNotElementType()
+        )
+        for duct in collector:
+            if not is_duct_curve(duct):
+                continue
+            checked += 1
+            row = classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg)
+            if row["status"] != STATUS_VERTICAL_CANDIDATE:
+                continue
+            candidates += 1
+            system_key = get_system_summary_key(row)
+            if system_key not in system_keys:
+                system_keys.append(system_key)
+    except Exception as ex:
+        return None, "Failed to scan active view system keys: {}".format(ex)
+    print(
+        "CONFIG UI -> active view system key scan checked={} candidates={} keys={}".format(
+            checked, candidates, system_keys
+        )
+    )
+    return sorted(system_keys), ""
+
+
+def collect_active_view_vertical_duct_system_context(cfg):
+    view = doc.ActiveView
+    active_level = get_active_level(view)
+    if active_level is None:
+        return None, "Active view is not a floor plan view with a valid level."
+    levels = collect_project_levels()
+    band_bottom, band_top = get_active_level_band(active_level, levels)
+    context = {}
+    checked = 0
+    candidates = 0
+    try:
+        collector = (
+            FilteredElementCollector(doc, view.Id)
+            .OfCategory(BuiltInCategory.OST_DuctCurves)
+            .WhereElementIsNotElementType()
+        )
+        for duct in collector:
+            if not is_duct_curve(duct):
+                continue
+            checked += 1
+            row = classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg)
+            if row["status"] != STATUS_VERTICAL_CANDIDATE:
+                continue
+            candidates += 1
+            system_key = get_system_summary_key(row)
+            if system_key not in context:
+                context[system_key] = {
+                    "candidate_ids": [],
+                    "geometry_intents": [],
+                }
+            context[system_key]["candidate_ids"].append(row.get("duct_id"))
+            intent = row.get("intent") or INTENT_UNKNOWN_VERTICAL_DUCT
+            if intent not in context[system_key]["geometry_intents"]:
+                context[system_key]["geometry_intents"].append(intent)
+    except Exception as ex:
+        return None, "Failed to scan active view system keys: {}".format(ex)
+    print(
+        "CONFIG UI -> active view system context scan checked={} candidates={} keys={}".format(
+            checked, candidates, sorted(context.keys())
+        )
+    )
+    return context, ""
+
+
+SYSTEM_OVERRIDE_OPTION_LABELS = [
+    (INTENT_GEOMETRY_FALLBACK, "GEOMETRY_FALLBACK - Use duct geometry direction"),
+    (INTENT_CONTINUOUS_UP, "CONTINUOUS_UP - Force Continuous Up"),
+    (INTENT_CONTINUOUS_DOWN, "CONTINUOUS_DOWN - Force Continuous Down"),
+    (INTENT_GOING_UP, "GOING_UP - Force Going Up"),
+    (INTENT_GOING_DOWN, "GOING_DOWN - Force Going Down"),
+    (INTENT_COMING_UP, "COMING_UP - Force Coming Up"),
+    (INTENT_COMING_DOWN, "COMING_DOWN - Force Coming Down"),
+    ("SKIP", "SKIP - Keep current value"),
+]
+
+
+def configure_system_type_intent_overrides():
+    cfg = get_config()
+    print("CONFIG UI -> configuring system intent overrides")
+    system_context, error = collect_active_view_vertical_duct_system_context(cfg)
+    if error:
+        TaskDialog.Show("Configure system type intent overrides", error)
+        return
+    if not system_context:
+        TaskDialog.Show(
+            "Configure system type intent overrides",
+            "No valid vertical duct candidates with system keys were found in the active view.",
+        )
+        return
+
+    existing = get_system_intent_overrides(cfg)
+    updated = dict(existing)
+    options = [label for value, label in SYSTEM_OVERRIDE_OPTION_LABELS]
+    label_to_value = {}
+    for value, label in SYSTEM_OVERRIDE_OPTION_LABELS:
+        label_to_value[label] = value
+    system_keys = sorted(system_context.keys())
+    for system_key in system_keys:
+        current = existing.get(system_key, INTENT_GEOMETRY_FALLBACK)
+        item = system_context.get(system_key, {})
+        geometry_intents = ", ".join(sorted(item.get("geometry_intents", []))) or "-"
+        candidate_ids = (
+            ", ".join([str(v) for v in item.get("candidate_ids", [])]) or "-"
+        )
+        picked = select_one(
+            "Configure vertical intent for system type",
+            (
+                "System key: {}\n"
+                "Current override: {}\n"
+                "Detected geometry intents in active view: {}\n"
+                "Candidate ids: {}\n\n"
+                "Office convention must be confirmed by HVAC.\n"
+                "If Supply Air / blue goes up, choose CONTINUOUS_UP.\n"
+                "If Return Air / green goes down, choose CONTINUOUS_DOWN.\n\n"
+                "Choose final vertical tag intent for this system type."
+            ).format(
+                system_key,
+                current,
+                geometry_intents,
+                candidate_ids,
+            ),
+            options,
+        )
+        if not picked:
+            print("CONFIG UI -> system intent override configuration cancelled")
+            return
+        picked_value = label_to_value.get(picked, "")
+        if picked_value == "SKIP":
+            continue
+        updated[system_key] = picked_value
+        print(
+            "CONFIG RESOLVE -> system intent override {} = {}".format(
+                system_key, picked_value
+            )
+        )
+
+    cfg["system_intent_overrides"] = updated
+    cfg["last_used_action"] = "Configure system type intent overrides"
+    write_config(cfg)
+    lines = ["System intent overrides saved:"]
+    if updated:
+        for key in sorted(updated.keys()):
+            lines.append("{} -> {}".format(key, updated[key]))
+    else:
+        lines.append("none")
+    lines.append("")
+    lines.append(
+        "Next test:\nRun Scan active view vertical ducts and verify Geometry intent vs Final intent."
+    )
+    TaskDialog.Show("Configure system type intent overrides", "\n".join(lines))
+
+
 def show_current_hvac_tagging_configuration():
     cfg = get_config()
     output = script.get_output() if script is not None else None
@@ -1134,6 +2221,14 @@ def show_current_hvac_tagging_configuration():
     output_emit(output, "- Config path: `{}`".format(get_config_path()))
     for key in sorted(cfg.keys()):
         output_emit(output, "- `{}`: `{}`".format(key, cfg.get(key)))
+    overrides = get_system_intent_overrides(cfg)
+    output_emit(output, "")
+    output_emit(output, "## System intent overrides")
+    if overrides:
+        for key in sorted(overrides.keys()):
+            output_emit(output, "- `{}` -> `{}`".format(key, overrides[key]))
+    else:
+        output_emit(output, "System intent overrides: none")
     print("CONFIG UI -> current HVAC tagging configuration shown.")
 
 
@@ -1143,8 +2238,11 @@ def show_current_hvac_tagging_configuration():
 def main_menu():
     actions = [
         "Scan active view vertical ducts",
+        "Place vertical duct tags for selected candidates",
+        "Configure vertical duct tag placement settings",
         "Choose loaded vertical duct tag family",
         "Load vertical duct tag family from .rfa",
+        "Configure system type intent overrides",
         "Show current HVAC tagging configuration",
         "Exit",
     ]
@@ -1154,10 +2252,16 @@ def main_menu():
             return
         if choice == "Scan active view vertical ducts":
             scan_active_view_vertical_ducts()
+        elif choice == "Place vertical duct tags for selected candidates":
+            place_vertical_duct_tags_for_selected_candidates()
+        elif choice == "Configure vertical duct tag placement settings":
+            configure_vertical_duct_tag_placement_settings()
         elif choice == "Choose loaded vertical duct tag family":
             choose_loaded_vertical_duct_tag_family()
         elif choice == "Load vertical duct tag family from .rfa":
             load_vertical_duct_tag_family_from_rfa()
+        elif choice == "Configure system type intent overrides":
+            configure_system_type_intent_overrides()
         elif choice == "Show current HVAC tagging configuration":
             show_current_hvac_tagging_configuration()
 

@@ -1,0 +1,9 @@
+title: Plumbing
+tooltip: Plumbing automation tools for pipe slopes, vertical pipe tags, and QA checks.
+author: BIM3DNA
+layout:
+  - Connect Pipes
+  - Piping Sheet Gen
+  - Pipe Slope Guard
+  - Smart Vertical Pipe Tags
+  - Plumbing QA Dashboard

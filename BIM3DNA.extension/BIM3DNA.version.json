@@ -1,0 +1,7 @@
+{
+  "build": "local",
+  "channel": "dev",
+  "product": "BIM3DNA Revit Toolbar",
+  "update_mode": "git",
+  "version": "0.1.0-dev"
+}

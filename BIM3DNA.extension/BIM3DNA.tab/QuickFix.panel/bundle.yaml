@@ -1,0 +1,25 @@
+title: QuickFix
+layout:
+  - Select Same Category
+  - Select Same Family
+  - Select Same Type
+  - Join Unjoin Geometry
+  - Join Unjoin Analytical
+  - Align View
+  - Align Box
+  - Set Plane
+  - Manage Worksets
+  - Batch Sheet
+  - Auto Params
+  - Fix Worksets
+  - Purge Unused
+  - Create Print Set
+  - Adjust Sheet Numbers
+  - Export Point Cloud Data
+  - Show Element Info
+  - Connect Pipes
+  - Piping Sheet Gen
+  - Sheet Transfer
+  - RenderHQ
+  - Image Scanner
+  - AI

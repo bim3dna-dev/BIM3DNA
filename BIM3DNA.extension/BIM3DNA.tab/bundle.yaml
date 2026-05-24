@@ -2,9 +2,6 @@ layout:
   - 01_Plumbing
   - 02_HVAC
   - 03_Electrical
-  - 04_Architectural
-  - 05_Structural
-  - 06_Coordination
-  - 90_AI_Workbench
+  - Coordination
   - About
   - QuickFix
