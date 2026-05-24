@@ -1,18 +1,6 @@
 <Window x:Name="MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="AI Workbench"
-    Height="640"
-    Width="1100"
-    MinWidth="980"
-    MinHeight="680"
-    WindowStartupLocation="CenterScreen"
-    WindowStyle="None"
-    Background="#eff6ff"
-    ResizeMode="CanResizeWithGrip"
-    SizeToContent="Manual"
-    UseLayoutRounding="True"
-    SnapsToDevicePixels="True">
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="AI Workbench" Height="640" Width="1100" MinWidth="980" MinHeight="680" WindowStartupLocation="CenterScreen" WindowStyle="None" Background="#eff6ff" ResizeMode="CanResizeWithGrip" SizeToContent="Manual" UseLayoutRounding="True" SnapsToDevicePixels="True">
     <Window.Resources>
         <SolidColorBrush x:Key="ComboBackgroundBrush" Color="#f8fafd"/>
         <SolidColorBrush x:Key="ComboForegroundBrush" Color="#1f2937"/>
@@ -169,11 +157,13 @@
                                 </WrapPanel>
                                 <WrapPanel Grid.Row="3" Margin="0,0,0,8">
                                     <Button x:Name="ProjectQuickSummaryButton" Tag="summary" Content="Summary" Width="76" Height="24" Margin="0,0,5,5"/>
+                                    <Button x:Name="ProjectQuickOnboardingButton" Tag="onboarding" Content="Onboarding" Width="92" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickLevelsButton" Tag="levels" Content="Levels" Width="68" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickViewsButton" Tag="views" Content="Views" Width="64" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickSheetsButton" Tag="sheets" Content="Sheets" Width="66" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickLinksButton" Tag="links" Content="Links" Width="62" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickLinkCoordinatesButton" Tag="link coordinates" Content="Link Coordinates" Width="122" Height="24" Margin="0,0,5,5"/>
+                                    <Button x:Name="ProjectQuickLevelsGridsButton" Tag="levels grids" Content="Levels / Grids" Width="104" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickImportsButton" Tag="imports" Content="CAD / Imports" Width="104" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickCategoriesButton" Tag="categories" Content="Categories" Width="88" Height="24" Margin="0,0,5,5"/>
                                     <Button x:Name="ProjectQuickSchedulesButton" Tag="schedules" Content="Schedules" Width="82" Height="24" Margin="0,0,5,5"/>

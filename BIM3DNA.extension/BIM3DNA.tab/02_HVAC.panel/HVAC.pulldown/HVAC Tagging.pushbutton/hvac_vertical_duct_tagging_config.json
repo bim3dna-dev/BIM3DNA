@@ -1,0 +1,29 @@
+{
+  "last_loaded_rfa_path": "", 
+  "last_used_action": "Choose loaded vertical duct tag family", 
+  "max_skipped_diagnostics_rows": 30, 
+  "min_vertical_height_ft": 1.0, 
+  "selected_duct_tag_family_name": "Duct Size Tag", 
+  "selected_duct_tag_symbol_id": "162121", 
+  "selected_duct_tag_type_name": "Duct Size Tag", 
+  "selected_family_api_compatible": true, 
+  "selected_family_compatibility_details": {
+    "api_compatible": true, 
+    "family_name": "Duct Size Tag", 
+    "is_compatible": true, 
+    "matched_required_type_count": 1, 
+    "missing_required_type_names": [], 
+    "semantic_warning": "The selected duct tag is API-compatible, but no vertical/riser/up/down intent keywords were found. It may be a generic duct size tag.", 
+    "total_type_count": 1, 
+    "type_names": [
+      "Duct Size Tag"
+    ], 
+    "vertical_intent_match": false
+  }, 
+  "selected_family_compatibility_summary": "compatible", 
+  "selected_family_semantic_warning": "The selected duct tag is API-compatible, but no vertical/riser/up/down intent keywords were found. It may be a generic duct size tag.", 
+  "selected_family_vertical_intent_match": false, 
+  "show_skipped_diagnostics": false, 
+  "vertical_angle_degrees": 80.0, 
+  "xy_tolerance_ft": 0.10000000000000001
+}

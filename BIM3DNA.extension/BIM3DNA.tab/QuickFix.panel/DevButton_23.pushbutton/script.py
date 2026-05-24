@@ -11,6 +11,9 @@ import requests
 import re
 import time
 import math
+import tempfile
+import codecs
+import csv
 import System
 
 from System import Action
@@ -49,6 +52,48 @@ XAML_PATH = "UI.xaml"
 PROMPT_CATALOG_PATH = os.path.join(LIB_DIR, "prompt_catalog.json")
 APPROVED_RECIPES_PATH = os.path.join(LIB_DIR, "approved_recipes.json")
 WINDOW_SETTINGS_FILE = "ai_window_settings.json"
+
+QA_EXPORT_ACCEPTED_REPORT_HEADERS = (
+    "[SELECTED ELEMENTS BY CATEGORY]",
+    "[SELECTED ELEMENTS BY TYPE]",
+    "[COUNT SELECTED ELEMENTS]",
+    "[SELECTION HEALTH CHECK]",
+    "[MISSING PARAMETERS FROM SELECTION]",
+    "[ACTIVE VIEW MEP SUMMARY]",
+    "[ACTIVE VIEW ELEMENTS BY CATEGORY]",
+    "[ACTIVE VIEW ELEMENTS BY TYPE]",
+    "[ACTIVE VIEW QA REPORT]",
+    "[ACTIVE VIEW MISSING PARAMETERS]",
+    "[SELECTED MEP SYSTEM ASSIGNMENT REPORT]",
+    "[ACTIVE VIEW MEP SYSTEM ASSIGNMENT REPORT]",
+    "[SELECTED DISCIPLINE QA REPORT]",
+    "[ACTIVE VIEW DISCIPLINE QA REPORT]",
+    "[PROJECT ONBOARDING CHECKLIST]",
+    "[GUIDED PROJECT STARTUP PLAN]",
+    "[PROJECT CONTEXT SUMMARY]",
+    "[LINK COORDINATE HEALTH]",
+    "[BIM BASIS / LEVELS & GRIDS]",
+    "[REVIEWED ACTION PROPOSAL]",
+    "[SPLIT SELECTED PIPES DRY RUN]",
+    "[REVIEWED ACTION CONFIRMATION GUARD]",
+    "[SPLIT SELECTED PIPES ROLLBACK TEST]",
+    "[SPLIT SELECTED PIPE REVIEWED APPLY]",
+    "[SPLIT APPLY VERIFICATION REPORT]",
+)
+
+PIPE_SPLIT_DRY_RUN_MAX_SELECTION = 200
+PIPE_SPLIT_DRY_RUN_DETAIL_LIMIT = 25
+PIPE_SPLIT_DRY_RUN_SAMPLE_LIMIT = 10
+# Revit internal feet; approximately 1000 mm total and 500 mm per segment.
+PIPE_SPLIT_DRY_RUN_MIN_TOTAL_LENGTH_FT = 3.28084
+PIPE_SPLIT_DRY_RUN_MIN_SEGMENT_LENGTH_FT = 1.64042
+PIPE_SPLIT_DRY_RUN_VERTICAL_Z_RATIO = 0.90
+MAX_ROLLBACK_SPLIT_CANDIDATES = 5
+ROLLBACK_SPLIT_LENGTH_TOLERANCE_FT = 1.0 / 304.8
+ROLLBACK_TEST_CONFIRMATION_TOKEN = "ROLLBACK-TEST-OK"
+MAX_PERSISTENT_SPLIT_CANDIDATES = 1
+PERSISTENT_SPLIT_CONFIRMATION_TOKEN = "PERSISTENT-SPLIT-OK"
+SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT = 0.00328084
 
 THEMES = {
     "light": {
@@ -2501,6 +2546,26 @@ def _category_name(elem):
     return get_elem_name(category) if category else "<No Category>"
 
 
+def _element_level_name(doc, elem):
+    value = _safe_param_text(elem, ["Reference Level", "Level", "Schedule Level", "Base Level", "Host Level"])
+    if value:
+        return value
+    for attr_name in ("LevelId", "GenLevel"):
+        try:
+            value = getattr(elem, attr_name, None)
+            if value is None:
+                continue
+            if attr_name == "GenLevel":
+                return get_elem_name(value)
+            level = doc.GetElement(value)
+            level_name = get_elem_name(level)
+            if level_name:
+                return level_name
+        except:
+            continue
+    return None
+
+
 def _document_title(doc):
     try:
         title = getattr(doc, "Title", None)
@@ -2528,6 +2593,13 @@ PROJECT_CONTEXT_ORIGIN_TOLERANCE_FT = 1.0 / 304.8
 PROJECT_CONTEXT_Z_TOLERANCE_FT = 1.0 / 304.8
 PROJECT_CONTEXT_ANGLE_TOLERANCE_DEG = 0.01
 PROJECT_CONTEXT_VECTOR_TOLERANCE = 0.0001
+LEVEL_ELEVATION_TOLERANCE_MM = 5.0
+GRID_LINEAR_OFFSET_TOLERANCE_MM = 10.0
+GRID_ANGLE_TOLERANCE_DEG = 0.10
+MAX_LINKS_FOR_LEVEL_GRID_SCAN = 10
+MAX_GRID_GEOMETRY_COMPARISONS_PER_LINK = 250
+MAX_REPORTED_LEVEL_ROWS = 50
+MAX_REPORTED_GRID_ROWS = 50
 
 
 def _safe_int(value, default=0):
@@ -2947,6 +3019,20 @@ def _feet_to_mm_text(value):
         return "unknown"
 
 
+def mm_to_internal_feet(mm):
+    try:
+        return float(mm) / 304.8
+    except:
+        return 0.0
+
+
+def internal_feet_to_mm(value):
+    try:
+        return float(value) * 304.8
+    except:
+        return "unknown"
+
+
 def _angle_to_degrees(angle_radians):
     try:
         return float(angle_radians) * 180.0 / math.pi
@@ -3270,6 +3356,475 @@ def _safe_bool_attr(obj, attr_name):
         return "unknown"
 
 
+def _normalize_bim_basis_name(name):
+    text = safe_str(name or "").strip().lower()
+    text = re.sub(r"[^\w\s\-_]+", " ", text)
+    text = re.sub(r"[\s\-_]+", " ", text)
+    return text.strip()
+
+
+def _duplicate_normalized_names(rows):
+    groups = {}
+    for row in rows or []:
+        key = row.get("normalized_name") or ""
+        if not key:
+            continue
+        groups.setdefault(key, []).append(row.get("name"))
+    duplicates = []
+    for key, names in groups.items():
+        unique = sorted(set([name for name in names if name]))
+        if len(unique) > 1 or len(names) > 1:
+            duplicates.append({"normalized_name": key, "names": unique, "count": len(names)})
+    return duplicates
+
+
+def _collect_level_rows(level_doc, sample_limit=MAX_REPORTED_LEVEL_ROWS):
+    rows = []
+    try:
+        for level in DB.FilteredElementCollector(level_doc).OfClass(DB.Level):
+            name = get_elem_name(level) or "(unnamed level)"
+            elevation = _safe_float(getattr(level, "Elevation", None))
+            rows.append(
+                {
+                    "name": name,
+                    "normalized_name": _normalize_bim_basis_name(name),
+                    "elevation_internal_feet": elevation,
+                    "elevation_mm": internal_feet_to_mm(elevation),
+                    "id": _safe_element_id_value(level),
+                }
+            )
+    except:
+        pass
+    rows.sort(key=lambda item: safe_str(item.get("name")))
+    return rows[:sample_limit], len(rows), _duplicate_normalized_names(rows)
+
+
+def _curve_type_name(curve):
+    try:
+        if isinstance(curve, DB.Line):
+            return "Line"
+    except:
+        pass
+    try:
+        if isinstance(curve, DB.Arc):
+            return "Arc"
+    except:
+        pass
+    if curve is None:
+        return "Unknown"
+    return "Other"
+
+
+def _apply_transform_point(transform, point):
+    if transform is None:
+        return point
+    try:
+        return transform.OfPoint(point)
+    except:
+        return None
+
+
+def _linear_grid_geometry(grid, transform=None):
+    result = {
+        "curve_type": "Unknown",
+        "origin": None,
+        "direction": None,
+        "angle_degrees": "unknown",
+        "geometry_status": "unknown",
+    }
+    try:
+        curve = grid.Curve
+        result["curve_type"] = _curve_type_name(curve)
+        if result["curve_type"] != "Line":
+            result["geometry_status"] = "name-only"
+            return result
+        p0 = _apply_transform_point(transform, curve.GetEndPoint(0))
+        p1 = _apply_transform_point(transform, curve.GetEndPoint(1))
+        if p0 is None or p1 is None:
+            result["geometry_status"] = "unknown"
+            return result
+        dx = float(p1.X) - float(p0.X)
+        dy = float(p1.Y) - float(p0.Y)
+        length = math.sqrt(dx * dx + dy * dy)
+        if length <= 0.0000001:
+            result["geometry_status"] = "unknown"
+            return result
+        ux = dx / length
+        uy = dy / length
+        result["origin"] = {"x": float(p0.X), "y": float(p0.Y), "z": float(p0.Z)}
+        result["direction"] = {"x": ux, "y": uy}
+        angle = math.atan2(uy, ux) * 180.0 / math.pi
+        if angle < 0:
+            angle += 180.0
+        if angle >= 180.0:
+            angle -= 180.0
+        result["angle_degrees"] = angle
+        result["geometry_status"] = "linear"
+    except:
+        result["geometry_status"] = "unknown"
+    return result
+
+
+def _collect_grid_rows(grid_doc, transform=None, sample_limit=MAX_REPORTED_GRID_ROWS):
+    rows = []
+    try:
+        for grid in DB.FilteredElementCollector(grid_doc).OfClass(DB.Grid):
+            name = get_elem_name(grid) or "(unnamed grid)"
+            geometry = _linear_grid_geometry(grid, transform)
+            row = {
+                "name": name,
+                "normalized_name": _normalize_bim_basis_name(name),
+                "id": _safe_element_id_value(grid),
+                "curve_type": geometry.get("curve_type"),
+                "geometry_status": geometry.get("geometry_status"),
+                "origin": geometry.get("origin"),
+                "direction": geometry.get("direction"),
+                "angle_degrees": geometry.get("angle_degrees"),
+            }
+            rows.append(row)
+    except:
+        pass
+    rows.sort(key=lambda item: safe_str(item.get("name")))
+    return rows[:sample_limit], len(rows), _duplicate_normalized_names(rows)
+
+
+def _rows_by_normalized_name(rows):
+    mapping = {}
+    for row in rows or []:
+        key = row.get("normalized_name") or ""
+        if key and key not in mapping:
+            mapping[key] = row
+    return mapping
+
+
+def _level_elevation_delta_mm(host_level, linked_level):
+    host_elev = host_level.get("elevation_internal_feet")
+    link_elev = linked_level.get("elevation_internal_feet")
+    if not isinstance(host_elev, float) or not isinstance(link_elev, float):
+        return "unknown"
+    return abs(internal_feet_to_mm(host_elev - link_elev))
+
+
+def _compare_level_rows(host_levels, link_levels):
+    findings = []
+    host_by_name = _rows_by_normalized_name(host_levels)
+    link_by_name = _rows_by_normalized_name(link_levels)
+    matched_host = set()
+    matched_link = set()
+    tolerance = float(LEVEL_ELEVATION_TOLERANCE_MM)
+    for key, host_level in host_by_name.items():
+        linked_level = link_by_name.get(key)
+        if linked_level:
+            matched_host.add(key)
+            matched_link.add(key)
+            delta = _level_elevation_delta_mm(host_level, linked_level)
+            if delta != "unknown" and delta > tolerance:
+                findings.append(
+                    {
+                        "type": "linked_level_elevation_mismatch",
+                        "severity": "high" if delta > 50.0 else "medium",
+                        "host_level": host_level.get("name"),
+                        "linked_level": linked_level.get("name"),
+                        "delta_mm": delta,
+                        "message": "Matching level names have elevation delta {0:.1f} mm.".format(delta),
+                    }
+                )
+        else:
+            findings.append({"type": "host_level_missing_in_link", "severity": "medium", "host_level": host_level.get("name"), "message": "Host level is missing in linked model."})
+    for key, linked_level in link_by_name.items():
+        if key not in matched_link:
+            findings.append({"type": "linked_level_missing_in_host", "severity": "medium", "linked_level": linked_level.get("name"), "message": "Linked level is missing in host model."})
+    comparisons = 0
+    for host_level in host_levels or []:
+        for linked_level in link_levels or []:
+            if comparisons >= MAX_REPORTED_LEVEL_ROWS:
+                break
+            if host_level.get("normalized_name") == linked_level.get("normalized_name"):
+                continue
+            delta = _level_elevation_delta_mm(host_level, linked_level)
+            if delta != "unknown" and delta <= tolerance:
+                findings.append(
+                    {
+                        "type": "linked_level_possible_name_mismatch",
+                        "severity": "low",
+                        "host_level": host_level.get("name"),
+                        "linked_level": linked_level.get("name"),
+                        "delta_mm": delta,
+                        "message": "Host and linked levels share elevation but have different names.",
+                    }
+                )
+                comparisons += 1
+        if comparisons >= MAX_REPORTED_LEVEL_ROWS:
+            break
+    return findings[:MAX_REPORTED_LEVEL_ROWS]
+
+
+def _angle_delta_degrees(a, b):
+    try:
+        delta = abs(float(a) - float(b))
+        while delta > 180.0:
+            delta -= 180.0
+        if delta > 90.0:
+            delta = 180.0 - delta
+        return abs(delta)
+    except:
+        return "unknown"
+
+
+def _linear_grid_offset_mm(host_grid, linked_grid):
+    try:
+        h_origin = host_grid.get("origin")
+        h_dir = host_grid.get("direction")
+        l_origin = linked_grid.get("origin")
+        if not h_origin or not h_dir or not l_origin:
+            return "unknown"
+        nx = -float(h_dir.get("y"))
+        ny = float(h_dir.get("x"))
+        dx = float(l_origin.get("x")) - float(h_origin.get("x"))
+        dy = float(l_origin.get("y")) - float(h_origin.get("y"))
+        offset_ft = abs(dx * nx + dy * ny)
+        return internal_feet_to_mm(offset_ft)
+    except:
+        return "unknown"
+
+
+def _compare_grid_rows(host_grids, link_grids):
+    findings = []
+    host_by_name = _rows_by_normalized_name(host_grids)
+    link_by_name = _rows_by_normalized_name(link_grids)
+    comparisons = 0
+    for key, host_grid in host_by_name.items():
+        linked_grid = link_by_name.get(key)
+        if not linked_grid:
+            findings.append({"type": "host_grid_missing_in_link", "severity": "medium", "host_grid": host_grid.get("name"), "message": "Host grid is missing in linked model."})
+            continue
+        if host_grid.get("geometry_status") == "linear" and linked_grid.get("geometry_status") == "linear" and comparisons < MAX_GRID_GEOMETRY_COMPARISONS_PER_LINK:
+            comparisons += 1
+            angle_delta = _angle_delta_degrees(host_grid.get("angle_degrees"), linked_grid.get("angle_degrees"))
+            offset_delta = _linear_grid_offset_mm(host_grid, linked_grid)
+            if angle_delta == "unknown" or offset_delta == "unknown":
+                findings.append({"type": "linked_grid_geometry_unknown", "severity": "low", "host_grid": host_grid.get("name"), "linked_grid": linked_grid.get("name"), "message": "Linear grid geometry comparison could not be completed."})
+            elif angle_delta > GRID_ANGLE_TOLERANCE_DEG or offset_delta > GRID_LINEAR_OFFSET_TOLERANCE_MM:
+                severity = "high" if offset_delta > 50.0 or angle_delta > 1.0 else "medium"
+                findings.append(
+                    {
+                        "type": "linked_grid_geometry_mismatch",
+                        "severity": severity,
+                        "host_grid": host_grid.get("name"),
+                        "linked_grid": linked_grid.get("name"),
+                        "angle_delta_degrees": angle_delta,
+                        "offset_delta_mm": offset_delta,
+                        "message": "Matching grid names have geometry delta outside tolerance.",
+                    }
+                )
+        else:
+            findings.append(
+                {
+                    "type": "linked_grid_geometry_unknown",
+                    "severity": "info",
+                    "host_grid": host_grid.get("name"),
+                    "linked_grid": linked_grid.get("name"),
+                    "message": "Geometry comparison limited for non-linear or unknown grid.",
+                }
+            )
+    for key, linked_grid in link_by_name.items():
+        if key not in host_by_name:
+            findings.append({"type": "linked_grid_missing_in_host", "severity": "medium", "linked_grid": linked_grid.get("name"), "message": "Linked grid is missing in host model."})
+    return findings[:MAX_REPORTED_GRID_ROWS]
+
+
+def _level_grid_finding_name(finding):
+    if not isinstance(finding, dict):
+        return None
+    for key in ("host_level", "linked_level", "host_grid", "linked_grid", "name"):
+        value = finding.get(key)
+        if value:
+            return value
+    names = finding.get("names")
+    if isinstance(names, list) and names:
+        return ", ".join([str(name) for name in names[:3]])
+    return None
+
+
+def _aggregate_level_grid_findings(findings, sample_limit=5):
+    grouped = {}
+    ordered = []
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        key = (finding.get("type") or "unknown", finding.get("severity") or "info")
+        if key not in grouped:
+            grouped[key] = {
+                "type": key[0],
+                "severity": key[1],
+                "count": 0,
+                "sample_names": [],
+                "sample_messages": [],
+            }
+            ordered.append(grouped[key])
+        row = grouped[key]
+        row["count"] += 1
+        name = _level_grid_finding_name(finding)
+        if name and name not in row["sample_names"] and len(row["sample_names"]) < sample_limit:
+            row["sample_names"].append(name)
+        message = finding.get("message")
+        if message and message not in row["sample_messages"] and len(row["sample_messages"]) < 2:
+            row["sample_messages"].append(message)
+    return sorted(ordered, key=lambda item: (-item.get("count", 0), item.get("type", "")))
+
+
+def _level_grid_findings_by_type(findings):
+    counts = {}
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        key = finding.get("type") or "unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _format_level_grid_type_counts(counts):
+    if not counts:
+        return "none"
+    return ", ".join(["{0}={1}".format(key, counts[key]) for key in sorted(counts.keys())])
+
+
+def _link_level_grid_issue_types(link_row):
+    counts = _level_grid_findings_by_type((link_row.get("level_findings") or []) + (link_row.get("grid_findings") or []))
+    return _format_level_grid_type_counts(counts)
+
+
+def _collect_host_link_level_grid_health(doc, sample_limit=PROJECT_CONTEXT_MAX_ITEMS):
+    host_levels, host_level_count, host_level_duplicates = _collect_level_rows(doc)
+    host_grids, host_grid_count, host_grid_duplicates = _collect_grid_rows(doc)
+    compared = []
+    skipped = []
+    all_level_findings = []
+    all_grid_findings = []
+    link_index = 0
+    try:
+        link_instances = list(DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance))
+    except:
+        link_instances = []
+    for instance in link_instances:
+        if link_index >= MAX_LINKS_FOR_LEVEL_GRID_SCAN:
+            skipped.append({"link_name": get_elem_name(instance) or "(unnamed link)", "status": "skipped", "reason": "link scan limit reached"})
+            continue
+        link_index += 1
+        link_type = None
+        try:
+            link_type = doc.GetElement(instance.GetTypeId())
+        except:
+            pass
+        link_name = get_elem_name(instance) or "(unnamed link)"
+        type_name = get_elem_name(link_type) if link_type is not None else "unknown"
+        transform = None
+        try:
+            transform = instance.GetTransform()
+        except:
+            pass
+        try:
+            link_doc = instance.GetLinkDocument()
+        except:
+            link_doc = None
+        if link_doc is None:
+            skipped.append({"link_name": link_name, "type_name": type_name, "status": "inaccessible", "reason": "linked document is not loaded/readable"})
+            continue
+        linked_title = _document_title(link_doc)
+        link_levels, link_level_count, link_level_duplicates = _collect_level_rows(link_doc)
+        link_grids, link_grid_count, link_grid_duplicates = _collect_grid_rows(link_doc, transform)
+        level_findings = _compare_level_rows(host_levels, link_levels)
+        grid_findings = _compare_grid_rows(host_grids, link_grids)
+        if host_grid_count == 0 and link_grid_count > 0:
+            for finding in grid_findings:
+                if finding.get("type") == "linked_grid_missing_in_host":
+                    finding["severity"] = "info"
+                    finding["message"] = "Host contains no grids; linked grid comparison is basis-dependent."
+        for duplicate in link_level_duplicates:
+            level_findings.append({"type": "linked_duplicate_level_names", "severity": "medium", "message": "Duplicate normalized level names in linked model.", "names": duplicate.get("names")})
+        for duplicate in link_grid_duplicates:
+            grid_findings.append({"type": "linked_duplicate_grid_names", "severity": "medium", "message": "Duplicate normalized grid names in linked model.", "names": duplicate.get("names")})
+        status = "OK"
+        if level_findings or grid_findings:
+            status = "PARTIAL" if all((finding.get("severity") == "info") for finding in (level_findings + grid_findings)) else "REVIEW"
+        compared.append(
+            {
+                "link_name": link_name,
+                "type_name": type_name,
+                "linked_document_title": linked_title,
+                "status": status,
+                "coordinate_health_status": "unknown",
+                "level_count": link_level_count,
+                "grid_count": link_grid_count,
+                "level_findings": level_findings[:MAX_REPORTED_LEVEL_ROWS],
+                "grid_findings": grid_findings[:MAX_REPORTED_GRID_ROWS],
+            }
+        )
+        all_level_findings.extend(level_findings)
+        all_grid_findings.extend(grid_findings)
+    for duplicate in host_level_duplicates:
+        all_level_findings.append({"type": "host_duplicate_level_names", "severity": "medium", "message": "Duplicate normalized level names in host model.", "names": duplicate.get("names")})
+    for duplicate in host_grid_duplicates:
+        all_grid_findings.append({"type": "host_duplicate_grid_names", "severity": "medium", "message": "Duplicate normalized grid names in host model.", "names": duplicate.get("names")})
+    grid_basis_limited = host_grid_count == 0 and any((row.get("grid_count") or 0) > 0 for row in compared)
+    overall = "OK"
+    if skipped and not compared:
+        overall = "PARTIAL"
+    elif skipped:
+        overall = "PARTIAL"
+    if all_level_findings or all_grid_findings:
+        overall = "REVIEW" if not skipped else "PARTIAL"
+    if grid_basis_limited:
+        overall = "PARTIAL"
+    issue_flags = sorted(set([item.get("type") for item in all_level_findings + all_grid_findings if item.get("type")]))
+    level_type_counts = _level_grid_findings_by_type(all_level_findings)
+    grid_type_counts = _level_grid_findings_by_type(all_grid_findings)
+    top_links = sorted(
+        [
+            {
+                "link_name": row.get("link_name"),
+                "status": row.get("status"),
+                "level_findings_count": len(row.get("level_findings") or []),
+                "grid_findings_count": len(row.get("grid_findings") or []),
+                "issue_types": _link_level_grid_issue_types(row),
+            }
+            for row in compared
+            if (row.get("level_findings") or row.get("grid_findings"))
+        ],
+        key=lambda item: -(item.get("level_findings_count", 0) + item.get("grid_findings_count", 0)),
+    )
+    return {
+        "profile": "Configurable BIM Basis / ILS-style",
+        "level_elevation_tolerance_mm": LEVEL_ELEVATION_TOLERANCE_MM,
+        "grid_linear_offset_tolerance_mm": GRID_LINEAR_OFFSET_TOLERANCE_MM,
+        "grid_angle_tolerance_degrees": GRID_ANGLE_TOLERANCE_DEG,
+        "host_level_count": host_level_count,
+        "host_grid_count": host_grid_count,
+        "host_duplicate_level_names": host_level_duplicates[:MAX_REPORTED_LEVEL_ROWS],
+        "host_duplicate_grid_names": host_grid_duplicates[:MAX_REPORTED_GRID_ROWS],
+        "links_compared_count": len(compared),
+        "links_skipped_count": len(skipped),
+        "links_compared": compared[:sample_limit],
+        "links_skipped": skipped[:sample_limit],
+        "level_findings_count": len(all_level_findings),
+        "grid_findings_count": len(all_grid_findings),
+        "level_findings": all_level_findings[:MAX_REPORTED_LEVEL_ROWS],
+        "grid_findings": all_grid_findings[:MAX_REPORTED_GRID_ROWS],
+        "level_findings_by_type": level_type_counts,
+        "grid_findings_by_type": grid_type_counts,
+        "top_affected_links": top_links[:sample_limit],
+        "host_grid_basis_limited": grid_basis_limited,
+        "status_wording": {
+            "OK": "OK: no findings",
+            "REVIEW": "REVIEW: findings exist and require coordination review",
+            "PARTIAL": "PARTIAL: comparison limited by missing host grids, inaccessible links, or non-linear grids",
+            "UNKNOWN": "UNKNOWN: required data unavailable",
+        },
+        "issue_flags": issue_flags,
+        "overall_status": overall,
+    }
+
+
 def _collect_imports_context(doc, uidoc, sample_limit=PROJECT_CONTEXT_MAX_ITEMS):
     imports = []
     total_count = 0
@@ -3494,6 +4049,44 @@ def _top_category_counts(category_counts, limit=8):
     return numeric[:limit]
 
 
+def _get_linked_model_coordinate_health(context):
+    if not isinstance(context, dict):
+        return {}
+    sections = context.get("sections") or {}
+    if isinstance(sections, dict):
+        value = sections.get("linked_model_coordinate_health")
+        if isinstance(value, dict):
+            return value
+    value = context.get("linked_model_coordinate_health")
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _get_host_link_level_grid_health(context):
+    return get_host_link_level_grid_health(context)
+
+
+def get_host_link_level_grid_health(context):
+    if not isinstance(context, dict):
+        return {}
+    sections = context.get("sections") or {}
+    if isinstance(sections, dict):
+        value = sections.get("host_link_level_grid_health")
+        if isinstance(value, dict):
+            return value
+        value = sections.get("bim_basis_level_grid_health")
+        if isinstance(value, dict):
+            return value
+    value = context.get("host_link_level_grid_health")
+    if isinstance(value, dict):
+        return value
+    value = context.get("bim_basis_level_grid_health")
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
 def _detect_project_issues(context):
     issues = []
     levels = context.get("levels", {})
@@ -3503,7 +4096,6 @@ def _detect_project_issues(context):
     if links.get("unavailable_links"):
         issues.append({"id": "unloaded_or_unavailable_revit_links", "severity": "medium", "message": "One or more Revit links appear unloaded or unavailable."})
     imports = context.get("imports_cad", {})
-    coord_health = context.get("linked_model_coordinate_health", {})
     if imports.get("total_import_instances", 0):
         issues.append({"id": "cad_imports_present", "severity": "low", "message": "CAD/import instances are present."})
     if imports.get("view_specific_import_count", 0):
@@ -3528,7 +4120,7 @@ def _detect_project_issues(context):
     warnings = context.get("warnings_summary", {})
     if warnings.get("total_warning_count", 0) and warnings.get("total_warning_count", 0) >= 100:
         issues.append({"id": "high_warning_count", "severity": "medium", "message": "High Revit warning count detected."})
-    coord_health = context.get("linked_model_coordinate_health", {})
+    coord_health = _get_linked_model_coordinate_health(context)
     if coord_health:
         if coord_health.get("unavailable_count", 0):
             issues.append({"id": "unloaded_or_unavailable_link", "severity": "medium", "message": "One or more Revit links are unloaded or unavailable."})
@@ -3542,6 +4134,19 @@ def _detect_project_issues(context):
             issues.append({"id": "duplicate_link_instances", "severity": "medium", "message": "Duplicate Revit link instances/types were detected."})
         if coord_health.get("unknown_coordinate_state_count", 0):
             issues.append({"id": "unknown_coordinate_state", "severity": "low", "message": "Some link coordinate state could not be read."})
+    level_grid = _get_host_link_level_grid_health(context)
+    if level_grid:
+        for flag in level_grid.get("issue_flags", [])[:12]:
+            severity = "medium"
+            if flag == "linked_level_elevation_mismatch":
+                severity = "high"
+            if flag in ("linked_level_possible_name_mismatch", "linked_grid_geometry_unknown"):
+                severity = "low"
+            if flag == "linked_grid_missing_in_host" and level_grid.get("host_grid_basis_limited"):
+                severity = "info"
+            issues.append({"id": flag, "severity": severity, "message": "BIM Basis / Levels & Grids finding: {0}".format(flag.replace("_", " "))})
+        if level_grid.get("links_skipped_count", 0):
+            issues.append({"id": "level_grid_scan_partial", "severity": "medium", "message": "Some linked models were skipped or inaccessible during level/grid comparison."})
     return issues
 
 
@@ -3575,7 +4180,460 @@ def _project_first_check_lines(context):
     return checks
 
 
+def _onboarding_section(title, status, result, next_step, branch):
+    return {
+        "title": title,
+        "status": status,
+        "result": result,
+        "next_step": next_step,
+        "branch": branch,
+    }
+
+
+def _onboarding_status_rank(status):
+    ranks = {"OK": 0, "INFO": 1, "UNKNOWN": 2, "PARTIAL": 3, "REVIEW": 4}
+    return ranks.get(status, 2)
+
+
+def build_project_onboarding_checklist(context):
+    context = context if isinstance(context, dict) else {}
+    doc_info = context.get("document", {}) if isinstance(context.get("document", {}), dict) else {}
+    active_view = doc_info.get("active_view", {}) if isinstance(doc_info.get("active_view", {}), dict) else {}
+    links = context.get("links", {}) if isinstance(context.get("links", {}), dict) else {}
+    coord_health = _get_linked_model_coordinate_health(context)
+    level_grid = get_host_link_level_grid_health(context)
+    imports = context.get("imports_cad", {}) if isinstance(context.get("imports_cad", {}), dict) else {}
+    warnings = context.get("warnings_summary", {}) if isinstance(context.get("warnings_summary", {}), dict) else {}
+    schedules = context.get("schedules", {}) if isinstance(context.get("schedules", {}), dict) else {}
+    levels = context.get("levels", {}) if isinstance(context.get("levels", {}), dict) else {}
+    selection = context.get("selection", {}) if isinstance(context.get("selection", {}), dict) else {}
+    issues = set([issue.get("id") for issue in context.get("detected_issues", []) if isinstance(issue, dict)])
+    sections = []
+    depth = context.get("scan_depth") or "unknown"
+    if depth == "standard":
+        scan_status = "OK"
+        scan_result = "Standard project context is available."
+    elif depth:
+        scan_status = "PARTIAL"
+        scan_result = "{0} context is available; standard Scan Project is recommended for onboarding.".format(str(depth).title())
+    else:
+        scan_status = "UNKNOWN"
+        scan_result = "No project context scan is available."
+    sections.append(_onboarding_section("Project Context Scan", scan_status, scan_result, "Run Scan Project before production decisions.", "Project"))
+
+    link_total = links.get("instance_count")
+    if link_total is None:
+        link_status = "UNKNOWN"
+        link_result = "Revit links were not scanned."
+        link_next = "Run Scan Project."
+    elif link_total == 0:
+        link_status = "INFO"
+        link_result = "No Revit link instances were found."
+        link_next = "No link loading issue detected."
+    elif links.get("unavailable_links"):
+        link_status = "REVIEW"
+        link_result = "{0} links found; {1} unavailable/unloaded.".format(link_total, len(links.get("unavailable_links") or []))
+        link_next = "Review unloaded/unavailable links before coordination checks."
+    else:
+        link_status = "OK"
+        link_result = "{0} links found; 0 unavailable/unloaded.".format(link_total)
+        link_next = "No link loading issue detected."
+    sections.append(_onboarding_section("Linked Models", link_status, link_result, link_next, "Links"))
+
+    if coord_health:
+        coord_status = coord_health.get("overall_status", "UNKNOWN")
+        if coord_status == "OK":
+            result = "No deterministic coordinate transform flags were detected."
+            next_step = "Verify manually if the project BIM protocol requires it."
+        elif coord_status == "PARTIAL":
+            result = "Coordinate health scan was partial."
+            next_step = "Review unavailable links and unknown coordinate states."
+        else:
+            result = "Coordinate flags: non-identity {0}, rotated {1}, z-offset {2}, unavailable {3}.".format(
+                coord_health.get("non_identity_transform_count", 0),
+                coord_health.get("rotated_link_count", 0),
+                coord_health.get("z_offset_link_count", 0),
+                coord_health.get("unavailable_count", 0),
+            )
+            next_step = "Review linked model coordinate health before model coordination."
+        sections.append(_onboarding_section("Link Coordinate Health", coord_status if coord_status in ("OK", "REVIEW", "PARTIAL") else "UNKNOWN", result, next_step, "Links / Coordinate Health"))
+    else:
+        sections.append(_onboarding_section("Link Coordinate Health", "UNKNOWN", "Linked model coordinate health was not scanned.", "Run standard Scan Project.", "Links / Coordinate Health"))
+
+    if level_grid:
+        lg_status = level_grid.get("overall_status", "UNKNOWN")
+        if level_grid.get("level_findings_count", 0) or level_grid.get("grid_findings_count", 0):
+            lg_status = "PARTIAL" if lg_status == "PARTIAL" or level_grid.get("host_grid_basis_limited") else "REVIEW"
+        result = "{0} level findings, {1} grid findings, {2} links compared.".format(
+            level_grid.get("level_findings_count", 0),
+            level_grid.get("grid_findings_count", 0),
+            level_grid.get("links_compared_count", 0),
+        )
+        next_step = "Review host/link level and grid ownership before level-targeted automation."
+        if not level_grid.get("level_findings_count", 0) and not level_grid.get("grid_findings_count", 0):
+            next_step = "No level/grid findings detected by current checks."
+        sections.append(_onboarding_section("BIM Basis / Levels & Grids", lg_status, result, next_step, "BIM Basis / Levels & Grids"))
+    else:
+        sections.append(_onboarding_section("BIM Basis / Levels & Grids", "UNKNOWN", "Level/grid health was not scanned.", "Run standard Scan Project.", "BIM Basis / Levels & Grids"))
+
+    import_count = imports.get("total_import_instances")
+    if import_count is None:
+        sections.append(_onboarding_section("CAD / Imports", "UNKNOWN", "CAD/import instances were not scanned.", "Run standard Scan Project.", "Imports / CAD"))
+    elif import_count == 0:
+        sections.append(_onboarding_section("CAD / Imports", "OK", "No CAD/import instances found.", "No CAD/import review needed from current scan.", "Imports / CAD"))
+    else:
+        note = "{0} CAD/import instances found; {1} view-specific.".format(import_count, imports.get("view_specific_import_count", 0))
+        sections.append(_onboarding_section("CAD / Imports", "REVIEW", note, "Review CAD/import ownership and view-specific imports.", "Imports / CAD"))
+
+    warning_count = warnings.get("total_warning_count")
+    if warning_count is None:
+        sections.append(_onboarding_section("Revit Warnings", "UNKNOWN", "Warnings were not scanned.", "Run standard Scan Project.", "Warnings"))
+    elif warning_count == 0:
+        sections.append(_onboarding_section("Revit Warnings", "OK", "0 Revit warnings detected by scanner.", "No warning review needed from current scan.", "Warnings"))
+    else:
+        sections.append(_onboarding_section("Revit Warnings", "REVIEW", "{0} Revit warnings detected.".format(warning_count), "Review top warning groups before production automation.", "Warnings"))
+
+    schedule_samples = schedules.get("schedules")
+    if schedule_samples is None:
+        sections.append(_onboarding_section("Schedules", "UNKNOWN", "Schedules were not scanned.", "Run standard Scan Project.", "Schedules"))
+    elif not schedule_samples:
+        sections.append(_onboarding_section("Schedules", "INFO", "No schedule details were sampled.", "Use schedule-specific checks if needed.", "Schedules"))
+    elif schedules.get("suspicious_or_empty_schedule_candidates"):
+        sections.append(_onboarding_section("Schedules", "REVIEW", "{0} sampled schedules; suspicious/empty candidates found.".format(len(schedule_samples)), "Review schedule population/status before using templates.", "Schedules"))
+    else:
+        sections.append(_onboarding_section("Schedules", "OK", "{0} sampled schedules; no suspicious/empty schedule candidates in current scan.".format(len(schedule_samples)), "Schedule actions can follow after context risks are reviewed.", "Schedules"))
+
+    level_issues = []
+    if levels.get("ambiguous_aliases"):
+        level_issues.append("ambiguous level aliases")
+    if level_grid.get("host_duplicate_level_names"):
+        level_issues.append("duplicate host level names")
+    if "linked_duplicate_level_names" in issues:
+        level_issues.append("duplicate linked level names")
+    if level_issues:
+        sections.append(_onboarding_section("Levels / Level Naming", "REVIEW", "Level naming issues: {0}.".format(", ".join(level_issues)), "Resolve level naming ambiguity before level-targeted actions.", "Levels"))
+    elif levels:
+        sections.append(_onboarding_section("Levels / Level Naming", "OK", "{0} levels scanned; no level alias ambiguity detected.".format(levels.get("count", 0)), "No level naming issue detected by current scan.", "Levels"))
+    else:
+        sections.append(_onboarding_section("Levels / Level Naming", "UNKNOWN", "Levels were not scanned.", "Run standard Scan Project.", "Levels"))
+
+    selected_count = selection.get("selected_element_count")
+    if selected_count is None:
+        sections.append(_onboarding_section("Active View / Selection", "UNKNOWN", "Selection was not scanned.", "Run standard Scan Project.", "Selection"))
+    elif selected_count:
+        sections.append(_onboarding_section("Active View / Selection", "OK", "{0} active-document selected elements.".format(selected_count), "Selection-based reviewed checks are available.", "Selection"))
+    else:
+        sections.append(_onboarding_section("Active View / Selection", "INFO", "No active-document selection.", "Use active-view/project checks first or select elements before selection-based checks.", "Selection"))
+
+    blocking = [
+        section for section in sections
+        if section.get("title") not in ("Project Context Scan", "Reviewed Actions / Automation Readiness")
+        and section.get("status") in ("REVIEW", "PARTIAL")
+    ]
+    readiness_status = "REVIEW" if blocking else "OK"
+    readiness_result = "{0} review item(s) should be checked before automation.".format(len(blocking)) if blocking else "No blocking project-context risks detected by current checklist."
+    sections.append(_onboarding_section("Reviewed Actions / Automation Readiness", readiness_status, readiness_result, "Run read-only diagnostics before model-modifying reviewed actions.", "Suggested Actions"))
+
+    overall = "OK"
+    for section in sections:
+        if _onboarding_status_rank(section.get("status")) > _onboarding_status_rank(overall):
+            overall = section.get("status")
+    recommended = []
+    for title in [
+        "BIM Basis / Levels & Grids",
+        "Link Coordinate Health",
+        "CAD / Imports",
+        "Revit Warnings",
+        "Active View / Selection",
+        "Schedules",
+    ]:
+        for section in sections:
+            if section.get("title") == title and section.get("status") in ("REVIEW", "PARTIAL", "INFO"):
+                recommended.append(section.get("next_step"))
+                break
+    if not recommended:
+        recommended = ["Run read-only active-view health checks, then proceed to reviewed catalog actions as needed."]
+    return {
+        "project_title": doc_info.get("title", "(unknown document)"),
+        "active_view": active_view.get("name", "(unknown view)"),
+        "context_depth": depth,
+        "scan_timestamp": context.get("timestamp_utc", "unknown"),
+        "overall_status": overall,
+        "sections": sections,
+        "recommended_next_actions": recommended[:8],
+        "blocking_review_items": [section.get("title") for section in sections if section.get("status") in ("REVIEW", "PARTIAL")],
+        "automation_readiness_status": readiness_status,
+    }
+
+
+def format_project_onboarding_checklist(checklist):
+    checklist = checklist if isinstance(checklist, dict) else {}
+    lines = [
+        "[PROJECT ONBOARDING CHECKLIST]",
+        "",
+        "Project",
+        "- Document: {0}".format(checklist.get("project_title", "(unknown document)")),
+        "- Active view: {0}".format(checklist.get("active_view", "(unknown view)")),
+        "- Context depth: {0}".format(checklist.get("context_depth", "unknown")),
+        "- Scan timestamp: {0}".format(checklist.get("scan_timestamp", "unknown")),
+        "",
+        "Overall status: {0}".format(checklist.get("overall_status", "UNKNOWN")),
+        "",
+        "Checklist",
+    ]
+    for index, section in enumerate(checklist.get("sections", []) or []):
+        lines.append("{0}. {1} [{2}]".format(index + 1, section.get("title"), section.get("status", "UNKNOWN")))
+        lines.append("   Result: {0}".format(section.get("result", "")))
+        lines.append("   Next step: {0}".format(section.get("next_step", "")))
+        lines.append("   Context branch: {0}".format(section.get("branch", "")))
+    lines.extend(["", "Recommended Next Steps"])
+    for index, action in enumerate(checklist.get("recommended_next_actions", [])[:8]):
+        lines.append("{0}. {1}".format(index + 1, action))
+    lines.extend(
+        [
+            "",
+            "Safety",
+            "- This checklist is read-only.",
+            "- No model data was modified.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _guided_plan_step(phase, title, action_key, action_type, risk, approval_required, reason, prerequisites=None):
+    return {
+        "phase": phase,
+        "action_title": title,
+        "action_key": action_key,
+        "action_type": action_type,
+        "risk": risk,
+        "approval_required": bool(approval_required),
+        "reason": reason,
+        "prerequisites": prerequisites or [],
+        "execution_status": "not_executed",
+    }
+
+
+def build_guided_project_startup_plan(context):
+    context = context if isinstance(context, dict) else {}
+    doc_info = context.get("document", {}) if isinstance(context.get("document", {}), dict) else {}
+    active_view = doc_info.get("active_view", {}) if isinstance(doc_info.get("active_view", {}), dict) else {}
+    onboarding = build_project_onboarding_checklist(context)
+    coord_health = _get_linked_model_coordinate_health(context)
+    level_grid = get_host_link_level_grid_health(context)
+    imports = context.get("imports_cad", {}) if isinstance(context.get("imports_cad", {}), dict) else {}
+    warnings = context.get("warnings_summary", {}) if isinstance(context.get("warnings_summary", {}), dict) else {}
+    schedules = context.get("schedules", {}) if isinstance(context.get("schedules", {}), dict) else {}
+    levels = context.get("levels", {}) if isinstance(context.get("levels", {}), dict) else {}
+    selection = context.get("selection", {}) if isinstance(context.get("selection", {}), dict) else {}
+    categories = context.get("category_counts", []) or []
+    issues = set([issue.get("id") for issue in context.get("detected_issues", []) if isinstance(issue, dict)])
+    phase1 = []
+    phase2 = []
+    phase3 = []
+    blocked = []
+
+    phase1.append(_guided_plan_step(
+        "Phase 1 - Required read-only diagnostics",
+        "Project onboarding checklist",
+        "project-onboarding-checklist",
+        "diagnostic",
+        "low",
+        False,
+        "Start with the deterministic checklist. Overall status {0}; automation readiness {1}.".format(onboarding.get("overall_status", "UNKNOWN"), onboarding.get("automation_readiness_status", "UNKNOWN")),
+    ))
+    if level_grid and (level_grid.get("overall_status") in ("REVIEW", "PARTIAL") or level_grid.get("level_findings_count", 0) or level_grid.get("grid_findings_count", 0)):
+        phase1.append(_guided_plan_step(
+            "Phase 1 - Required read-only diagnostics",
+            "BIM Basis / Levels & Grids review",
+            "check-bim-basis-level-grid-health",
+            "diagnostic",
+            "low",
+            False,
+            "Level/grid findings exist: {0} level findings, {1} grid findings.".format(level_grid.get("level_findings_count", 0), level_grid.get("grid_findings_count", 0)),
+        ))
+    if coord_health and (coord_health.get("overall_status") in ("REVIEW", "PARTIAL") or coord_health.get("unavailable_count", 0) or coord_health.get("non_identity_transform_count", 0)):
+        phase1.append(_guided_plan_step(
+            "Phase 1 - Required read-only diagnostics",
+            "Linked model coordinate health check",
+            "check-linked-model-coordinate-health",
+            "diagnostic",
+            "low",
+            False,
+            "Linked coordinate health status {0}; unavailable {1}, non-identity {2}, rotated {3}, z-offset {4}.".format(coord_health.get("overall_status", "UNKNOWN"), coord_health.get("unavailable_count", 0), coord_health.get("non_identity_transform_count", 0), coord_health.get("rotated_link_count", 0), coord_health.get("z_offset_link_count", 0)),
+        ))
+    if imports.get("total_import_instances", 0):
+        phase1.append(_guided_plan_step(
+            "Phase 1 - Required read-only diagnostics",
+            "CAD/import review",
+            None,
+            "diagnostic",
+            "low",
+            False,
+            "{0} CAD/import instances found; {1} view-specific.".format(imports.get("total_import_instances", 0), imports.get("view_specific_import_count", 0)),
+        ))
+    if warnings.get("total_warning_count", 0):
+        phase1.append(_guided_plan_step(
+            "Phase 1 - Required read-only diagnostics",
+            "Review Revit warnings summary",
+            None,
+            "diagnostic",
+            "low",
+            False,
+            "{0} Revit warnings detected. Review warning groups before automation.".format(warnings.get("total_warning_count", 0)),
+        ))
+    if levels.get("ambiguous_aliases"):
+        blocked.append(_guided_plan_step(
+            "Blocked / not recommended yet",
+            "Level-targeted automation",
+            None,
+            "blocked",
+            "medium",
+            False,
+            "Ambiguous level aliases exist; level-targeted automation should wait until level naming is reviewed.",
+            ["Resolve or review ambiguous level names."],
+        ))
+
+    phase2.append(_guided_plan_step(
+        "Phase 2 - Optional project health checks",
+        "Active-view health check",
+        "health-check-active-view-selection",
+        "reviewed_action",
+        "low",
+        False,
+        "Run a read-only active-view health check after required diagnostics.",
+    ))
+    if selection.get("selected_element_count", 0):
+        phase2.append(_guided_plan_step(
+            "Phase 2 - Optional project health checks",
+            "Report selected elements by category",
+            "report-selected-elements-by-category",
+            "reviewed_action",
+            "low",
+            False,
+            "{0} selected elements are available for selection-based QA.".format(selection.get("selected_element_count", 0)),
+        ))
+
+    major_context_risk = bool(blocked or [step for step in phase1 if step.get("action_title") != "Project onboarding checklist"])
+    pipe_count = 0
+    fitting_count = 0
+    for item in categories:
+        if item.get("category") == "Pipes" and isinstance(item.get("total_count"), int):
+            pipe_count = item.get("total_count")
+        if item.get("category") == "Pipe Fittings" and isinstance(item.get("total_count"), int):
+            fitting_count = item.get("total_count")
+    if pipe_count:
+        phase3.append(_guided_plan_step(
+            "Phase 3 - Reviewed automation candidates",
+            "Create pipe schedule by level",
+            "create-pipe-schedule-by-level",
+            "reviewed_action",
+            "medium",
+            True,
+            "Pipes are present; schedule creation should run only after read-only diagnostics are reviewed.",
+            ["Review Phase 1 diagnostics first."] if major_context_risk else [],
+        ))
+    if fitting_count:
+        phase3.append(_guided_plan_step(
+            "Phase 3 - Reviewed automation candidates",
+            "Create pipe fitting schedule by level",
+            "create-pipe-fitting-schedule-by-level",
+            "reviewed_action",
+            "medium",
+            True,
+            "Pipe fittings are present; schedule creation should run only after read-only diagnostics are reviewed.",
+            ["Review Phase 1 diagnostics first."] if major_context_risk else [],
+        ))
+    if schedules.get("template_like_schedule_candidates") and "aco_bunge_templates_present" in issues:
+        phase3.append(_guided_plan_step(
+            "Phase 3 - Reviewed automation candidates",
+            "ACO pipe fitting summary from template",
+            "create-aco-pipe-fitting-summary-from-template",
+            "reviewed_action",
+            "medium",
+            True,
+            "ACO/Bunge template-like schedules were observed; use only after required diagnostics and template status are reviewed.",
+            ["Review schedule population/status.", "Review Phase 1 diagnostics first."] if major_context_risk else ["Review schedule population/status."],
+        ))
+    if not phase3:
+        phase3.append(_guided_plan_step(
+            "Phase 3 - Reviewed automation candidates",
+            "No reviewed automation candidate selected yet",
+            None,
+            "informational",
+            "low",
+            False,
+            "No schedule/template automation candidate was selected from the current context.",
+        ))
+    steps = phase1 + phase2 + phase3 + blocked
+    return {
+        "title": "Guided Project Startup Plan",
+        "project_title": doc_info.get("title", "(unknown document)"),
+        "active_view": active_view.get("name", "(unknown view)"),
+        "context_depth": context.get("scan_depth", "unknown"),
+        "scan_timestamp": context.get("timestamp_utc", "unknown"),
+        "overall_onboarding_status": onboarding.get("overall_status", "UNKNOWN"),
+        "automation_readiness": onboarding.get("automation_readiness_status", "UNKNOWN"),
+        "phase1": phase1,
+        "phase2": phase2,
+        "phase3": phase3,
+        "blocked": blocked,
+        "steps": steps,
+        "execution_safe": True,
+        "plan_only": True,
+    }
+
+
+def format_guided_project_startup_plan(plan):
+    plan = plan if isinstance(plan, dict) else {}
+    lines = [
+        "[GUIDED PROJECT STARTUP PLAN]",
+        "",
+        "Project",
+        "- Document: {0}".format(plan.get("project_title", "(unknown document)")),
+        "- Active view: {0}".format(plan.get("active_view", "(unknown view)")),
+        "- Context depth: {0}".format(plan.get("context_depth", "unknown")),
+        "- Scan timestamp: {0}".format(plan.get("scan_timestamp", "unknown")),
+        "- Overall onboarding status: {0}".format(plan.get("overall_onboarding_status", "UNKNOWN")),
+        "- Automation readiness: {0}".format(plan.get("automation_readiness", "UNKNOWN")),
+    ]
+
+    def append_phase(title, steps):
+        lines.extend(["", title])
+        if not steps:
+            lines.append("- none")
+            return
+        for index, step in enumerate(steps):
+            lines.append("{0}. {1}".format(index + 1, step.get("action_title")))
+            lines.append("   risk: {0}".format(step.get("risk", "low")))
+            lines.append("   approval required: {0}".format("yes" if step.get("approval_required") else "no"))
+            lines.append("   type: {0}".format(step.get("action_type", "diagnostic")))
+            if step.get("action_key"):
+                lines.append("   action key: {0}".format(step.get("action_key")))
+            lines.append("   reason: {0}".format(step.get("reason", "")))
+            prerequisites = step.get("prerequisites") or []
+            if prerequisites:
+                lines.append("   prerequisites: {0}".format("; ".join(prerequisites)))
+            lines.append("   execution status: {0}".format(step.get("execution_status", "not_executed")))
+
+    append_phase("Phase 1 - Required read-only diagnostics", plan.get("phase1") or [])
+    append_phase("Phase 2 - Optional project health checks", plan.get("phase2") or [])
+    append_phase("Phase 3 - Reviewed automation candidates", plan.get("phase3") or [])
+    append_phase("Blocked / not recommended yet", plan.get("blocked") or [])
+    lines.extend(
+        [
+            "",
+            "Safety",
+            "- This is a plan only.",
+            "- No actions have been executed.",
+            "- Execute Plan remains governed by reviewed/catalog approval.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _summarize_project_context(context):
+    context = context if isinstance(context, dict) else {}
     doc_info = context.get("document", {})
     active_view = doc_info.get("active_view", {})
     levels = context.get("levels", {})
@@ -3587,6 +4645,8 @@ def _summarize_project_context(context):
     selection = context.get("selection", {})
     warnings = context.get("warnings_summary", {})
     issues = context.get("detected_issues", [])
+    coord_health = _get_linked_model_coordinate_health(context)
+    level_grid = get_host_link_level_grid_health(context)
     lines = [
         "[PROJECT CONTEXT SUMMARY]",
         "Document: {0}".format(doc_info.get("title", "(unknown document)")),
@@ -3617,6 +4677,13 @@ def _summarize_project_context(context):
             coord_health.get("non_identity_transform_count", 0),
             coord_health.get("rotated_link_count", 0),
             coord_health.get("z_offset_link_count", 0),
+        ))
+    if level_grid:
+        lines.append("BIM Basis / Levels & Grids: {0} | level findings {1} | grid findings {2} | links compared {3}".format(
+            level_grid.get("overall_status", "unknown"),
+            level_grid.get("level_findings_count", 0),
+            level_grid.get("grid_findings_count", 0),
+            level_grid.get("links_compared_count", 0),
         ))
     import_names = [item.get("instance_name") for item in imports.get("imports", [])[:5] if item.get("instance_name")]
     lines.append("CAD/imports: {0}{1}".format(imports.get("total_import_instances", 0), " | {0}".format(", ".join(import_names)) if import_names else ""))
@@ -3674,6 +4741,7 @@ def collect_project_context(doc, uidoc, scan_depth="standard"):
         _collector_section(context, warnings, "schedules", lambda: _collect_schedule_inventory(doc))
         _collector_section(context, warnings, "links", lambda: _collect_revit_links(doc))
         _collector_section(context, warnings, "linked_model_coordinate_health", lambda: _collect_linked_model_coordinate_health(doc))
+        _collector_section(context, warnings, "host_link_level_grid_health", lambda: _collect_host_link_level_grid_health(doc))
         _collector_section(context, warnings, "imports_cad", lambda: _collect_imports_context(doc, uidoc))
         _collector_section(context, warnings, "category_counts", lambda: _collect_core_category_counts(doc, uidoc))
         _collector_section(context, warnings, "warnings_summary", lambda: _collect_warning_summary(doc))
@@ -3698,20 +4766,19 @@ def summarize_current_project_context(doc, uidoc, context=None):
 
 def ask_agent_for_project_plan_action(doc, uidoc, context=None):
     result = collect_project_context(doc, uidoc, "standard")
-    summary = result.get("summary", "")
-    return "\n".join(
-        [
-            "Project-context planning input prepared.",
-            summary,
-            "Use AI Agent Ask Agent for Plan to create a reviewed plan from this context.",
-            "No actions have been executed.",
-        ]
-    )
+    plan = build_guided_project_startup_plan(result.get("context", {}))
+    return format_guided_project_startup_plan(plan)
+
+
+def guided_project_startup_plan_action(doc, uidoc, context=None):
+    result = collect_project_context(doc, uidoc, "standard")
+    plan = build_guided_project_startup_plan(result.get("context", {}))
+    return format_guided_project_startup_plan(plan)
 
 
 def check_linked_model_coordinate_health(doc, uidoc, context=None):
     result = collect_project_context(doc, uidoc, "standard")
-    health = result.get("context", {}).get("linked_model_coordinate_health", {})
+    health = _get_linked_model_coordinate_health(result.get("context", {}))
     return "\n".join(
         [
             "[LINKED MODEL COORDINATE HEALTH]",
@@ -3726,6 +4793,31 @@ def check_linked_model_coordinate_health(doc, uidoc, context=None):
             "No actions have been executed.",
         ]
     )
+
+
+def check_bim_basis_level_grid_health(doc, uidoc, context=None):
+    result = collect_project_context(doc, uidoc, "standard")
+    health = _get_host_link_level_grid_health(result.get("context", {}))
+    return "\n".join(
+        [
+            "[BIM BASIS / LEVELS & GRIDS]",
+            "Profile: {0}".format(health.get("profile", "Configurable BIM Basis / ILS-style")),
+            "Overall status: {0}".format(health.get("overall_status", "not scanned")),
+            "Host levels: {0}".format(health.get("host_level_count", "not scanned")),
+            "Host grids: {0}".format(health.get("host_grid_count", "not scanned")),
+            "Links compared: {0}".format(health.get("links_compared_count", 0)),
+            "Links skipped: {0}".format(health.get("links_skipped_count", 0)),
+            "Level findings: {0}".format(health.get("level_findings_count", 0)),
+            "Grid findings: {0}".format(health.get("grid_findings_count", 0)),
+            "No actions have been executed.",
+        ]
+    )
+
+
+def project_onboarding_checklist_action(doc, uidoc, context=None):
+    result = collect_project_context(doc, uidoc, "standard")
+    checklist = build_project_onboarding_checklist(result.get("context", {}))
+    return format_project_onboarding_checklist(checklist)
 
 
 def create_codex_task_brief_action(doc, uidoc, context=None):
@@ -3816,6 +4908,21 @@ def _electrical_assignment_value(elem):
         elem,
         ["Circuit Number", "Panel", "System Type", "System Name", "System Classification"],
     )
+
+
+def _safe_builtin_param_value(elem, builtin_param_names):
+    for name in builtin_param_names:
+        try:
+            bip = getattr(DB.BuiltInParameter, name)
+        except:
+            continue
+        try:
+            value = _value_from_param(elem.get_Parameter(bip))
+        except:
+            value = None
+        if value:
+            return value
+    return None
 
 
 def _is_unconnected_fitting(elem):
@@ -4277,16 +5384,1161 @@ def _room_space_maps(doc):
     return room_map, space_map
 
 
+ACTIVE_VIEW_MEP_DETAIL_CAP = 2000
+ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP = 20
+ACTIVE_VIEW_MEP_TYPE_GROUP_CAP = 20
+ACTIVE_VIEW_MEP_LEVEL_GROUP_CAP = 10
+ACTIVE_VIEW_MEP_SAMPLE_ID_CAP = 10
+
+
+def _active_view_mep_category_specs():
+    return [
+        ("Piping", "Pipes", "OST_PipeCurves"),
+        ("Piping", "Pipe Fittings", "OST_PipeFitting"),
+        ("Piping", "Pipe Accessories", "OST_PipeAccessory"),
+        ("Piping", "Plumbing Fixtures", "OST_PlumbingFixtures"),
+        ("HVAC", "Ducts", "OST_DuctCurves"),
+        ("HVAC", "Duct Fittings", "OST_DuctFitting"),
+        ("HVAC", "Duct Accessories", "OST_DuctAccessory"),
+        ("HVAC", "Air Terminals", "OST_DuctTerminal"),
+        ("HVAC", "Mechanical Equipment", "OST_MechanicalEquipment"),
+        ("HVAC", "Flex Ducts", "OST_FlexDuctCurves"),
+        ("Electrical", "Electrical Fixtures", "OST_ElectricalFixtures"),
+        ("Electrical", "Electrical Equipment", "OST_ElectricalEquipment"),
+        ("Electrical", "Lighting Fixtures", "OST_LightingFixtures"),
+        ("Electrical", "Lighting Devices", "OST_LightingDevices"),
+        ("Electrical", "Data Devices", "OST_DataDevices"),
+        ("Electrical", "Communication Devices", "OST_CommunicationDevices"),
+        ("Electrical", "Fire Alarm Devices", "OST_FireAlarmDevices"),
+        ("Electrical", "Conduits", "OST_Conduit"),
+        ("Electrical", "Conduit Fittings", "OST_ConduitFitting"),
+        ("Electrical", "Cable Trays", "OST_CableTray"),
+        ("Electrical", "Cable Tray Fittings", "OST_CableTrayFitting"),
+        ("Electrical", "Electrical Analytical Loads", "OST_ElectricalAnalyticalLoads"),
+        ("Other supported / coordination", "Generic Models", "OST_GenericModel"),
+        ("Other supported / coordination", "Revit Links", "OST_RvtLinks"),
+    ]
+
+
+def _safe_builtin_category(category_name):
+    try:
+        return getattr(DB.BuiltInCategory, category_name)
+    except:
+        return None
+
+
+def _collect_active_view_mep_elements(doc, uidoc, discipline_filter=None):
+    active_view = uidoc.ActiveView
+    element_map = {}
+    category_meta = {}
+    warnings = []
+    requested = (discipline_filter or "").lower().strip()
+    for discipline, label, bic_name in _active_view_mep_category_specs():
+        if requested and requested != discipline.lower():
+            continue
+        bic = _safe_builtin_category(bic_name)
+        if bic is None:
+            continue
+        try:
+            elems = list(
+                DB.FilteredElementCollector(doc, active_view.Id)
+                .OfCategory(bic)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+        except Exception as err:
+            warnings.append("Skipped {0}: {1}".format(label, safe_str(err)))
+            continue
+        for elem in elems:
+            if elem is None:
+                continue
+            key = _safe_int_id(elem)
+            element_map[key] = elem
+            category_meta[key] = {
+                "discipline": discipline,
+                "label": label,
+            }
+
+    if not requested or requested == "other supported / coordination":
+        try:
+            imports = list(
+                DB.FilteredElementCollector(doc, active_view.Id)
+                .OfClass(DB.ImportInstance)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+            for elem in imports:
+                if elem is None:
+                    continue
+                key = _safe_int_id(elem)
+                element_map[key] = elem
+                category_meta[key] = {
+                    "discipline": "Other supported / coordination",
+                    "label": "CAD/import instances",
+                }
+        except Exception as err:
+            warnings.append("Skipped CAD/import instances: {0}".format(safe_str(err)))
+
+    elements = list(element_map.values())
+    elements.sort(key=lambda elem: _safe_int_id(elem))
+    return {
+        "active_view": active_view,
+        "elements": elements,
+        "category_meta": category_meta,
+        "warnings": warnings,
+        "discipline_filter": discipline_filter,
+    }
+
+
+def _active_view_mep_groups(doc, collected, detail_cap=ACTIVE_VIEW_MEP_DETAIL_CAP):
+    elems = collected.get("elements", [])
+    inspected = elems[:detail_cap]
+    meta = collected.get("category_meta", {})
+    discipline_counts = {
+        "Piping": 0,
+        "HVAC": 0,
+        "Electrical": 0,
+        "Other supported / coordination": 0,
+    }
+    category_grouped = {}
+    type_grouped = {}
+    level_grouped = {}
+    missing_level = []
+    imports = []
+    revit_links = []
+    for elem in inspected:
+        key = _safe_int_id(elem)
+        info = meta.get(key, {})
+        discipline = info.get("discipline") or "Other supported / coordination"
+        category_name = info.get("label") or _category_name(elem)
+        discipline_counts.setdefault(discipline, 0)
+        discipline_counts[discipline] += 1
+        category_grouped.setdefault(category_name, []).append(elem)
+        type_grouped.setdefault(_family_and_type_text(doc, elem) or "(no type)", []).append(elem)
+        level_name = _element_level_name(doc, elem)
+        if level_name:
+            level_grouped.setdefault(level_name, []).append(elem)
+        else:
+            missing_level.append(elem)
+        if category_name == "CAD/import instances" or "Import" in category_name:
+            imports.append(elem)
+        if category_name == "Revit Links":
+            revit_links.append(elem)
+    return {
+        "elements": elems,
+        "inspected": inspected,
+        "discipline_counts": discipline_counts,
+        "category_grouped": category_grouped,
+        "type_grouped": type_grouped,
+        "level_grouped": level_grouped,
+        "missing_level": missing_level,
+        "imports": imports,
+        "revit_links": revit_links,
+        "capped": len(elems) > detail_cap,
+    }
+
+
+def _active_view_mep_header(title, doc, uidoc, collected, total_count):
+    active_view = collected.get("active_view") or uidoc.ActiveView
+    try:
+        view_type = safe_str(active_view.ViewType)
+    except:
+        view_type = "unknown"
+    return [
+        title,
+        "Selection scope: active view / active document only",
+        "Active document: {0}".format(_document_title(doc)),
+        "Active view: {0} [{1}]".format(_active_view_title(doc, uidoc), view_type),
+        "Total supported MEP elements in active view: {0}".format(total_count),
+    ]
+
+
+def _append_active_view_group_lines(lines, title, grouped, limit):
+    lines.append("")
+    lines.append(title)
+    ordered = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
+    if not ordered:
+        lines.append("- none")
+        return
+    for name, items in ordered[:limit]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(name, len(items), _sample_id_text(items)))
+    if len(ordered) > limit:
+        lines.append("...showing first {0} of {1} groups".format(limit, len(ordered)))
+
+
+def _append_active_view_common_tail(lines, groups, collected, mode):
+    elems = groups.get("elements", [])
+    if groups.get("capped"):
+        lines.append("")
+        lines.append("Result set capped for readability/performance.")
+    lines.append("")
+    lines.append("Sample ElementIds: {0}".format(_sample_id_text(elems, limit=ACTIVE_VIEW_MEP_SAMPLE_ID_CAP)))
+    lines.append("")
+    lines.append("Notes / Warnings")
+    notes = []
+    if not elems:
+        notes.append("No supported MEP elements found in the active view.")
+    visible_disciplines = [name for name, count in groups.get("discipline_counts", {}).items() if count]
+    if len(visible_disciplines) > 1:
+        notes.append("Mixed disciplines visible: {0}".format(len(visible_disciplines)))
+    if groups.get("missing_level"):
+        notes.append("Missing level/reference-level data on {0} element(s).".format(len(groups.get("missing_level"))))
+    if groups.get("imports"):
+        notes.append("CAD/import instances visible in active view: {0}".format(len(groups.get("imports"))))
+    if groups.get("revit_links"):
+        notes.append("Revit links visible in active view: {0}".format(len(groups.get("revit_links"))))
+    for warning in collected.get("warnings", []):
+        notes.append(warning)
+    if not notes:
+        notes.append("No active-view QA warnings detected by this read-only report.")
+    for note in notes:
+        lines.append("- {0}".format(note))
+    lines.append("")
+    lines.append("Safety note:")
+    lines.append("- read-only; no model data modified.")
+
+
+def active_view_mep_report(doc, uidoc, mode="summary", discipline_filter=None):
+    collected = _collect_active_view_mep_elements(doc, uidoc, discipline_filter=discipline_filter)
+    groups = _active_view_mep_groups(doc, collected)
+    elems = groups.get("elements", [])
+    title_map = {
+        "summary": "[ACTIVE VIEW MEP SUMMARY]",
+        "count": "[ACTIVE VIEW MEP SUMMARY]",
+        "category": "[ACTIVE VIEW ELEMENTS BY CATEGORY]",
+        "type": "[ACTIVE VIEW ELEMENTS BY TYPE]",
+        "qa": "[ACTIVE VIEW QA REPORT]",
+    }
+    title = title_map.get(mode, "[ACTIVE VIEW MEP SUMMARY]")
+    lines = _active_view_mep_header(title, doc, uidoc, collected, len(elems))
+    if discipline_filter:
+        lines.append("Discipline filter: {0}".format(discipline_filter))
+    if not elems:
+        lines.append("")
+        lines.append("No supported MEP elements found in the active view.")
+        lines.append("")
+        lines.append("Safety note:")
+        lines.append("- read-only; no model data modified.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("By discipline")
+    for discipline in ["Piping", "HVAC", "Electrical", "Other supported / coordination"]:
+        lines.append("- {0}: {1}".format(discipline, groups.get("discipline_counts", {}).get(discipline, 0)))
+
+    if mode == "type":
+        _append_active_view_group_lines(lines, "Type / family-type counts", groups.get("type_grouped", {}), ACTIVE_VIEW_MEP_TYPE_GROUP_CAP)
+        _append_active_view_group_lines(lines, "Category counts", groups.get("category_grouped", {}), ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP)
+    else:
+        _append_active_view_group_lines(lines, "By category", groups.get("category_grouped", {}), ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP)
+        _append_active_view_group_lines(lines, "Top family/type groups", groups.get("type_grouped", {}), ACTIVE_VIEW_MEP_TYPE_GROUP_CAP)
+    _append_active_view_group_lines(lines, "Sample levels", groups.get("level_grouped", {}), ACTIVE_VIEW_MEP_LEVEL_GROUP_CAP)
+    _append_active_view_common_tail(lines, groups, collected, mode)
+    return "\n".join(lines)
+
+
+def report_active_view_missing_parameters(doc, uidoc, discipline_filter=None):
+    collected = _collect_active_view_mep_elements(doc, uidoc, discipline_filter=discipline_filter)
+    groups = _active_view_mep_groups(doc, collected)
+    elems = groups.get("elements", [])
+    inspected = groups.get("inspected", [])
+    lines = _active_view_mep_header("[ACTIVE VIEW MISSING PARAMETERS]", doc, uidoc, collected, len(elems))
+    if discipline_filter:
+        lines.append("Discipline filter: {0}".format(discipline_filter))
+    if not elems:
+        lines.append("")
+        lines.append("No supported MEP elements found in the active view.")
+        lines.append("")
+        lines.append("Safety note:")
+        lines.append("- read-only; no model data modified.")
+        return "\n".join(lines)
+
+    checks = [
+        ("Mark", lambda elem: _lookup_first_param_value(elem, ["Mark"])),
+        ("Comments", lambda elem: _lookup_first_param_value(elem, ["Comments"])),
+        ("Family and Type", lambda elem: _family_and_type_text(doc, elem)),
+        (
+            "System assignment",
+            lambda elem: _system_assignment_value(elem) if _supports_system_assignment(elem) else "__not_applicable__",
+        ),
+        (
+            "Electrical circuit/system",
+            lambda elem: _electrical_assignment_value(elem) if _supports_electrical_assignment(elem) else "__not_applicable__",
+        ),
+    ]
+    lines.append("Elements inspected for parameter details: {0}".format(len(inspected)))
+    lines.append("Parameters checked: {0}".format(", ".join([label for label, _ in checks])))
+    lines.append("")
+    for label, resolver in checks:
+        applicable = []
+        missing = []
+        unavailable = []
+        for elem in inspected:
+            try:
+                value = resolver(elem)
+            except Exception:
+                value = "__not_applicable__"
+            if value == "__not_applicable__":
+                unavailable.append(elem)
+                continue
+            applicable.append(elem)
+            if not value:
+                missing.append(elem)
+        lines.append(
+            "{0}: missing/empty {1} | applicable {2} | unavailable/not applicable {3}".format(
+                label,
+                len(missing),
+                len(applicable),
+                len(unavailable),
+            )
+        )
+        if missing:
+            lines.append("  sample affected ElementIds: {0}".format(_sample_id_text(missing)))
+    if groups.get("capped"):
+        lines.append("")
+        lines.append("Result set capped for readability/performance.")
+    lines.append("")
+    lines.append("Safety note:")
+    lines.append("- read-only; no model data modified.")
+    return "\n".join(lines)
+
+
+def active_view_mep_summary(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="summary")
+
+
+def count_mep_elements_in_active_view(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="count")
+
+
+def report_active_view_elements_by_category(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="category")
+
+
+def report_active_view_elements_by_type(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="type")
+
+
+def active_view_qa_report(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="qa")
+
+
+def report_missing_parameters_in_active_view(doc, uidoc, context=None):
+    return report_active_view_missing_parameters(doc, uidoc)
+
+
+def active_view_piping_report(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="summary", discipline_filter="Piping")
+
+
+def active_view_hvac_report(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="summary", discipline_filter="HVAC")
+
+
+def active_view_electrical_report(doc, uidoc, context=None):
+    return active_view_mep_report(doc, uidoc, mode="summary", discipline_filter="Electrical")
+
+
+def _system_assignment_category_specs():
+    return [
+        ("Piping", "Pipes", "OST_PipeCurves"),
+        ("Piping", "Pipe Fittings", "OST_PipeFitting"),
+        ("Piping", "Pipe Accessories", "OST_PipeAccessory"),
+        ("Piping", "Plumbing Fixtures", "OST_PlumbingFixtures"),
+        ("HVAC", "Ducts", "OST_DuctCurves"),
+        ("HVAC", "Duct Fittings", "OST_DuctFitting"),
+        ("HVAC", "Duct Accessories", "OST_DuctAccessory"),
+        ("HVAC", "Air Terminals", "OST_DuctTerminal"),
+        ("HVAC", "Mechanical Equipment", "OST_MechanicalEquipment"),
+        ("HVAC", "Flex Ducts", "OST_FlexDuctCurves"),
+        ("Electrical", "Electrical Fixtures", "OST_ElectricalFixtures"),
+        ("Electrical", "Electrical Equipment", "OST_ElectricalEquipment"),
+        ("Electrical", "Lighting Fixtures", "OST_LightingFixtures"),
+        ("Electrical", "Lighting Devices", "OST_LightingDevices"),
+        ("Electrical", "Data Devices", "OST_DataDevices"),
+        ("Electrical", "Communication Devices", "OST_CommunicationDevices"),
+        ("Electrical", "Fire Alarm Devices", "OST_FireAlarmDevices"),
+        ("Electrical", "Conduits", "OST_Conduit"),
+        ("Electrical", "Conduit Fittings", "OST_ConduitFitting"),
+        ("Electrical", "Cable Trays", "OST_CableTray"),
+        ("Electrical", "Cable Tray Fittings", "OST_CableTrayFitting"),
+        ("Electrical", "Electrical Analytical Loads", "OST_ElectricalAnalyticalLoads"),
+    ]
+
+
+def _system_assignment_category_lookup(discipline_filter=None):
+    requested = (discipline_filter or "").lower().strip()
+    lookup = {}
+    for discipline, label, bic_name in _system_assignment_category_specs():
+        if requested and requested != discipline.lower():
+            continue
+        bic = _safe_builtin_category(bic_name)
+        if bic is None:
+            continue
+        try:
+            lookup[int(bic)] = {
+                "discipline": discipline,
+                "label": label,
+            }
+        except:
+            continue
+    return lookup
+
+
+def _collect_selected_system_assignment_elements(doc, uidoc, discipline_filter=None):
+    lookup = _system_assignment_category_lookup(discipline_filter)
+    elements = []
+    meta = {}
+    for element_id in uidoc.Selection.GetElementIds():
+        elem = doc.GetElement(element_id)
+        if elem is None:
+            continue
+        try:
+            category_id = elem.Category.Id.IntegerValue
+        except:
+            continue
+        if category_id not in lookup:
+            continue
+        key = _safe_int_id(elem)
+        elements.append(elem)
+        meta[key] = lookup[category_id]
+    elements.sort(key=lambda elem: _safe_int_id(elem))
+    return {
+        "scope": "selection",
+        "elements": elements,
+        "category_meta": meta,
+        "warnings": [],
+        "discipline_filter": discipline_filter,
+        "active_view": uidoc.ActiveView,
+    }
+
+
+def _collect_active_view_system_assignment_elements(doc, uidoc, discipline_filter=None):
+    active_view = uidoc.ActiveView
+    elements = []
+    meta = {}
+    warnings = []
+    for discipline, label, bic_name in _system_assignment_category_specs():
+        if discipline_filter and discipline.lower() != discipline_filter.lower():
+            continue
+        bic = _safe_builtin_category(bic_name)
+        if bic is None:
+            continue
+        try:
+            found = list(
+                DB.FilteredElementCollector(doc, active_view.Id)
+                .OfCategory(bic)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+        except Exception as err:
+            warnings.append("Skipped {0}: {1}".format(label, safe_str(err)))
+            continue
+        for elem in found:
+            if elem is None:
+                continue
+            key = _safe_int_id(elem)
+            elements.append(elem)
+            meta[key] = {
+                "discipline": discipline,
+                "label": label,
+            }
+    element_map = {}
+    for elem in elements:
+        element_map[_safe_int_id(elem)] = elem
+    elements = list(element_map.values())
+    elements.sort(key=lambda elem: _safe_int_id(elem))
+    return {
+        "scope": "active_view",
+        "elements": elements,
+        "category_meta": meta,
+        "warnings": warnings,
+        "discipline_filter": discipline_filter,
+        "active_view": active_view,
+    }
+
+
+def _system_assignment_read(elem, discipline):
+    try:
+        if discipline == "Electrical":
+            value = _lookup_first_param_value(
+                elem,
+                [
+                    "Circuit Number",
+                    "Electrical Circuit",
+                    "Panel",
+                    "System Name",
+                    "Electrical System",
+                    "System Type",
+                    "System Classification",
+                ],
+            )
+            if not value:
+                value = _safe_builtin_param_value(
+                    elem,
+                    [
+                        "RBS_ELEC_CIRCUIT_NUMBER",
+                        "RBS_ELEC_PANEL_NAME",
+                    ],
+                )
+            if value:
+                return ("assigned", value)
+            if _supports_electrical_assignment(elem):
+                return ("missing", None)
+            return ("unavailable", None)
+        value = _lookup_first_param_value(
+            elem,
+            [
+                "MEP System",
+                "System Name",
+                "System Type",
+                "System Classification",
+                "Piping System Type",
+                "Duct System Type",
+            ],
+        )
+        if not value:
+            value = _safe_builtin_param_value(
+                elem,
+                [
+                    "RBS_SYSTEM_NAME_PARAM",
+                    "RBS_SYSTEM_CLASSIFICATION_PARAM",
+                    "RBS_PIPING_SYSTEM_TYPE_PARAM",
+                    "RBS_DUCT_SYSTEM_TYPE_PARAM",
+                ],
+            )
+        if value:
+            return ("assigned", value)
+        if _supports_system_assignment(elem):
+            return ("missing", None)
+        return ("unavailable", None)
+    except:
+        return ("unknown", None)
+
+
+def _system_assignment_analysis(doc, collected):
+    elements = collected.get("elements", [])
+    inspected = elements[:ACTIVE_VIEW_MEP_DETAIL_CAP]
+    meta = collected.get("category_meta", {})
+    discipline_counts = {"Piping": 0, "HVAC": 0, "Electrical": 0, "Other supported / coordination": 0}
+    category_grouped = {}
+    type_grouped = {}
+    level_grouped = {}
+    by_system = {}
+    missing_by_category = {}
+    unavailable_by_category = {}
+    unknown_by_category = {}
+    missing = []
+    unavailable = []
+    unknown = []
+    assigned = []
+    for elem in inspected:
+        key = _safe_int_id(elem)
+        info = meta.get(key, {})
+        discipline = info.get("discipline") or "Other supported / coordination"
+        category_name = info.get("label") or _category_name(elem)
+        discipline_counts.setdefault(discipline, 0)
+        discipline_counts[discipline] += 1
+        category_grouped.setdefault(category_name, []).append(elem)
+        type_grouped.setdefault(_family_and_type_text(doc, elem) or "(no type)", []).append(elem)
+        level_name = _element_level_name(doc, elem)
+        if level_name:
+            level_grouped.setdefault(level_name, []).append(elem)
+        status, value = _system_assignment_read(elem, discipline)
+        if status == "assigned":
+            assigned.append(elem)
+            system_name = value or "(readable value)"
+            by_system.setdefault(system_name, []).append(elem)
+        elif status == "missing":
+            missing.append(elem)
+            missing_by_category.setdefault(category_name, []).append(elem)
+        elif status == "unavailable":
+            unavailable.append(elem)
+            unavailable_by_category.setdefault(category_name, []).append(elem)
+        else:
+            unknown.append(elem)
+            unknown_by_category.setdefault(category_name, []).append(elem)
+    return {
+        "elements": elements,
+        "inspected": inspected,
+        "discipline_counts": discipline_counts,
+        "category_grouped": category_grouped,
+        "type_grouped": type_grouped,
+        "level_grouped": level_grouped,
+        "by_system": by_system,
+        "missing": missing,
+        "unavailable": unavailable,
+        "unknown": unknown,
+        "assigned": assigned,
+        "missing_by_category": missing_by_category,
+        "unavailable_by_category": unavailable_by_category,
+        "unknown_by_category": unknown_by_category,
+        "capped": len(elements) > ACTIVE_VIEW_MEP_DETAIL_CAP,
+    }
+
+
+def _format_system_assignment_report(doc, uidoc, collected, title):
+    analysis = _system_assignment_analysis(doc, collected)
+    active_view = collected.get("active_view") or uidoc.ActiveView
+    try:
+        view_type = safe_str(active_view.ViewType)
+    except:
+        view_type = "unknown"
+    scope = collected.get("scope")
+    elements = analysis.get("elements", [])
+    inspected = analysis.get("inspected", [])
+    lines = [
+        title,
+        "Selection scope: {0} / active document only".format("selected elements" if scope == "selection" else "active view"),
+        "Active document: {0}".format(_document_title(doc)),
+        "Active view: {0} [{1}]".format(_active_view_title(doc, uidoc), view_type),
+    ]
+    if collected.get("discipline_filter"):
+        lines.append("Discipline filter: {0}".format(collected.get("discipline_filter")))
+    if scope == "selection":
+        lines.append("Total selected supported MEP elements: {0}".format(len(elements)))
+    else:
+        lines.append("Total supported MEP elements in active view: {0}".format(len(elements)))
+        lines.append("Elements inspected for system details: {0}".format(len(inspected)))
+    if not elements:
+        lines.append("")
+        if scope == "selection":
+            lines.append("No supported MEP elements selected. Select elements or use an active-view system report.")
+        else:
+            lines.append("No supported MEP elements found in the active view.")
+        lines.append("")
+        lines.append("Safety note:")
+        lines.append("- read-only; no model data modified.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("By discipline")
+    for discipline in ["Piping", "HVAC", "Electrical", "Other supported / coordination"]:
+        lines.append("- {0}: {1}".format(discipline, analysis.get("discipline_counts", {}).get(discipline, 0)))
+
+    lines.append("")
+    lines.append("System assignment summary")
+    lines.append("- Assigned/readable: {0}".format(len(analysis.get("assigned", []))))
+    lines.append("- Missing/empty: {0}".format(len(analysis.get("missing", []))))
+    lines.append("- Unavailable/not applicable: {0}".format(len(analysis.get("unavailable", []))))
+    lines.append("- Unknown/error: {0}".format(len(analysis.get("unknown", []))))
+
+    lines.append("")
+    lines.append("By system / classification")
+    systems = sorted(analysis.get("by_system", {}).items(), key=lambda item: (-len(item[1]), item[0]))
+    if systems:
+        for system_name, items in systems[:ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP]:
+            categories = sorted(set([_category_name(elem) for elem in items]))
+            lines.append("- {0}: {1} | categories: {2} | sample ids: {3}".format(system_name, len(items), ", ".join(categories[:5]), _sample_id_text(items)))
+        if len(systems) > ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP:
+            lines.append("...showing first {0} of {1} system groups".format(ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP, len(systems)))
+    else:
+        lines.append("- none")
+
+    _append_active_view_group_lines(lines, "Missing / empty system assignment", analysis.get("missing_by_category", {}), ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP)
+    _append_active_view_group_lines(lines, "Unavailable / not applicable", analysis.get("unavailable_by_category", {}), ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP)
+    _append_active_view_group_lines(lines, "By category", analysis.get("category_grouped", {}), ACTIVE_VIEW_MEP_CATEGORY_GROUP_CAP)
+    _append_active_view_group_lines(lines, "Top family/type groups", analysis.get("type_grouped", {}), ACTIVE_VIEW_MEP_TYPE_GROUP_CAP)
+    _append_active_view_group_lines(lines, "Sample levels", analysis.get("level_grouped", {}), ACTIVE_VIEW_MEP_LEVEL_GROUP_CAP)
+
+    lines.append("")
+    lines.append("Sample ElementIds: {0}".format(_sample_id_text(elements, limit=ACTIVE_VIEW_MEP_SAMPLE_ID_CAP)))
+    lines.append("")
+    lines.append("Notes / Warnings")
+    notes = []
+    visible_disciplines = [name for name, count in analysis.get("discipline_counts", {}).items() if count]
+    if scope == "selection" and len(visible_disciplines) > 1:
+        notes.append("Mixed disciplines selected: {0}".format(len(visible_disciplines)))
+    if analysis.get("missing"):
+        notes.append("Missing/empty system assignment found on {0} element(s).".format(len(analysis.get("missing"))))
+    if analysis.get("unavailable") and analysis.get("discipline_counts", {}).get("Electrical", 0):
+        notes.append("Electrical circuit/system data unavailable for {0} element(s).".format(len(analysis.get("unavailable"))))
+    if scope == "active_view":
+        notes.append("Visible Revit links are not scanned for internal systems.")
+    for warning in collected.get("warnings", []):
+        notes.append(warning)
+    if analysis.get("capped"):
+        notes.append("Detailed system results are based on capped inspection.")
+        notes.append("Result set capped for readability/performance.")
+    if not notes:
+        notes.append("No system-assignment QA warnings detected by this read-only report.")
+    for note in notes:
+        lines.append("- {0}".format(note))
+    lines.append("")
+    lines.append("Safety note:")
+    lines.append("- read-only; no model data modified.")
+    return "\n".join(lines)
+
+
+def selected_mep_system_assignment_report(doc, uidoc, context=None, discipline_filter=None):
+    collected = _collect_selected_system_assignment_elements(doc, uidoc, discipline_filter=discipline_filter)
+    return _format_system_assignment_report(doc, uidoc, collected, "[SELECTED MEP SYSTEM ASSIGNMENT REPORT]")
+
+
+def active_view_mep_system_assignment_report(doc, uidoc, context=None, discipline_filter=None):
+    collected = _collect_active_view_system_assignment_elements(doc, uidoc, discipline_filter=discipline_filter)
+    return _format_system_assignment_report(doc, uidoc, collected, "[ACTIVE VIEW MEP SYSTEM ASSIGNMENT REPORT]")
+
+
+def selected_pipe_system_report(doc, uidoc, context=None):
+    return selected_mep_system_assignment_report(doc, uidoc, context, discipline_filter="Piping")
+
+
+def active_view_pipe_system_report(doc, uidoc, context=None):
+    return active_view_mep_system_assignment_report(doc, uidoc, context, discipline_filter="Piping")
+
+
+def selected_duct_system_report(doc, uidoc, context=None):
+    return selected_mep_system_assignment_report(doc, uidoc, context, discipline_filter="HVAC")
+
+
+def active_view_duct_system_report(doc, uidoc, context=None):
+    return active_view_mep_system_assignment_report(doc, uidoc, context, discipline_filter="HVAC")
+
+
+def selected_electrical_system_report(doc, uidoc, context=None):
+    return selected_mep_system_assignment_report(doc, uidoc, context, discipline_filter="Electrical")
+
+
+def active_view_electrical_system_report(doc, uidoc, context=None):
+    return active_view_mep_system_assignment_report(doc, uidoc, context, discipline_filter="Electrical")
+
+
+def safe_get_param_value(elem, candidate_names_or_builtins):
+    names = []
+    builtins = []
+    for candidate in candidate_names_or_builtins or []:
+        if isinstance(candidate, str):
+            if candidate.startswith("RBS_") or candidate.startswith("INSTANCE_") or candidate.startswith("ALL_MODEL_"):
+                builtins.append(candidate)
+            names.append(candidate)
+        else:
+            try:
+                value = _value_from_param(elem.get_Parameter(candidate))
+            except:
+                value = None
+            if value:
+                return value
+    value = _lookup_first_param_value(elem, names)
+    if value:
+        return value
+    return _safe_builtin_param_value(elem, builtins)
+
+
+def safe_get_level_name(elem, doc):
+    return _element_level_name(doc, elem)
+
+
+def safe_get_type_label(elem, doc):
+    return _family_and_type_text(doc, elem) or "(no type)"
+
+
+def classify_category_to_discipline(category_name):
+    text = (category_name or "").lower()
+    if "pipe" in text or "plumbing" in text:
+        return "Piping"
+    if "duct" in text or "air terminal" in text or "mechanical equipment" in text:
+        return "HVAC"
+    if "electrical" in text or "lighting" in text or "conduit" in text or "cable tray" in text or "data device" in text or "communication" in text or "fire alarm" in text:
+        return "Electrical"
+    return "Other supported / coordination"
+
+
+def _qa_result(rule_id, discipline, label, severity, result, elem, category, value=None, reason=""):
+    return {
+        "rule_id": rule_id,
+        "discipline": discipline,
+        "label": label,
+        "severity": severity,
+        "result": result,
+        "category": category,
+        "element_id": _safe_int_id(elem),
+        "element": elem,
+        "value": value,
+        "reason": reason,
+    }
+
+
+def _qa_check_value(elem, candidates):
+    try:
+        value = safe_get_param_value(elem, candidates)
+    except Exception as err:
+        return ("error", None, safe_str(err))
+    if value is None:
+        return ("unavailable", None, "parameter unavailable")
+    if safe_str(value).strip() == "":
+        return ("fail", None, "parameter empty")
+    return ("pass", value, "readable")
+
+
+def _qa_presence_rule(elem, category, discipline, rule_id, label, candidates, missing_is_fail=True):
+    status, value, reason = _qa_check_value(elem, candidates)
+    if status == "unavailable" and missing_is_fail:
+        return _qa_result(rule_id, discipline, label, "review", "fail", elem, category, value, "missing or empty")
+    if status == "unavailable":
+        return _qa_result(rule_id, discipline, label, "info", "unavailable", elem, category, value, reason)
+    if status == "error":
+        return _qa_result(rule_id, discipline, label, "info", "error", elem, category, value, reason)
+    if status == "fail":
+        return _qa_result(rule_id, discipline, label, "review", "fail", elem, category, value, reason)
+    return _qa_result(rule_id, discipline, label, "info", "pass", elem, category, value, reason)
+
+
+def _is_category_named(category_name, tokens):
+    text = (category_name or "").lower()
+    return any(token.lower() in text for token in tokens)
+
+
+def _evaluate_discipline_qa_rules_for_element(doc, elem, meta):
+    category = meta.get("label") or _category_name(elem)
+    discipline = meta.get("discipline") or classify_category_to_discipline(category)
+    results = []
+    results.append(_qa_presence_rule(elem, category, discipline, "COMMON-001", "Mark present", ["Mark"]))
+    results.append(_qa_presence_rule(elem, category, discipline, "COMMON-002", "Comments present", ["Comments"]))
+    type_label = safe_get_type_label(elem, doc)
+    if type_label and type_label != "(no type)":
+        results.append(_qa_result("COMMON-003", discipline, "Family and Type readable", "info", "pass", elem, category, type_label, "readable"))
+    else:
+        results.append(_qa_result("COMMON-003", discipline, "Family and Type readable", "review", "fail", elem, category, None, "family/type not readable"))
+    level_name = safe_get_level_name(elem, doc)
+    if level_name:
+        results.append(_qa_result("COMMON-004", discipline, "Level/reference level readable", "info", "pass", elem, category, level_name, "readable"))
+    else:
+        results.append(_qa_result("COMMON-004", discipline, "Level/reference level readable", "review", "fail", elem, category, None, "level/reference level not readable"))
+    if category:
+        results.append(_qa_result("COMMON-005", discipline, "Element has category", "info", "pass", elem, category, category, "readable"))
+    else:
+        results.append(_qa_result("COMMON-005", discipline, "Element has category", "review", "fail", elem, category, None, "category not readable"))
+
+    if discipline == "Piping":
+        status, value = _system_assignment_read(elem, discipline)
+        if status == "assigned":
+            results.append(_qa_result("PIP-001", discipline, "System assignment readable", "info", "pass", elem, category, value, "readable"))
+        elif status == "missing":
+            results.append(_qa_result("PIP-001", discipline, "System assignment readable", "review", "fail", elem, category, None, "missing or empty"))
+        elif status == "unavailable":
+            results.append(_qa_result("PIP-001", discipline, "System assignment readable", "info", "not_applicable", elem, category, None, "category-specific not applicable or unavailable"))
+        else:
+            results.append(_qa_result("PIP-001", discipline, "System assignment readable", "info", "error", elem, category, None, "read error"))
+        results.append(_qa_presence_rule(elem, category, discipline, "PIP-002", "Level/reference level readable", ["Level", "Reference Level", "Schedule Level", "Base Level"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "PIP-003", "Size / Diameter readable", ["Size", "Diameter", "Nominal Diameter", "Outside Diameter"], missing_is_fail=False))
+        results.append(_qa_presence_rule(elem, category, discipline, "PIP-004", "Mark present", ["Mark"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "PIP-005", "Comments present", ["Comments"], missing_is_fail=True))
+        if _is_category_named(category, ["Pipes"]):
+            results.append(_qa_presence_rule(elem, category, discipline, "PIP-006", "Pipe slope readable", ["Slope"], missing_is_fail=False))
+            results.append(_qa_presence_rule(elem, category, discipline, "PIP-007", "Pipe length readable", ["Length"], missing_is_fail=False))
+        else:
+            results.append(_qa_result("PIP-006", discipline, "Pipe slope readable", "info", "not_applicable", elem, category, None, "not a pipe curve"))
+            results.append(_qa_result("PIP-007", discipline, "Pipe length readable", "info", "not_applicable", elem, category, None, "not a pipe curve"))
+    elif discipline == "HVAC":
+        status, value = _system_assignment_read(elem, discipline)
+        if status == "assigned":
+            results.append(_qa_result("HVAC-001", discipline, "System assignment readable", "info", "pass", elem, category, value, "readable"))
+        elif status == "missing":
+            results.append(_qa_result("HVAC-001", discipline, "System assignment readable", "review", "fail", elem, category, None, "missing or empty"))
+        elif status == "unavailable":
+            results.append(_qa_result("HVAC-001", discipline, "System assignment readable", "info", "not_applicable", elem, category, None, "category-specific not applicable or unavailable"))
+        else:
+            results.append(_qa_result("HVAC-001", discipline, "System assignment readable", "info", "error", elem, category, None, "read error"))
+        results.append(_qa_presence_rule(elem, category, discipline, "HVAC-002", "Level/reference level readable", ["Level", "Reference Level", "Schedule Level", "Base Level"], missing_is_fail=True))
+        if _is_category_named(category, ["Duct", "Flex Duct"]):
+            results.append(_qa_presence_rule(elem, category, discipline, "HVAC-003", "Size readable", ["Size", "Width", "Height", "Diameter"], missing_is_fail=False))
+        else:
+            results.append(_qa_result("HVAC-003", discipline, "Size readable", "info", "not_applicable", elem, category, None, "category-specific not applicable"))
+        if _is_category_named(category, ["Air Terminal"]):
+            results.append(_qa_presence_rule(elem, category, discipline, "HVAC-004", "Flow readable", ["Flow", "Air Flow", "Supply Airflow", "Return Airflow", "Exhaust Airflow"], missing_is_fail=False))
+        else:
+            results.append(_qa_result("HVAC-004", discipline, "Flow readable", "info", "not_applicable", elem, category, None, "category-specific not applicable"))
+        results.append(_qa_presence_rule(elem, category, discipline, "HVAC-005", "Mark present", ["Mark"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "HVAC-006", "Comments present", ["Comments"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "HVAC-007", "Family and Type readable", ["Family and Type", "Type Name"], missing_is_fail=True))
+    elif discipline == "Electrical":
+        status, value = _system_assignment_read(elem, discipline)
+        circuit_applicable = _supports_electrical_assignment(elem)
+        if status == "assigned":
+            results.append(_qa_result("ELEC-001", discipline, "Electrical circuit/system readable", "info", "pass", elem, category, value, "readable"))
+        elif status == "missing" and circuit_applicable:
+            results.append(_qa_result("ELEC-001", discipline, "Electrical circuit/system readable", "review", "fail", elem, category, None, "missing or empty"))
+        else:
+            results.append(_qa_result("ELEC-001", discipline, "Electrical circuit/system readable", "info", "not_applicable", elem, category, None, "category-specific not applicable or unavailable"))
+        results.append(_qa_presence_rule(elem, category, discipline, "ELEC-002", "Panel readable", ["Panel", "Panel Name", "RBS_ELEC_PANEL_NAME"], missing_is_fail=circuit_applicable))
+        results.append(_qa_presence_rule(elem, category, discipline, "ELEC-003", "Circuit Number readable", ["Circuit Number", "Electrical Circuit", "RBS_ELEC_CIRCUIT_NUMBER"], missing_is_fail=circuit_applicable))
+        results.append(_qa_presence_rule(elem, category, discipline, "ELEC-004", "Level/reference level readable", ["Level", "Reference Level", "Schedule Level", "Base Level"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "ELEC-005", "Mark present", ["Mark"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "ELEC-006", "Comments present", ["Comments"], missing_is_fail=True))
+        results.append(_qa_presence_rule(elem, category, discipline, "ELEC-007", "Family and Type readable", ["Family and Type", "Type Name"], missing_is_fail=True))
+        if _is_category_named(category, ["Conduit", "Cable Tray"]):
+            results.append(_qa_presence_rule(elem, category, discipline, "ELEC-008", "Conduit/cable tray size readable", ["Size", "Diameter", "Trade Size"], missing_is_fail=False))
+        else:
+            results.append(_qa_result("ELEC-008", discipline, "Conduit/cable tray size readable", "info", "not_applicable", elem, category, None, "category-specific not applicable"))
+    return results
+
+
+def summarize_rule_results(results):
+    summary = {
+        "pass": 0,
+        "fail": 0,
+        "unavailable": 0,
+        "not_applicable": 0,
+        "error": 0,
+        "failed_element_ids": set(),
+    }
+    for result in results:
+        state = result.get("result") or "error"
+        if state in summary:
+            summary[state] += 1
+        else:
+            summary["error"] += 1
+        if state == "fail":
+            summary["failed_element_ids"].add(result.get("element_id"))
+    return summary
+
+
+def _dedupe_rule_results_for_summary(results):
+    discipline_identity_rule_ids = set(["PIP-004", "PIP-005", "HVAC-005", "HVAC-006", "ELEC-005", "ELEC-006"])
+    element_ids_with_discipline_identity = set()
+    for result in results:
+        if result.get("rule_id") in discipline_identity_rule_ids:
+            element_ids_with_discipline_identity.add(result.get("element_id"))
+    filtered = []
+    for result in results:
+        if result.get("rule_id") in ("COMMON-001", "COMMON-002") and result.get("element_id") in element_ids_with_discipline_identity:
+            continue
+        filtered.append(result)
+    return filtered
+
+
+def _unique_elements_from_rule_results(items):
+    unique = []
+    seen = set()
+    for item in items:
+        elem = item.get("element")
+        elem_id = item.get("element_id")
+        if elem is None or elem_id in seen:
+            continue
+        unique.append(elem)
+        seen.add(elem_id)
+    return unique
+
+
+def _collect_discipline_qa_elements(doc, uidoc, scope, discipline_filter=None):
+    if scope == "selection":
+        return _collect_selected_system_assignment_elements(doc, uidoc, discipline_filter=discipline_filter)
+    return _collect_active_view_system_assignment_elements(doc, uidoc, discipline_filter=discipline_filter)
+
+
+def _format_discipline_qa_report(doc, uidoc, scope, discipline_filter=None):
+    collected = _collect_discipline_qa_elements(doc, uidoc, scope, discipline_filter)
+    elements = collected.get("elements", [])
+    inspected = elements[:ACTIVE_VIEW_MEP_DETAIL_CAP]
+    meta = collected.get("category_meta", {})
+    active_view = collected.get("active_view") or uidoc.ActiveView
+    try:
+        view_type = safe_str(active_view.ViewType)
+    except:
+        view_type = "unknown"
+    title = "[SELECTED DISCIPLINE QA REPORT]" if scope == "selection" else "[ACTIVE VIEW DISCIPLINE QA REPORT]"
+    lines = [
+        title,
+        "Selection scope: {0} / active document only".format("selected elements" if scope == "selection" else "active view"),
+        "Active document: {0}".format(_document_title(doc)),
+        "Active view: {0} [{1}]".format(_active_view_title(doc, uidoc), view_type),
+        "Discipline filter: {0}".format(discipline_filter or "All"),
+    ]
+    if scope == "selection":
+        lines.append("Total selected supported MEP elements: {0}".format(len(elements)))
+    else:
+        lines.append("Total supported MEP elements in active view: {0}".format(len(elements)))
+    lines.append("Elements inspected for QA details: {0}".format(len(inspected)))
+    if not elements:
+        lines.append("")
+        if scope == "selection":
+            lines.append("No supported MEP elements selected. Select elements or use an active-view discipline QA report.")
+        else:
+            lines.append("No supported MEP elements found in the active view.")
+        lines.append("")
+        lines.append("Safety note:")
+        lines.append("- read-only; no model data modified.")
+        return "\n".join(lines)
+
+    discipline_counts = {"Piping": 0, "HVAC": 0, "Electrical": 0, "Other supported / coordination": 0}
+    results = []
+    for elem in inspected:
+        info = meta.get(_safe_int_id(elem), {})
+        discipline = info.get("discipline") or classify_category_to_discipline(info.get("label") or _category_name(elem))
+        discipline_counts.setdefault(discipline, 0)
+        discipline_counts[discipline] += 1
+        results.extend(_evaluate_discipline_qa_rules_for_element(doc, elem, info))
+    results = _dedupe_rule_results_for_summary(results)
+    summary = summarize_rule_results(results)
+    fail_results = [result for result in results if result.get("result") == "fail"]
+    unavailable_results = [result for result in results if result.get("result") in ("unavailable", "not_applicable")]
+
+    def grouped_by_rule(items):
+        grouped = {}
+        for item in items:
+            key = (item.get("rule_id"), item.get("label"))
+            grouped.setdefault(key, []).append(item)
+        return grouped
+
+    def grouped_by_field(items, field):
+        grouped = {}
+        for item in items:
+            key = item.get(field) or "(unknown)"
+            grouped.setdefault(key, []).append(item)
+        return grouped
+
+    lines.append("")
+    lines.append("By discipline")
+    for discipline in ["Piping", "HVAC", "Electrical", "Other supported / coordination"]:
+        lines.append("- {0}: {1}".format(discipline, discipline_counts.get(discipline, 0)))
+    lines.append("")
+    lines.append("QA result summary")
+    lines.append("- Pass checks: {0}".format(summary.get("pass", 0)))
+    lines.append("- Failed checks: {0}".format(summary.get("fail", 0)))
+    lines.append("- Unavailable/not applicable checks: {0}".format(summary.get("unavailable", 0) + summary.get("not_applicable", 0)))
+    lines.append("- Error checks: {0}".format(summary.get("error", 0)))
+    lines.append("- Elements with one or more failed checks: {0}".format(len(summary.get("failed_element_ids", set()))))
+
+    lines.append("")
+    lines.append("Failed checks by rule")
+    rule_groups = grouped_by_rule(fail_results)
+    if rule_groups:
+        for (rule_id, label), items in sorted(rule_groups.items(), key=lambda item: (-len(item[1]), item[0][0]))[:20]:
+            elems = _unique_elements_from_rule_results(items)
+            lines.append("- {0} {1}: {2} | sample ids: {3}".format(rule_id, label, len(items), _sample_id_text(elems)))
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    lines.append("Failed checks by category")
+    category_groups = grouped_by_field(fail_results, "category")
+    if category_groups:
+        for category, items in sorted(category_groups.items(), key=lambda item: (-len(item[1]), item[0]))[:20]:
+            elems = _unique_elements_from_rule_results(items)
+            lines.append("- {0}: {1} | sample ids: {2}".format(category, len(items), _sample_id_text(elems)))
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    lines.append("Top affected family/type groups")
+    type_groups = {}
+    for item in fail_results:
+        elem = item.get("element")
+        if elem is None:
+            continue
+        type_groups.setdefault(safe_get_type_label(elem, doc), {})[_safe_int_id(elem)] = elem
+    if type_groups:
+        for type_name, elem_map in sorted(type_groups.items(), key=lambda item: (-len(item[1]), item[0]))[:20]:
+            elems = list(elem_map.values())
+            lines.append("- {0}: {1} | sample ids: {2}".format(type_name, len(elems), _sample_id_text(elems)))
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    lines.append("Sample affected levels")
+    level_groups = {}
+    for item in fail_results:
+        elem = item.get("element")
+        if elem is None:
+            continue
+        level_groups.setdefault(safe_get_level_name(elem, doc) or "(level not found)", {})[_safe_int_id(elem)] = elem
+    if level_groups:
+        for level_name, elem_map in sorted(level_groups.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+            elems = list(elem_map.values())
+            lines.append("- {0}: {1} | sample ids: {2}".format(level_name, len(elems), _sample_id_text(elems)))
+    else:
+        lines.append("- none")
+
+    lines.append("")
+    lines.append("Unavailable / not applicable highlights")
+    unavailable_groups = grouped_by_rule(unavailable_results)
+    if unavailable_groups:
+        for (rule_id, label), items in sorted(unavailable_groups.items(), key=lambda item: (-len(item[1]), item[0][0]))[:10]:
+            categories = sorted(set([item.get("category") or "(unknown)" for item in items]))
+            elems = _unique_elements_from_rule_results(items)
+            lines.append("- {0} {1}: {2} | categories: {3} | sample ids: {4}".format(rule_id, label, len(items), ", ".join(categories[:5]), _sample_id_text(elems)))
+    else:
+        lines.append("- none")
+
+    failed_elems = []
+    seen = set()
+    for item in fail_results:
+        elem = item.get("element")
+        elem_id = item.get("element_id")
+        if elem is not None and elem_id not in seen:
+            failed_elems.append(elem)
+            seen.add(elem_id)
+    lines.append("")
+    lines.append("Sample ElementIds with failures: {0}".format(_sample_id_text(failed_elems, limit=ACTIVE_VIEW_MEP_SAMPLE_ID_CAP)))
+    lines.append("")
+    lines.append("Notes / Warnings")
+    notes = []
+    visible_disciplines = [name for name, count in discipline_counts.items() if count]
+    if len(visible_disciplines) > 1:
+        notes.append("Mixed disciplines {0}: {1}".format("selected" if scope == "selection" else "visible", len(visible_disciplines)))
+    notes.append("Counts represent rule evaluations; sample ElementIds are deduplicated.")
+    if scope == "active_view":
+        notes.append("Visible Revit links are not scanned for internal QA.")
+    if len(elements) > ACTIVE_VIEW_MEP_DETAIL_CAP:
+        notes.append("Detailed QA results are based on capped inspection.")
+        notes.append("Result set capped for readability/performance.")
+    notes.append("This is a rule-based read-only diagnostic. It does not modify parameters or systems.")
+    for note in notes:
+        lines.append("- {0}".format(note))
+    lines.append("")
+    lines.append("Safety note:")
+    lines.append("- read-only; no model data modified.")
+    return "\n".join(lines)
+
+
+def selected_discipline_qa_report(doc, uidoc, context=None, discipline_filter=None):
+    return _format_discipline_qa_report(doc, uidoc, "selection", discipline_filter=discipline_filter)
+
+
+def active_view_discipline_qa_report(doc, uidoc, context=None, discipline_filter=None):
+    return _format_discipline_qa_report(doc, uidoc, "active_view", discipline_filter=discipline_filter)
+
+
+def selected_piping_qa_report(doc, uidoc, context=None):
+    return selected_discipline_qa_report(doc, uidoc, context, discipline_filter="Piping")
+
+
+def active_view_piping_qa_report(doc, uidoc, context=None):
+    return active_view_discipline_qa_report(doc, uidoc, context, discipline_filter="Piping")
+
+
+def selected_hvac_qa_report(doc, uidoc, context=None):
+    return selected_discipline_qa_report(doc, uidoc, context, discipline_filter="HVAC")
+
+
+def active_view_hvac_qa_report(doc, uidoc, context=None):
+    return active_view_discipline_qa_report(doc, uidoc, context, discipline_filter="HVAC")
+
+
+def selected_electrical_qa_report(doc, uidoc, context=None):
+    return selected_discipline_qa_report(doc, uidoc, context, discipline_filter="Electrical")
+
+
+def active_view_electrical_qa_report(doc, uidoc, context=None):
+    return active_view_discipline_qa_report(doc, uidoc, context, discipline_filter="Electrical")
+
+
 def report_selected_elements_by_category(doc, uidoc):
     elems = _selected_elements(doc, uidoc)
+    type_grouped = {}
+    level_grouped = {}
     lines = [
-        "Selected elements by category",
+        "[SELECTED ELEMENTS BY CATEGORY]",
         "Selection scope: active document only",
         "Active document: {0}".format(_document_title(doc)),
         "Active view: {0}".format(_active_view_title(doc, uidoc)),
-        "Current selection count: {0}".format(len(elems)),
-        "Total selected elements: {0}".format(len(elems)),
+        "Total selected: {0}".format(len(elems)),
     ]
+    if not elems:
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
+        return "\n".join(lines)
     grouped = {}
     try:
         for elem in elems:
@@ -4294,59 +6546,196 @@ def report_selected_elements_by_category(doc, uidoc):
                 continue
             category_name = _category_name(elem)
             grouped.setdefault(category_name, []).append(elem)
+            type_grouped.setdefault(_family_and_type_text(doc, elem) or "(no type)", []).append(elem)
+            level_grouped.setdefault(_element_level_name(doc, elem) or "(level not found)", []).append(elem)
     except Exception as err:
         lines.append("Unable to group selected elements by category.")
         lines.append("Diagnostic: {0}".format(safe_str(err)))
         return "\n".join(lines)
     if not grouped:
-        lines.append("No selected elements found in the active Revit document.")
-        lines.append("Selections in other open Revit projects are not included.")
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
         return "\n".join(lines)
+    lines.append("")
+    lines.append("Category counts")
     ordered = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
     for index, (category_name, items) in enumerate(ordered[:20]):
-        lines.append(
-            "{0}: {1} | sample ids: {2}".format(
-                category_name,
-                len(items),
-                _sample_id_text(items),
-            )
-        )
+        lines.append("- {0}: {1} | sample ids: {2}".format(category_name, len(items), _sample_id_text(items)))
     if len(ordered) > 20:
         lines.append("...showing first 20 of {0} category groups".format(len(ordered)))
+    lines.append("")
+    lines.append("Top family/type groups")
+    for type_name, items in sorted(type_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:5]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(type_name, len(items), _sample_id_text(items)))
+    lines.append("")
+    lines.append("Sample levels")
+    for level_name, items in sorted(level_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:5]:
+        lines.append("- {0}: {1}".format(level_name, len(items)))
+    lines.append("")
+    lines.append("Sample ElementIds: {0}".format(_sample_id_text(elems, limit=10)))
+    lines.append("Safety note: read-only; no model data modified.")
     return "\n".join(lines)
 
 
 def report_selected_elements_by_type(doc, uidoc):
     elems = _selected_elements(doc, uidoc)
     grouped = {}
+    category_grouped = {}
+    level_grouped = {}
     for elem in elems:
         if not elem:
             continue
         type_name = _family_and_type_text(doc, elem) or "(no type)"
         grouped.setdefault(type_name, []).append(elem)
+        category_grouped.setdefault(_category_name(elem), []).append(elem)
+        level_grouped.setdefault(_element_level_name(doc, elem) or "(level not found)", []).append(elem)
     lines = [
-        "Selected elements by type",
+        "[SELECTED ELEMENTS BY TYPE]",
         "Selection scope: active document only",
         "Active document: {0}".format(_document_title(doc)),
         "Active view: {0}".format(_active_view_title(doc, uidoc)),
-        "Current selection count: {0}".format(len(elems)),
-        "Total selected elements: {0}".format(len(elems)),
+        "Total selected: {0}".format(len(elems)),
     ]
-    if not grouped:
-        lines.append("No selected elements found in the active Revit document.")
-        lines.append("Selections in other open Revit projects are not included.")
+    if not elems:
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
         return "\n".join(lines)
+    if not grouped:
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("Type / family-type counts")
     ordered = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
     for type_name, items in ordered[:20]:
-        lines.append(
-            "{0}: {1} | sample ids: {2}".format(
-                type_name,
-                len(items),
-                _sample_id_text(items),
-            )
-        )
+        lines.append("- {0}: {1} | sample ids: {2}".format(type_name, len(items), _sample_id_text(items)))
     if len(ordered) > 20:
         lines.append("...showing first 20 of {0} type groups".format(len(ordered)))
+    lines.append("")
+    lines.append("By category")
+    for category_name, items in sorted(category_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(category_name, len(items), _sample_id_text(items)))
+    lines.append("")
+    lines.append("Sample levels")
+    for level_name, items in sorted(level_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:5]:
+        lines.append("- {0}: {1}".format(level_name, len(items)))
+    lines.append("")
+    lines.append("Sample ElementIds: {0}".format(_sample_id_text(elems, limit=10)))
+    lines.append("Safety note: read-only; no model data modified.")
+    return "\n".join(lines)
+
+
+def count_selected_elements(doc, uidoc):
+    elems = _selected_elements(doc, uidoc)
+    grouped = {}
+    type_grouped = {}
+    level_grouped = {}
+    for elem in elems:
+        if not elem:
+            continue
+        grouped.setdefault(_category_name(elem), []).append(elem)
+        type_grouped.setdefault(_family_and_type_text(doc, elem) or "(no type)", []).append(elem)
+        level_name = _element_level_name(doc, elem) or "(level not found)"
+        level_grouped.setdefault(level_name, []).append(elem)
+    lines = [
+        "[COUNT SELECTED ELEMENTS]",
+        "Selection scope: active document only",
+        "Active document: {0}".format(_document_title(doc)),
+        "Active view: {0}".format(_active_view_title(doc, uidoc)),
+        "Total selected: {0}".format(len(elems)),
+    ]
+    if not elems:
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("By category")
+    for category_name, items in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:20]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(category_name, len(items), _sample_id_text(items)))
+    lines.append("")
+    lines.append("Top family/type groups")
+    for type_name, items in sorted(type_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(type_name, len(items), _sample_id_text(items)))
+    lines.append("")
+    lines.append("Sample levels")
+    for level_name, items in sorted(level_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+        lines.append("- {0}: {1}".format(level_name, len(items)))
+    lines.append("")
+    lines.append("Sample ElementIds: {0}".format(_sample_id_text(elems, limit=10)))
+    lines.append("Safety note: read-only; no model data modified.")
+    return "\n".join(lines)
+
+
+def health_check_selected_elements(doc, uidoc):
+    elems = _selected_elements(doc, uidoc)
+    grouped = {}
+    type_grouped = {}
+    level_grouped = {}
+    missing_level = []
+    linked_or_import = []
+    for elem in elems:
+        if not elem:
+            continue
+        category_name = _category_name(elem)
+        grouped.setdefault(category_name, []).append(elem)
+        type_grouped.setdefault(_family_and_type_text(doc, elem) or "(no type)", []).append(elem)
+        level_name = _element_level_name(doc, elem)
+        if level_name:
+            level_grouped.setdefault(level_name, []).append(elem)
+        else:
+            missing_level.append(elem)
+        try:
+            if isinstance(elem, DB.ImportInstance):
+                linked_or_import.append(elem)
+        except:
+            pass
+        if category_name in ("Revit Links", "Imports in Families") or "Import" in category_name or "Link" in category_name:
+            linked_or_import.append(elem)
+
+    lines = [
+        "[SELECTION HEALTH CHECK]",
+        "Selection scope: active document only",
+        "Active document: {0}".format(_document_title(doc)),
+        "Active view: {0}".format(_active_view_title(doc, uidoc)),
+        "Total selected: {0}".format(len(elems)),
+    ]
+    if not elems:
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Category distribution")
+    for category_name, items in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:20]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(category_name, len(items), _sample_id_text(items)))
+    lines.append("")
+    lines.append("Type distribution")
+    for type_name, items in sorted(type_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+        lines.append("- {0}: {1} | sample ids: {2}".format(type_name, len(items), _sample_id_text(items)))
+    lines.append("")
+    lines.append("Level distribution")
+    if level_grouped:
+        for level_name, items in sorted(level_grouped.items(), key=lambda item: (-len(item[1]), item[0]))[:10]:
+            lines.append("- {0}: {1}".format(level_name, len(items)))
+    else:
+        lines.append("- No level data found on sampled selected elements.")
+    lines.append("")
+    lines.append("Warnings")
+    warning_count = 0
+    if len(grouped) > 1:
+        warning_count += 1
+        lines.append("- Mixed categories selected: {0}".format(len(grouped)))
+    if missing_level:
+        warning_count += 1
+        lines.append("- Missing level/reference-level data on {0} selected element(s); sample ids: {1}".format(len(missing_level), _sample_id_text(missing_level)))
+    if linked_or_import:
+        warning_count += 1
+        lines.append("- Linked/import-style elements encountered: {0}; sample ids: {1}".format(len(linked_or_import), _sample_id_text(linked_or_import)))
+    if not warning_count:
+        lines.append("- No selection health warnings detected by this read-only check.")
+    lines.append("")
+    lines.append("Sample ElementIds: {0}".format(_sample_id_text(elems, limit=10)))
+    lines.append("Safety note: read-only; no model data modified.")
     return "\n".join(lines)
 
 
@@ -4407,16 +6796,15 @@ def health_check_for_active_view_selection(doc, uidoc):
 def report_missing_parameters_from_selection(doc, uidoc):
     elems = _selected_elements(doc, uidoc)
     lines = [
-        "Missing key parameters from selection",
+        "[MISSING PARAMETERS FROM SELECTION]",
         "Selection scope: active document only",
         "Active document: {0}".format(_document_title(doc)),
         "Active view: {0}".format(_active_view_title(doc, uidoc)),
-        "Current selection count: {0}".format(len(elems)),
-        "Total selected elements: {0}".format(len(elems)),
+        "Total selected: {0}".format(len(elems)),
     ]
     if not elems:
-        lines.append("No selected elements found in the active Revit document.")
-        lines.append("Selections in other open Revit projects are not included.")
+        lines.append("No elements selected. Select elements or use an active-view report.")
+        lines.append("Safety note: read-only; no model data modified.")
         return "\n".join(lines)
 
     checks = [
@@ -4433,41 +6821,567 @@ def report_missing_parameters_from_selection(doc, uidoc):
         ),
     ]
 
+    lines.append("Parameters checked: {0}".format(", ".join([label for label, _ in checks])))
+    lines.append("")
+
     findings = []
     for label, resolver in checks:
         applicable = []
         missing = []
+        unavailable = []
         for elem in elems:
             try:
                 value = resolver(elem)
-            except:
+            except Exception:
                 value = "__not_applicable__"
             if value == "__not_applicable__":
+                unavailable.append(elem)
                 continue
             applicable.append(elem)
             if not value:
                 missing.append(elem)
-        if not applicable:
-            continue
-        findings.append((label, applicable, missing))
+        findings.append((label, applicable, missing, unavailable))
 
     if not findings:
         lines.append("No reviewed parameter checks were applicable to the current selection.")
+        lines.append("Safety note: read-only; no model data modified.")
         return "\n".join(lines)
 
     missing_any = False
-    for label, applicable, missing in findings:
+    for label, applicable, missing, unavailable in findings:
         lines.append(
-            "{0}: missing on {1} of {2} applicable element(s)".format(
-                label, len(missing), len(applicable)
+            "{0}: missing/empty {1} | applicable {2} | unavailable/not applicable {3}".format(
+                label, len(missing), len(applicable), len(unavailable)
             )
         )
         if missing:
             missing_any = True
-            lines.append("  sample ids: {0}".format(_sample_id_text(missing)))
+            lines.append("  sample affected ElementIds: {0}".format(_sample_id_text(missing)))
     if not missing_any:
         lines.append("Nothing is missing from the reviewed baseline parameter set for the current selection.")
+    lines.append("Safety note: read-only; no model data modified.")
     return "\n".join(lines)
+
+
+def _split_pipe_dry_run_bucket():
+    return {"count": 0, "ids": [], "categories": {}}
+
+
+def _split_pipe_dry_run_add_bucket(groups, key, elem, limit=PIPE_SPLIT_DRY_RUN_SAMPLE_LIMIT):
+    bucket = groups.setdefault(key, _split_pipe_dry_run_bucket())
+    bucket["count"] += 1
+    elem_id = _safe_int_id(elem)
+    if elem_id is not None and elem_id not in bucket["ids"] and len(bucket["ids"]) < limit:
+        bucket["ids"].append(elem_id)
+    category = _category_name(elem)
+    if category:
+        bucket["categories"][category] = bucket["categories"].get(category, 0) + 1
+
+
+def _split_pipe_dry_run_bucket_line(label, bucket):
+    bucket = bucket or _split_pipe_dry_run_bucket()
+    parts = ["- {0}: {1}".format(label, bucket.get("count", 0))]
+    ids = bucket.get("ids") or []
+    if ids:
+        parts.append("sample ids: {0}".format(", ".join([safe_str(item) for item in ids[:PIPE_SPLIT_DRY_RUN_SAMPLE_LIMIT]])))
+    categories = bucket.get("categories") or {}
+    if categories:
+        category_text = ", ".join(["{0}={1}".format(key, value) for key, value in sorted(categories.items())[:5]])
+        parts.append("sample categories: {0}".format(category_text))
+    return " | ".join(parts)
+
+
+def _split_pipe_dry_run_is_pipe(elem):
+    try:
+        return elem.Category.Id.IntegerValue == int(DB.BuiltInCategory.OST_PipeCurves)
+    except:
+        return _category_name(elem) == "Pipes"
+
+
+def _split_pipe_dry_run_is_line_curve(curve):
+    try:
+        if isinstance(curve, DB.Line):
+            return True
+    except:
+        pass
+    try:
+        return curve.GetType().Name == "Line"
+    except:
+        return False
+
+
+def _split_pipe_dry_run_endpoints(curve):
+    try:
+        return curve.GetEndPoint(0), curve.GetEndPoint(1)
+    except:
+        return None, None
+
+
+def _split_pipe_dry_run_length_from_endpoints(p0, p1):
+    try:
+        dx = float(p1.X - p0.X)
+        dy = float(p1.Y - p0.Y)
+        dz = float(p1.Z - p0.Z)
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+    except:
+        return None
+
+
+def _split_pipe_dry_run_is_near_vertical(p0, p1):
+    length = _split_pipe_dry_run_length_from_endpoints(p0, p1)
+    if not length:
+        return False
+    try:
+        return abs(float(p1.Z - p0.Z) / length) > PIPE_SPLIT_DRY_RUN_VERTICAL_Z_RATIO
+    except:
+        return False
+
+
+def _split_pipe_dry_run_midpoint(p0, p1):
+    try:
+        return DB.XYZ((p0.X + p1.X) / 2.0, (p0.Y + p1.Y) / 2.0, (p0.Z + p1.Z) / 2.0)
+    except:
+        return None
+
+
+def _split_pipe_dry_run_length_text(length_ft):
+    if length_ft is None:
+        return "(unreadable)"
+    try:
+        return "{0:.3f} ft ({1:.0f} mm)".format(float(length_ft), internal_feet_to_mm(length_ft))
+    except:
+        return "{0:.3f} ft".format(float(length_ft))
+
+
+def _split_pipe_dry_run_xyz_text(point):
+    if point is None:
+        return "(unreadable)"
+    try:
+        ft_text = "internal ft: ({0:.6f}, {1:.6f}, {2:.6f})".format(point.X, point.Y, point.Z)
+    except:
+        return "(unreadable)"
+    try:
+        mm_text = "approx mm: ({0:.0f}, {1:.0f}, {2:.0f})".format(
+            internal_feet_to_mm(point.X),
+            internal_feet_to_mm(point.Y),
+            internal_feet_to_mm(point.Z),
+        )
+        return "{0}; {1}".format(ft_text, mm_text)
+    except:
+        return ft_text
+
+
+def _split_pipe_dry_run_safe_curve(elem):
+    try:
+        location = elem.Location
+    except:
+        return None, "unreadable_location_curve"
+    try:
+        if not isinstance(location, DB.LocationCurve):
+            return None, "unreadable_location_curve"
+    except:
+        if not hasattr(location, "Curve"):
+            return None, "unreadable_location_curve"
+    try:
+        curve = location.Curve
+    except:
+        return None, "unreadable_location_curve"
+    if curve is None:
+        return None, "unreadable_location_curve"
+    try:
+        if hasattr(curve, "IsBound") and not curve.IsBound:
+            return curve, "unbounded_curve"
+    except:
+        pass
+    p0, p1 = _split_pipe_dry_run_endpoints(curve)
+    if p0 is None or p1 is None:
+        return curve, "unreadable_endpoints"
+    if not _split_pipe_dry_run_is_line_curve(curve):
+        return curve, "unsupported_curve_type"
+    return curve, "ok"
+
+
+def _split_pipe_dry_run_candidate(doc, elem, curve):
+    p0, p1 = _split_pipe_dry_run_endpoints(curve)
+    try:
+        length = float(curve.Length)
+    except:
+        length = _split_pipe_dry_run_length_from_endpoints(p0, p1)
+    return {
+        "element": elem,
+        "id": _safe_int_id(elem),
+        "type": _family_and_type_text(doc, elem) or "(unreadable)",
+        "level": _element_level_name(doc, elem) or "(unreadable)",
+        "system": _system_assignment_value(elem) or "(unreadable)",
+        "diameter_size": _safe_param_text(elem, ["Diameter", "Size", "Nominal Diameter", "Outside Diameter"]) or "(unreadable)",
+        "slope": _safe_param_text(elem, ["Slope"]) or "(unreadable)",
+        "length": length,
+        "point": _split_pipe_dry_run_midpoint(p0, p1),
+        "segment_a": length / 2.0 if length is not None else None,
+        "segment_b": length / 2.0 if length is not None else None,
+    }
+
+
+def _split_pipe_dry_run_prompt_has_interval_request(prompt_text):
+    normalized = safe_str(prompt_text).lower()
+    if " every " in normalized or " interval" in normalized:
+        return True
+    return bool(re.search(r"\b\d+(?:\.\d+)?\s*(mm|m|meter|meters)\b", normalized))
+
+
+def split_selected_pipes_dry_run(doc, uidoc, context=None):
+    prompt_text = _prompt_text_from_context(context)
+    selected = _selected_elements(doc, uidoc)
+    total_selected = len(selected)
+    inspected_elements = selected[:PIPE_SPLIT_DRY_RUN_MAX_SELECTION]
+    capped = len(selected) > PIPE_SPLIT_DRY_RUN_MAX_SELECTION
+    skipped = {}
+    warnings = {}
+    candidates = []
+    total_original_length = 0.0
+
+    for elem in inspected_elements:
+        try:
+            category = _category_name(elem)
+            if not _split_pipe_dry_run_is_pipe(elem):
+                if category == "Pipe Fittings":
+                    _split_pipe_dry_run_add_bucket(skipped, "pipe_fittings", elem)
+                elif category == "Pipe Accessories":
+                    _split_pipe_dry_run_add_bucket(skipped, "pipe_accessories", elem)
+                else:
+                    _split_pipe_dry_run_add_bucket(skipped, "non_pipe_categories", elem)
+                continue
+            try:
+                if bool(elem.Pinned):
+                    _split_pipe_dry_run_add_bucket(skipped, "pinned_pipes", elem)
+                    continue
+            except:
+                pass
+            try:
+                group_id = getattr(elem, "GroupId", None)
+                if group_id is not None and group_id != DB.ElementId.InvalidElementId:
+                    _split_pipe_dry_run_add_bucket(skipped, "grouped_pipes", elem)
+                    continue
+            except:
+                pass
+            try:
+                design_option = getattr(elem, "DesignOption", None)
+                if design_option is not None:
+                    _split_pipe_dry_run_add_bucket(skipped, "design_option_pipes", elem)
+                    continue
+            except:
+                pass
+            curve, status = _split_pipe_dry_run_safe_curve(elem)
+            if status != "ok":
+                _split_pipe_dry_run_add_bucket(skipped, status, elem)
+                continue
+            p0, p1 = _split_pipe_dry_run_endpoints(curve)
+            if _split_pipe_dry_run_is_near_vertical(p0, p1):
+                _split_pipe_dry_run_add_bucket(skipped, "near_vertical_pipes", elem)
+                continue
+            try:
+                length = float(curve.Length)
+            except:
+                length = _split_pipe_dry_run_length_from_endpoints(p0, p1)
+            if length is None:
+                _split_pipe_dry_run_add_bucket(skipped, "unreadable_location_curve", elem)
+                continue
+            if length < PIPE_SPLIT_DRY_RUN_MIN_TOTAL_LENGTH_FT or (length / 2.0) < PIPE_SPLIT_DRY_RUN_MIN_SEGMENT_LENGTH_FT:
+                _split_pipe_dry_run_add_bucket(skipped, "too_short_pipes", elem)
+                continue
+            candidate = _split_pipe_dry_run_candidate(doc, elem, curve)
+            candidates.append(candidate)
+            total_original_length += length
+            if candidate.get("level") == "(unreadable)":
+                _split_pipe_dry_run_add_bucket(warnings, "missing_unreadable_level", elem)
+            if candidate.get("system") == "(unreadable)":
+                _split_pipe_dry_run_add_bucket(warnings, "missing_unreadable_system", elem)
+            if candidate.get("diameter_size") == "(unreadable)":
+                _split_pipe_dry_run_add_bucket(warnings, "missing_unreadable_diameter_size", elem)
+            if candidate.get("slope") == "(unreadable)":
+                _split_pipe_dry_run_add_bucket(warnings, "missing_unreadable_slope", elem)
+        except:
+            _split_pipe_dry_run_add_bucket(skipped, "calculation_errors", elem)
+
+    skipped_count = sum([bucket.get("count", 0) for bucket in skipped.values()])
+    warning_count = sum([bucket.get("count", 0) for bucket in warnings.values()])
+    try:
+        active_view_type = safe_str(uidoc.ActiveView.ViewType)
+    except:
+        active_view_type = "(unknown type)"
+
+    lines = [
+        "[SPLIT SELECTED PIPES DRY RUN]",
+        "",
+        "Scope:",
+        "selected elements / active document only",
+        "",
+        "Active document:",
+        _document_title(doc),
+        "",
+        "Active view:",
+        "{0} [{1}]".format(_active_view_title(doc, uidoc), active_view_type),
+        "",
+    ]
+    if total_selected == 0:
+        lines.extend(
+            [
+                "Total selected elements: 0",
+                "",
+                "Dry-run result:",
+                "Not ready",
+                "",
+                "No elements selected. Select pipes before running split dry-run.",
+                "",
+                "Safety:",
+                "- Dry-run only.",
+                "- Read-only.",
+                "- No transaction opened.",
+                "- No pipe was split.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "Candidate strategy:",
+            "Midpoint candidate only. One proposed split point per eligible straight pipe.",
+            "",
+            "Selection summary:",
+            "- Total selected elements: {0}".format(total_selected),
+            "- Elements inspected: {0}".format(len(inspected_elements)),
+            "- Eligible pipes: {0}".format(len(candidates)),
+            "- Candidate split points: {0}".format(len(candidates)),
+            "- Skipped elements: {0}".format(skipped_count),
+            "- Warnings: {0}".format(warning_count),
+            "",
+            "Candidate split summary:",
+            "- Total original pipe length: {0}".format(_split_pipe_dry_run_length_text(total_original_length if candidates else 0.0)),
+            "- Estimated segment count if later applied: {0}".format(len(candidates) * 2),
+            "- Minimum segment length rule: total >= {0}; each estimated segment >= {1}".format(
+                _split_pipe_dry_run_length_text(PIPE_SPLIT_DRY_RUN_MIN_TOTAL_LENGTH_FT),
+                _split_pipe_dry_run_length_text(PIPE_SPLIT_DRY_RUN_MIN_SEGMENT_LENGTH_FT),
+            ),
+            "- Candidate points generated: {0}".format(len(candidates)),
+            "",
+            "Candidate pipes:",
+        ]
+    )
+    if not candidates:
+        lines.append("- none")
+    else:
+        for index, candidate in enumerate(candidates[:PIPE_SPLIT_DRY_RUN_DETAIL_LIMIT]):
+            lines.extend(
+                [
+                    "{0}. Pipe {1}".format(index + 1, candidate.get("id")),
+                    "   - Type: {0}".format(candidate.get("type")),
+                    "   - Level: {0}".format(candidate.get("level")),
+                    "   - System: {0}".format(candidate.get("system")),
+                    "   - Diameter/Size: {0}".format(candidate.get("diameter_size")),
+                    "   - Slope: {0}".format(candidate.get("slope")),
+                    "   - Original length: {0}".format(_split_pipe_dry_run_length_text(candidate.get("length"))),
+                    "   - Candidate split point: {0}".format(_split_pipe_dry_run_xyz_text(candidate.get("point"))),
+                    "   - Estimated segment A: {0}".format(_split_pipe_dry_run_length_text(candidate.get("segment_a"))),
+                    "   - Estimated segment B: {0}".format(_split_pipe_dry_run_length_text(candidate.get("segment_b"))),
+                    "   - Status: dry-run only / not applied",
+                ]
+            )
+        if len(candidates) > PIPE_SPLIT_DRY_RUN_DETAIL_LIMIT:
+            lines.append("...showing first {0} of {1} eligible pipes".format(PIPE_SPLIT_DRY_RUN_DETAIL_LIMIT, len(candidates)))
+
+    lines.extend(
+        [
+            "",
+            "Skipped elements:",
+            _split_pipe_dry_run_bucket_line("Pipe fittings", skipped.get("pipe_fittings")),
+            _split_pipe_dry_run_bucket_line("Pipe accessories", skipped.get("pipe_accessories")),
+            _split_pipe_dry_run_bucket_line("Non-pipe categories", skipped.get("non_pipe_categories")),
+            _split_pipe_dry_run_bucket_line("Pinned pipes", skipped.get("pinned_pipes")),
+            _split_pipe_dry_run_bucket_line("Grouped pipes", skipped.get("grouped_pipes")),
+            _split_pipe_dry_run_bucket_line("Design-option pipes", skipped.get("design_option_pipes")),
+            _split_pipe_dry_run_bucket_line("Near-vertical pipes", skipped.get("near_vertical_pipes")),
+            _split_pipe_dry_run_bucket_line("Too-short pipes", skipped.get("too_short_pipes")),
+            _split_pipe_dry_run_bucket_line("Unreadable location curve", skipped.get("unreadable_location_curve")),
+            _split_pipe_dry_run_bucket_line("Unbounded curve", skipped.get("unbounded_curve")),
+            _split_pipe_dry_run_bucket_line("Unsupported curve type", skipped.get("unsupported_curve_type")),
+            _split_pipe_dry_run_bucket_line("Calculation errors", skipped.get("calculation_errors")),
+            "",
+            "Preflight warnings:",
+            _split_pipe_dry_run_bucket_line("Missing/unreadable level", warnings.get("missing_unreadable_level")),
+            _split_pipe_dry_run_bucket_line("Missing/unreadable system", warnings.get("missing_unreadable_system")),
+            _split_pipe_dry_run_bucket_line("Missing/unreadable diameter/size", warnings.get("missing_unreadable_diameter_size")),
+            _split_pipe_dry_run_bucket_line("Missing/unreadable slope", warnings.get("missing_unreadable_slope")),
+            "",
+            "Risks:",
+            "- Future pipe splitting can affect connected fittings, slopes, systems, tags, dimensions, schedules, and downstream coordination.",
+            "- MEP-WR-001 does not inspect connectors or connected networks.",
+            "- MEP-WR-001 does not apply changes.",
+            "- Future reviewed apply must use explicit confirmation and rollback.",
+            "",
+            "Dry-run result:",
+            "Ready for reviewed apply design" if candidates else "Not ready",
+        ]
+    )
+    if not candidates:
+        lines.extend(["", "Reason:", "No selected pipes passed the dry-run eligibility checks."])
+    if _split_pipe_dry_run_prompt_has_interval_request(prompt_text):
+        lines.extend(["", "Note:", "Interval-based splitting is not implemented in MEP-WR-001. Current dry-run uses midpoint candidate only."])
+    if capped:
+        lines.extend(["", "Note:", "Result set capped for readability/performance."])
+    lines.extend(
+        [
+            "",
+            "Next step:",
+            "Future feature MEP-WR-002 should implement reviewed apply with explicit confirmation, transaction rollback, before/after evidence, and conservative skip handling.",
+            "",
+            "Safety:",
+            "- Dry-run only.",
+            "- Read-only.",
+            "- No transaction opened.",
+            "- No pipe was split.",
+            "- Revit model data was not modified.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def split_selected_pipes_rollback_test(doc, uidoc, context=None):
+    try:
+        active_view_type = safe_str(uidoc.ActiveView.ViewType)
+    except:
+        active_view_type = "(unknown type)"
+    return "\n".join(
+        [
+            "[SPLIT SELECTED PIPES ROLLBACK TEST]",
+            "",
+            "Rollback Test ID:",
+            "MEP-WR-002-{0}".format(time.strftime("%Y%m%d_%H%M%S")),
+            "",
+            "Scope:",
+            "latest split dry-run candidates / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(_active_view_title(doc, uidoc), active_view_type),
+            "",
+            "Source dry-run:",
+            "- Source status: unavailable",
+            "",
+            "Execution status:",
+            "- Rollback test requested: true",
+            "- Confirmation token present: {0}".format("true" if _has_rollback_test_token(_prompt_text_from_context(context)) else "false"),
+            "- Execution available: false",
+            "- Transaction opened: false",
+            "- BreakCurve called: false",
+            "- Transaction group rolled back: false",
+            "- Persistent model changes: false",
+            "",
+            "Rollback-test result:",
+            "Not ready",
+            "",
+            "Reason:",
+            "No valid split selected pipes dry-run is available in this stateless command path.",
+            "",
+            "Required previous step:",
+            "dry run split selected pipes",
+            "",
+            "Safety:",
+            "- Rollback-test guard only.",
+            "- No transaction opened.",
+            "- BreakCurve was not called.",
+            "- Revit model data was not modified.",
+        ]
+    )
+
+
+def split_selected_pipe_reviewed_apply(doc, uidoc, context=None):
+    try:
+        active_view_type = safe_str(uidoc.ActiveView.ViewType)
+    except:
+        active_view_type = "(unknown type)"
+    return "\n".join(
+        [
+            "[SPLIT SELECTED PIPE REVIEWED APPLY]",
+            "",
+            "Reviewed Apply ID:",
+            "MEP-WR-003-{0}".format(time.strftime("%Y%m%d_%H%M%S")),
+            "",
+            "Request:",
+            "persistent apply requested",
+            "",
+            "Scope:",
+            "single split candidate / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(_active_view_title(doc, uidoc), active_view_type),
+            "",
+            "Reviewed apply result:",
+            "Not ready",
+            "",
+            "Reason:",
+            "No valid split dry-run and rollback-test state is available in this stateless command path.",
+            "",
+            "Required previous steps:",
+            "1. dry run split selected pipes",
+            "2. run split rollback test ROLLBACK-TEST-OK",
+            "",
+            "Safety:",
+            "- No transaction opened.",
+            "- No pipe was split.",
+            "- Revit model data was not modified.",
+        ]
+    )
+
+
+def split_apply_verification_report(doc, uidoc, context=None):
+    try:
+        active_view_type = safe_str(uidoc.ActiveView.ViewType)
+    except:
+        active_view_type = "(unknown type)"
+    return "\n".join(
+        [
+            "[SPLIT APPLY VERIFICATION REPORT]",
+            "",
+            "Verification ID:",
+            "MEP-WR-004-{0}".format(time.strftime("%Y%m%d_%H%M%S")),
+            "",
+            "Scope:",
+            "latest reviewed split apply result / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(_active_view_title(doc, uidoc), active_view_type),
+            "",
+            "Source reviewed apply:",
+            "- Source status: unavailable",
+            "",
+            "Execution status:",
+            "- Verification requested: true",
+            "- Transaction opened: false",
+            "- BreakCurve called: false",
+            "- Model modified: false",
+            "",
+            "Verification result:",
+            "Not ready",
+            "",
+            "Reason:",
+            "No latest MEP-WR-003 reviewed apply state is available in this stateless command path.",
+            "",
+            "Safety:",
+            "- Read-only verification only.",
+            "- No transaction opened.",
+            "- No pipe was split.",
+            "- Revit model data was not modified.",
+        ]
+    )
 
 
 def split_selected_pipes(doc, uidoc, context=None):
@@ -7775,10 +10689,40 @@ REVIEWED_ACTION_HANDLERS = {
     "report_devices_without_circuit_info": report_devices_without_circuit_info,
     "report_electrical_qa_elements_without_assignment": report_electrical_qa_elements_without_assignment,
     "list_fixtures_by_type_in_active_view": list_fixtures_by_type_in_active_view,
+    "active_view_mep_summary": active_view_mep_summary,
+    "count_mep_elements_in_active_view": count_mep_elements_in_active_view,
+    "report_active_view_elements_by_category": report_active_view_elements_by_category,
+    "report_active_view_elements_by_type": report_active_view_elements_by_type,
+    "active_view_qa_report": active_view_qa_report,
+    "report_missing_parameters_in_active_view": report_missing_parameters_in_active_view,
+    "active_view_piping_report": active_view_piping_report,
+    "active_view_hvac_report": active_view_hvac_report,
+    "active_view_electrical_report": active_view_electrical_report,
+    "selected_mep_system_assignment_report": selected_mep_system_assignment_report,
+    "active_view_mep_system_assignment_report": active_view_mep_system_assignment_report,
+    "selected_pipe_system_report": selected_pipe_system_report,
+    "active_view_pipe_system_report": active_view_pipe_system_report,
+    "selected_duct_system_report": selected_duct_system_report,
+    "active_view_duct_system_report": active_view_duct_system_report,
+    "selected_electrical_system_report": selected_electrical_system_report,
+    "active_view_electrical_system_report": active_view_electrical_system_report,
+    "selected_discipline_qa_report": selected_discipline_qa_report,
+    "active_view_discipline_qa_report": active_view_discipline_qa_report,
+    "selected_piping_qa_report": selected_piping_qa_report,
+    "active_view_piping_qa_report": active_view_piping_qa_report,
+    "selected_hvac_qa_report": selected_hvac_qa_report,
+    "active_view_hvac_qa_report": active_view_hvac_qa_report,
+    "selected_electrical_qa_report": selected_electrical_qa_report,
+    "active_view_electrical_qa_report": active_view_electrical_qa_report,
     "report_selected_elements_by_category": report_selected_elements_by_category,
     "report_selected_elements_by_type": report_selected_elements_by_type,
+    "count_selected_elements": count_selected_elements,
     "health_check_for_active_view_selection": health_check_for_active_view_selection,
     "report_missing_parameters_from_selection": report_missing_parameters_from_selection,
+    "split_selected_pipes_dry_run": split_selected_pipes_dry_run,
+    "split_selected_pipes_rollback_test": split_selected_pipes_rollback_test,
+    "split_selected_pipe_reviewed_apply": split_selected_pipe_reviewed_apply,
+    "split_apply_verification_report": split_apply_verification_report,
     "create_3d_view_from_selection": create_3d_view_from_selection,
     "split_selected_pipes": split_selected_pipes,
     "report_duplicates": report_duplicates,
@@ -7815,9 +10759,214 @@ REVIEWED_ACTION_HANDLERS = {
     "scan_current_project_context": scan_current_project_context,
     "summarize_current_project_context": summarize_current_project_context,
     "check_linked_model_coordinate_health": check_linked_model_coordinate_health,
+    "check_bim_basis_level_grid_health": check_bim_basis_level_grid_health,
+    "project_onboarding_checklist_action": project_onboarding_checklist_action,
     "ask_agent_for_project_plan_action": ask_agent_for_project_plan_action,
+    "guided_project_startup_plan_action": guided_project_startup_plan_action,
     "create_codex_task_brief_action": create_codex_task_brief_action,
 }
+
+
+def _normalize_deterministic_route_text(prompt):
+    text = safe_str(prompt).lower().strip()
+    text = re.sub(r"[\u2010-\u2015]+", "-", text)
+    text = re.sub(r"\s*/\s*", " and ", text)
+    text = re.sub(r"[-_]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _is_split_selected_pipes_dry_run_prompt(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    routes = [
+        "split selected pipes dry run",
+        "dry run split selected pipes",
+        "preview split selected pipes",
+        "calculate split selected pipes",
+        "calculate pipe split candidates",
+        "split pipe candidates",
+        "selected pipe split dry run",
+        "selected pipes split dry run",
+        "preview selected pipe splits",
+        "proposed split selected pipes",
+        "pipe split dry run",
+    ]
+    if normalized in routes:
+        return True
+    if "split" in normalized and "pipe" in normalized and any(token in normalized for token in ["dry run", "preview", "candidate", "calculate", "proposed"]):
+        return True
+    return False
+
+
+def _is_split_rollback_test_prompt(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    route_text = re.sub(r"\brollback\s+test\s+ok\b", " ", normalized)
+    route_text = re.sub(r"\s+", " ", route_text).strip()
+    routes = [
+        "split selected pipes rollback test",
+        "rollback test split selected pipes",
+        "run split rollback test",
+        "test split selected pipes with rollback",
+        "simulate split selected pipes rollback",
+        "validate split apply rollback",
+        "reviewed split rollback test",
+        "pipe split rollback test",
+        "split pipe write api rollback test",
+        "probe split selected pipes rollback",
+    ]
+    if route_text in routes:
+        return True
+    for route in routes:
+        if route in route_text:
+            return True
+    return "rollback" in route_text and "split" in route_text and "pipe" in route_text
+
+
+def _has_rollback_test_token(prompt):
+    raw_prompt = safe_str(prompt)
+    normalized = _normalize_deterministic_route_text(raw_prompt)
+    return ROLLBACK_TEST_CONFIRMATION_TOKEN in raw_prompt or "rollback test ok" in normalized
+
+
+def _split_reviewed_apply_request_kind(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    route_text = re.sub(r"\bpersistent\s+split\s+ok\b", " ", normalized)
+    route_text = re.sub(r"\s+", " ", route_text).strip()
+    readiness_routes = [
+        "show split apply candidates",
+        "show reviewed split apply candidates",
+        "split apply readiness",
+        "reviewed split apply readiness",
+        "can apply split candidate",
+        "can apply pipe split",
+    ]
+    apply_routes = [
+        "apply split candidate",
+        "apply pipe split candidate",
+        "reviewed apply split candidate",
+        "persist split candidate",
+        "persist pipe split candidate",
+        "execute split candidate",
+        "execute pipe split candidate",
+        "apply selected pipe split candidate",
+        "reviewed pipe split apply",
+    ]
+    if route_text in readiness_routes:
+        return "status"
+    if route_text in apply_routes:
+        return "apply"
+    for route in readiness_routes:
+        if route in route_text:
+            return "status"
+    for route in apply_routes:
+        if route in route_text:
+            return "apply"
+    return None
+
+
+def _has_persistent_split_token(prompt):
+    raw_prompt = safe_str(prompt)
+    normalized = _normalize_deterministic_route_text(raw_prompt)
+    return PERSISTENT_SPLIT_CONFIRMATION_TOKEN in raw_prompt or "persistent split ok" in normalized
+
+
+def _parse_split_apply_candidate_selection(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    route_text = re.sub(r"\bpersistent\s+split\s+ok\b", " ", normalized)
+    route_text = re.sub(r"\s+", " ", route_text).strip()
+    if re.search(r"\b(apply|split|persist|execute)\s+all\b", route_text) or re.search(r"\bcandidates?\s+\d+\s+\d+", route_text) or "all split candidates" in route_text or "selected pipe splits" in route_text:
+        return {"kind": "batch", "value": None}
+    number_matches = re.findall(r"\b(?:candidate|candidates)\s+(\d+)\b", route_text)
+    if len(number_matches) > 1:
+        return {"kind": "batch", "value": None}
+    if number_matches:
+        value = int(number_matches[0])
+        if value > 9999 and ("pipe split candidate" in route_text or "pipe candidate" in route_text):
+            return {"kind": "pipe_id", "value": value}
+        return {"kind": "candidate_number", "value": value}
+    pipe_match = re.search(r"\bpipe(?:\s+id)?\s+(\d+)\b", route_text)
+    if pipe_match:
+        return {"kind": "pipe_id", "value": int(pipe_match.group(1))}
+    return {"kind": "missing", "value": None}
+
+
+def _is_split_apply_verification_prompt(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    routes = [
+        "verify latest split apply",
+        "verify latest pipe split",
+        "verify split apply result",
+        "verify pipe split result",
+        "verify latest reviewed split apply",
+        "verify latest reviewed pipe split",
+        "show latest split apply result",
+        "show latest pipe split result",
+        "check latest split apply",
+        "check pipe split result",
+        "post apply split verification",
+        "post apply split verification",
+        "split apply verification",
+        "pipe split verification",
+        "verify split result pipe",
+        "verify pipe split result",
+    ]
+    if normalized in routes:
+        return True
+    for route in routes:
+        if normalized.startswith(route) or route in normalized:
+            return True
+    return False
+
+
+def _parse_explicit_split_verification_ids(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    match = re.search(r"\bverify\s+split\s+result\s+pipe\s+(\d+)\s+new\s+pipe\s+(\d+)\b", normalized)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"\bverify\s+pipe\s+split\s+result\s+(\d+)\s+(\d+)\b", normalized)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None, None
+
+
+def _reviewed_action_confirmation_guard_request_kind(prompt):
+    normalized = _normalize_deterministic_route_text(prompt)
+    status_routes = [
+        "show latest reviewed action",
+        "show latest reviewed proposal",
+        "show latest dry run",
+        "reviewed action status",
+        "reviewed proposal status",
+        "dry run status",
+        "can i apply latest action",
+        "can i execute latest proposal",
+    ]
+    confirmation_routes = [
+        "confirm reviewed action",
+        "confirm latest reviewed action",
+        "confirm latest proposal",
+        "confirm latest dry run",
+        "confirm split selected pipes",
+        "apply reviewed action",
+        "apply latest reviewed action",
+        "execute reviewed action",
+        "execute latest proposal",
+        "run reviewed action",
+        "approve reviewed action",
+        "approve latest proposal",
+    ]
+    if normalized in confirmation_routes:
+        return "confirmation"
+    if normalized in status_routes:
+        return "status"
+    if any(token in normalized for token in ["confirm", "apply", "execute", "approve", "run reviewed action"]):
+        if "reviewed" in normalized or "proposal" in normalized or "dry run" in normalized or "split selected pipes" in normalized:
+            return "confirmation"
+    if ("status" in normalized or normalized.startswith("show latest") or normalized.startswith("can i ")) and (
+        "reviewed" in normalized or "proposal" in normalized or "dry run" in normalized or "latest action" in normalized
+    ):
+        return "status"
+    return None
 
 
 def execute_reviewed_action_handler(handler_name, doc, uidoc, context=None):
@@ -7832,6 +10981,78 @@ def execute_reviewed_action_handler(handler_name, doc, uidoc, context=None):
 
 def handle_public_command(prompt, doc, uidoc):
     p = prompt.lower()
+    if _is_split_apply_verification_prompt(prompt):
+        return "\n".join(
+            [
+                "[SPLIT APPLY VERIFICATION REPORT]",
+                "",
+                "Verification result:",
+                "Not ready",
+                "",
+                "Reason:",
+                "No latest MEP-WR-003 reviewed apply state is available in this stateless command path.",
+                "",
+                "Safety:",
+                "- Read-only verification only.",
+                "- No transaction opened.",
+                "- No pipe was split.",
+                "- Revit model data was not modified.",
+            ]
+        )
+    if _split_reviewed_apply_request_kind(prompt):
+        return "\n".join(
+            [
+                "[SPLIT SELECTED PIPE REVIEWED APPLY]",
+                "",
+                "Reviewed apply result:",
+                "Not ready",
+                "",
+                "Reason:",
+                "No valid split dry-run and rollback-test state is available in this stateless command path.",
+                "",
+                "Required previous steps:",
+                "1. dry run split selected pipes",
+                "2. run split rollback test ROLLBACK-TEST-OK",
+                "",
+                "Safety:",
+                "- No transaction opened.",
+                "- No pipe was split.",
+                "- Revit model data was not modified.",
+            ]
+        )
+    if _is_split_rollback_test_prompt(prompt):
+        return split_selected_pipes_rollback_test(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
+    if _reviewed_action_confirmation_guard_request_kind(prompt):
+        return "\n".join(
+            [
+                "[REVIEWED ACTION CONFIRMATION GUARD]",
+                "",
+                "Latest reviewed source:",
+                "- Source type: none",
+                "- Source status: unavailable",
+                "",
+                "Execution status:",
+                "- Execution requested: true",
+                "- Execution available: false",
+                "- Execution performed: false",
+                "",
+                "Confirmation result:",
+                "Not ready",
+                "",
+                "Reason:",
+                "No reviewed action proposal or split dry-run is available in this stateless command path. Use the AI Workbench chat session after running a proposal or dry-run.",
+                "",
+                "Safety:",
+                "- Confirmation guard only.",
+                "- Read-only.",
+                "- No transaction opened.",
+                "- No action was applied.",
+                "- No pipe was split.",
+                "- Revit model data was not modified.",
+            ]
+        )
+    if _is_split_selected_pipes_dry_run_prompt(prompt):
+        return split_selected_pipes_dry_run(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
     if "split" in p and "pipe" in p:
         return split_selected_pipes(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
     if "remove duplicates" in p or "remove duplicate" in p or "clean duplicates" in p or "delete duplicate" in p:
@@ -7866,6 +11087,54 @@ def handle_public_command(prompt, doc, uidoc):
         if "active view" in p:
             return report_total_length_active_view_linear_mep(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
         return report_total_length_selected_linear_mep(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
+    if "active view mep summary" in p or "active view mep report" in p or "count mep elements in active view" in p or "count mep in active view" in p:
+        return active_view_mep_summary(doc, uidoc)
+    if "report active view elements by category" in p or "active view category report" in p:
+        return report_active_view_elements_by_category(doc, uidoc)
+    if "report active view elements by type" in p or "active view type report" in p:
+        return report_active_view_elements_by_type(doc, uidoc)
+    if "active view qa report" in p or "active view health check" in p:
+        return active_view_qa_report(doc, uidoc)
+    if "report missing parameters in active view" in p or "missing parameters in active view" in p or "active view missing parameters" in p:
+        return report_missing_parameters_in_active_view(doc, uidoc)
+    if "report pipes in active view" in p or "active view pipe report" in p or "active view piping report" in p:
+        return active_view_piping_report(doc, uidoc)
+    if "report ducts in active view" in p or "active view duct report" in p or "active view hvac report" in p:
+        return active_view_hvac_report(doc, uidoc)
+    if "count electrical elements in active view" in p or "report electrical elements in active view" in p or "active view electrical report" in p:
+        return active_view_electrical_report(doc, uidoc)
+    if "selected piping qa report" in p or "selected pipe qa report" in p:
+        return selected_piping_qa_report(doc, uidoc)
+    if "active view piping qa report" in p or "active view pipe qa report" in p:
+        return active_view_piping_qa_report(doc, uidoc)
+    if "selected hvac qa report" in p or "selected duct qa report" in p:
+        return selected_hvac_qa_report(doc, uidoc)
+    if "active view hvac qa report" in p or "active view duct qa report" in p:
+        return active_view_hvac_qa_report(doc, uidoc)
+    if "selected electrical qa report" in p or "selected electrical circuit qa report" in p:
+        return selected_electrical_qa_report(doc, uidoc)
+    if "active view electrical qa report" in p or "active view electrical circuit qa report" in p:
+        return active_view_electrical_qa_report(doc, uidoc)
+    if "selected discipline qa report" in p or "selected mep qa rules report" in p or "check selected mep qa rules" in p:
+        return selected_discipline_qa_report(doc, uidoc)
+    if "active view discipline qa report" in p or "active view mep qa rules report" in p or "check active view mep qa rules" in p:
+        return active_view_discipline_qa_report(doc, uidoc)
+    if "selected pipe system report" in p or "check selected pipe systems" in p:
+        return selected_pipe_system_report(doc, uidoc)
+    if "active view pipe system report" in p or "check pipe systems in active view" in p:
+        return active_view_pipe_system_report(doc, uidoc)
+    if "selected duct system report" in p or "check selected duct systems" in p:
+        return selected_duct_system_report(doc, uidoc)
+    if "active view duct system report" in p or "check duct systems in active view" in p:
+        return active_view_duct_system_report(doc, uidoc)
+    if "selected electrical system report" in p or "check selected electrical systems" in p or "selected circuit report" in p:
+        return selected_electrical_system_report(doc, uidoc)
+    if "active view electrical system report" in p or "check electrical systems in active view" in p or "active view circuit report" in p:
+        return active_view_electrical_system_report(doc, uidoc)
+    if "selected mep system assignment report" in p or "selected mep systems" in p or "selected system qa report" in p or "selected elements system report" in p or "report selected elements by system" in p:
+        return selected_mep_system_assignment_report(doc, uidoc)
+    if "active view mep system assignment report" in p or "active view mep systems" in p or "active view system qa report" in p or "report active view elements by system" in p or "count systems in active view" in p:
+        return active_view_mep_system_assignment_report(doc, uidoc)
     if "schedule bundle" in p and ("level" in p or "reference level" in p):
         return create_schedule_bundle_by_level(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
     if "pipe fitting" in p and "schedule" in p and ("level" in p or "reference level" in p):
@@ -7895,7 +11164,7 @@ def handle_public_command(prompt, doc, uidoc):
     if "count selected pipes" in p or "how many pipes are selected" in p:
         return count_selected_pipes(doc, uidoc)
     if "count pipes in active view" in p or "count all pipes in active view" in p:
-        return count_pipes_in_active_view(doc, uidoc)
+        return active_view_piping_report(doc, uidoc)
     if "list pipes in active view" in p or "list all pipes in active view" in p:
         return list_pipes_in_active_view(doc, uidoc)
     if "report total selected pipe length" in p or "total selected pipe length" in p or "length of selected pipes" in p:
@@ -7914,13 +11183,17 @@ def handle_public_command(prompt, doc, uidoc):
         return report_devices_without_circuit_info(doc, uidoc)
     if "list fixtures by type in active view" in p or "list electrical fixtures by type" in p:
         return list_fixtures_by_type_in_active_view(doc, uidoc)
-    if "report selected elements by category" in p:
+    if "report selected elements by category" in p or "selection category report" in p or "selected elements by category" in p or "report selection by category" in p:
         return report_selected_elements_by_category(doc, uidoc)
-    if "report selected elements by type" in p:
+    if "report selected elements by type" in p or "selection type report" in p or "selected elements by type" in p or "report selection by type" in p:
         return report_selected_elements_by_type(doc, uidoc)
-    if "health check for active view selection" in p or "selection health check" in p:
+    if "count selected elements" in p or "selected element count" in p or "count current selection" in p or "count selection" in p or "bim qa count selected elements" in p:
+        return count_selected_elements(doc, uidoc)
+    if "selection health check" in p or "health check selected elements" in p or "health check selection" in p:
+        return health_check_selected_elements(doc, uidoc)
+    if "health check for active view selection" in p:
         return health_check_for_active_view_selection(doc, uidoc)
-    if "report missing parameters from selection" in p or "missing parameters from selection" in p:
+    if "report missing parameters from selection" in p or "report missing parameters from selected elements" in p or "missing parameters from selection" in p or "missing selected parameters" in p:
         return report_missing_parameters_from_selection(doc, uidoc)
     if "create 3d view from selection/context" in p or "create 3d view from selection" in p or "create 3d view" in p:
         return create_3d_view_from_selection(doc, uidoc)
@@ -7966,8 +11239,8 @@ def handle_public_command(prompt, doc, uidoc):
         return count_ducts(doc, uidoc)
     if "count selected ducts" in p or "count the selected ducts" in p or "how many selected ducts" in p:
         return count_selected_ducts(doc, uidoc)
-    if "count all ducts in active view" in p:
-        return count_ducts_in_active_view(doc, uidoc)
+    if "count ducts in active view" in p or "count all ducts in active view" in p:
+        return active_view_hvac_report(doc, uidoc)
     if "count lights" in p:
         return count_lights(doc, uidoc)
     if "total structural volume" in p:
@@ -8348,6 +11621,14 @@ class OllamaAIChat(forms.WPFWindow):
         self.latest_project_context_active_view_id = None
         self.latest_project_context_summary = ""
         self.latest_codex_brief = ""
+        self.latest_deterministic_report = None
+        self.latest_chat_output_is_deterministic_report = False
+        self.latest_reviewed_action_proposal = None
+        self.latest_split_pipe_dry_run = None
+        self.latest_reviewed_action_confirmation_guard = None
+        self.latest_split_rollback_test_state = None
+        self.latest_split_reviewed_apply_state = None
+        self.latest_split_apply_verification_state = None
 
         self.populate_model_selector()
         self.ModelSelector.SelectionChanged += self.on_model_selected
@@ -8365,11 +11646,13 @@ class OllamaAIChat(forms.WPFWindow):
             self.ProjectCodexBriefButton.Click += self.on_project_codex_brief
         for quick_name in [
             "ProjectQuickSummaryButton",
+            "ProjectQuickOnboardingButton",
             "ProjectQuickLevelsButton",
             "ProjectQuickViewsButton",
             "ProjectQuickSheetsButton",
             "ProjectQuickLinksButton",
             "ProjectQuickLinkCoordinatesButton",
+            "ProjectQuickLevelsGridsButton",
             "ProjectQuickImportsButton",
             "ProjectQuickCategoriesButton",
             "ProjectQuickSchedulesButton",
@@ -8948,11 +12231,13 @@ class OllamaAIChat(forms.WPFWindow):
         self._apply_control_style("ProjectCodexBriefButton", "#475569", "#ffffff", "#475569")
         for name in [
             "ProjectQuickSummaryButton",
+            "ProjectQuickOnboardingButton",
             "ProjectQuickLevelsButton",
             "ProjectQuickViewsButton",
             "ProjectQuickSheetsButton",
             "ProjectQuickLinksButton",
             "ProjectQuickLinkCoordinatesButton",
+            "ProjectQuickLevelsGridsButton",
             "ProjectQuickImportsButton",
             "ProjectQuickCategoriesButton",
             "ProjectQuickSchedulesButton",
@@ -9509,6 +12794,2650 @@ class OllamaAIChat(forms.WPFWindow):
         except:
             self.ChatHistory.AppendText("{0}\n{1}\n\n".format(title, body))
 
+    def _extract_report_header(self, report_text):
+        for line in safe_str(report_text).splitlines():
+            candidate = line.strip()
+            if candidate.startswith("[") and candidate.endswith("]"):
+                return candidate
+        return ""
+
+    def _is_exportable_report_text(self, report_text):
+        header = self._extract_report_header(report_text)
+        return header in QA_EXPORT_ACCEPTED_REPORT_HEADERS
+
+    def _detect_report_scope(self, report_text):
+        header = self._extract_report_header(report_text)
+        if header == "[SPLIT APPLY VERIFICATION REPORT]":
+            return "latest reviewed split apply result / active document only"
+        if header == "[SPLIT SELECTED PIPE REVIEWED APPLY]":
+            return "single split candidate / active document only"
+        if header == "[SPLIT SELECTED PIPES ROLLBACK TEST]":
+            return "latest split dry-run candidates / active document only"
+        if header == "[REVIEWED ACTION CONFIRMATION GUARD]":
+            return "session-local reviewed action state / active document only"
+        text = safe_str(report_text).lower()
+        if "selection scope: selected elements" in text or "total selected" in text or "selected supported" in text:
+            return "selected elements / active document only"
+        if "selection scope: active view" in text or "active view" in text:
+            return "active view / active document only"
+        if "project context" in text or "project onboarding" in text:
+            return "project context snapshot"
+        if "guided project startup plan" in text:
+            return "project-context agent plan"
+        return "deterministic AI Workbench report"
+
+    def remember_latest_deterministic_report(self, prompt, report_text):
+        if not self._is_exportable_report_text(report_text):
+            self.latest_chat_output_is_deterministic_report = False
+            return False
+        self.latest_deterministic_report = {
+            "source_prompt": safe_str(prompt),
+            "report_text": safe_str(report_text),
+            "report_header": self._extract_report_header(report_text),
+            "report_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "report_scope": self._detect_report_scope(report_text),
+            "deterministic": True,
+        }
+        self.latest_chat_output_is_deterministic_report = True
+        return True
+
+    def _is_qa_export_request(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        routes = [
+            "export latest qa report",
+            "export current qa report",
+            "save latest qa report",
+            "save current qa report",
+            "create qa evidence snapshot",
+            "create evidence snapshot",
+            "export ai workbench report",
+            "export latest diagnostic report",
+            "save latest diagnostic report",
+        ]
+        return normalized in routes
+
+    def _qa_export_base_folder(self):
+        return self._qa_export_root()
+
+    def _qa_export_primary_root(self):
+        user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        desktop = os.path.join(user_profile, "Desktop")
+        return os.path.join(desktop, "Results", "AI_Workbench", "QA_Exports")
+
+    def _qa_export_temp_root(self):
+        return os.path.join(tempfile.gettempdir(), "AI_Workbench", "QA_Exports")
+
+    def _qa_export_root(self):
+        primary = self._qa_export_primary_root()
+        user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        desktop = os.path.join(user_profile, "Desktop")
+        if desktop and os.path.isdir(desktop):
+            return primary
+        return self._qa_export_temp_root()
+
+    def _qa_export_index_dir(self, root_folder=None):
+        return os.path.join(root_folder or self._qa_export_root(), "_index")
+
+    def _qa_export_index_candidates(self):
+        candidates = []
+        primary = self._qa_export_index_dir(self._qa_export_primary_root())
+        fallback = self._qa_export_index_dir(self._qa_export_temp_root())
+        for item in [primary, fallback]:
+            if item and item not in candidates:
+                candidates.append(item)
+        return candidates
+
+    def _qa_index_csv_escape(self, value):
+        text = safe_str(value)
+        if text == "(none)":
+            text = ""
+        text = text.replace("\r", " ").replace("\n", " ")
+        if '"' in text:
+            text = text.replace('"', '""')
+        if "," in text or '"' in text:
+            text = '"{0}"'.format(text)
+        return text
+
+    def _qa_index_csv_row(self, values):
+        return ",".join([self._qa_index_csv_escape(value) for value in values])
+
+    def _report_header_family(self, header):
+        text = safe_str(header).strip().strip("[]")
+        if not text:
+            return "unknown"
+        return slugify_text(text)
+
+    def _qa_export_file_paths(self, export_folder):
+        return {
+            "report_file": os.path.join(export_folder, "report.md"),
+            "text_file": os.path.join(export_folder, "report.txt"),
+            "metadata_file": os.path.join(export_folder, "metadata.json"),
+            "manifest_file": os.path.join(export_folder, "artifact_manifest.txt"),
+        }
+
+    def _write_qa_export_index_entry(self, metadata):
+        index_dir = self._qa_export_index_dir()
+        try:
+            if not os.path.isdir(index_dir):
+                os.makedirs(index_dir)
+            export_folder = metadata.get("export_folder") or ""
+            file_paths = self._qa_export_file_paths(export_folder)
+            entry = dict(metadata)
+            entry["feature_id"] = "MEP-RO-006"
+            entry["source_feature_id"] = "MEP-RO-005"
+            entry["index_written"] = True
+            entry["report_file"] = file_paths.get("report_file")
+            entry["text_file"] = file_paths.get("text_file")
+            entry["metadata_file"] = file_paths.get("metadata_file")
+            entry["manifest_file"] = file_paths.get("manifest_file")
+            entry["export_folder_exists"] = bool(export_folder and os.path.isdir(export_folder))
+            entry["report_header_family"] = self._report_header_family(metadata.get("source_report_header"))
+            entry["document_key"] = slugify_text(metadata.get("document_title") or "unknown-document")
+            entry["active_view_key"] = slugify_text(metadata.get("active_view_name") or "unknown-view")
+
+            jsonl_path = os.path.join(index_dir, "qa_export_index.jsonl")
+            stream = codecs.open(jsonl_path, "a", "utf-8")
+            try:
+                stream.write(json.dumps(entry, sort_keys=True))
+                stream.write("\n")
+            finally:
+                stream.close()
+
+            csv_path = os.path.join(index_dir, "qa_export_index.csv")
+            csv_fields = [
+                "feature_id",
+                "source_feature_id",
+                "export_timestamp_local",
+                "document_title",
+                "active_view_name",
+                "active_view_type",
+                "source_prompt",
+                "source_report_header",
+                "report_scope",
+                "export_folder",
+                "deterministic_route",
+                "read_only",
+                "model_modified",
+                "linked_documents_scanned",
+                "connector_traversal_used",
+                "geometry_extraction_used",
+                "report_header_family",
+                "document_key",
+                "active_view_key",
+            ]
+            csv_exists = os.path.exists(csv_path)
+            csv_stream = codecs.open(csv_path, "a", "utf-8")
+            try:
+                if not csv_exists:
+                    csv_stream.write(self._qa_index_csv_row(csv_fields))
+                    csv_stream.write("\n")
+                csv_stream.write(self._qa_index_csv_row([entry.get(field) for field in csv_fields]))
+                csv_stream.write("\n")
+            finally:
+                csv_stream.close()
+
+            latest_path = os.path.join(index_dir, "latest_export.json")
+            latest_stream = codecs.open(latest_path, "w", "utf-8")
+            try:
+                latest_stream.write(json.dumps(entry, indent=2, sort_keys=True))
+            finally:
+                latest_stream.close()
+
+            return {
+                "ok": True,
+                "index_dir": index_dir,
+                "jsonl_path": jsonl_path,
+                "csv_path": csv_path,
+                "latest_path": latest_path,
+                "entry": entry,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "index_dir": index_dir,
+                "warning": "{0}: {1}".format(exc.__class__.__name__, str(exc)),
+            }
+
+    def _read_qa_export_index_entries(self, limit=None):
+        last_error = None
+        for index_dir in self._qa_export_index_candidates():
+            jsonl_path = os.path.join(index_dir, "qa_export_index.jsonl")
+            csv_path = os.path.join(index_dir, "qa_export_index.csv")
+            if os.path.exists(jsonl_path):
+                try:
+                    entries = []
+                    stream = codecs.open(jsonl_path, "r", "utf-8")
+                    try:
+                        for line in stream:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            loaded = json.loads(line)
+                            if isinstance(loaded, dict):
+                                entries.append(loaded)
+                    finally:
+                        stream.close()
+                    if limit and len(entries) > limit:
+                        return entries[-int(limit):], index_dir, None
+                    return entries, index_dir, None
+                except Exception as exc:
+                    last_error = "{0}: {1}".format(exc.__class__.__name__, str(exc))
+                    return None, index_dir, last_error
+            if os.path.exists(csv_path):
+                try:
+                    entries = []
+                    stream = codecs.open(csv_path, "r", "utf-8")
+                    try:
+                        reader = csv.DictReader(stream)
+                        for row in reader:
+                            if isinstance(row, dict):
+                                row["generated_files"] = ["report.md", "report.txt", "metadata.json", "artifact_manifest.txt"]
+                                entries.append(row)
+                    finally:
+                        stream.close()
+                    if limit and len(entries) > limit:
+                        return entries[-int(limit):], index_dir, None
+                    return entries, index_dir, None
+                except Exception as exc:
+                    last_error = "{0}: {1}".format(exc.__class__.__name__, str(exc))
+                    return None, index_dir, last_error
+        return [], self._qa_export_index_dir(), None
+
+    def _read_latest_qa_export(self):
+        last_error = None
+        for index_dir in self._qa_export_index_candidates():
+            latest_path = os.path.join(index_dir, "latest_export.json")
+            if not os.path.exists(latest_path):
+                continue
+            try:
+                stream = codecs.open(latest_path, "r", "utf-8")
+                try:
+                    loaded = json.loads(stream.read())
+                finally:
+                    stream.close()
+                if isinstance(loaded, dict):
+                    return loaded, index_dir, None
+            except Exception as exc:
+                last_error = "{0}: {1}".format(exc.__class__.__name__, str(exc))
+                return None, index_dir, last_error
+        entries, index_dir, error = self._read_qa_export_index_entries()
+        if error:
+            return None, index_dir, error
+        if entries:
+            return entries[-1], index_dir, None
+        return None, self._qa_export_index_dir(), last_error
+
+    def _format_qa_export_index_report(self):
+        entries, index_dir, error = self._read_qa_export_index_entries()
+        if error:
+            return "\n".join(
+                [
+                    "[QA EXPORT INDEX]",
+                    "QA export index exists but could not be read safely. Generate a new evidence snapshot or inspect the index file manually.",
+                    "Index folder: {0}".format(index_dir),
+                    "Error: {0}".format(error),
+                ]
+            )
+        if not entries:
+            return "\n".join(
+                [
+                    "[QA EXPORT INDEX]",
+                    "No QA export index was found. Run an evidence snapshot export first.",
+                ]
+            )
+        latest = entries[-1]
+        lines = [
+            "[QA EXPORT INDEX]",
+            "",
+            "Index folder:",
+            index_dir,
+            "",
+            "Total indexed exports: {0}".format(len(entries)),
+            "",
+            "Latest export:",
+            "- timestamp: {0}".format(latest.get("export_timestamp_local") or "unknown"),
+            "- document: {0}".format(latest.get("document_title") or "unknown"),
+            "- active view: {0} [{1}]".format(latest.get("active_view_name") or "unknown", latest.get("active_view_type") or "unknown"),
+            "- source prompt: {0}".format(latest.get("source_prompt") or "unknown"),
+            "- source header: {0}".format(latest.get("source_report_header") or "unknown"),
+            "- scope: {0}".format(latest.get("report_scope") or "unknown"),
+            "- export folder: {0}".format(latest.get("export_folder") or "unknown"),
+            "",
+            "Recent exports:",
+        ]
+        recent = entries[-10:]
+        recent.reverse()
+        for index, item in enumerate(recent):
+            lines.append(
+                "{0}. {1} | {2} | {3} | {4} | {5}".format(
+                    index + 1,
+                    item.get("export_timestamp_local") or "unknown",
+                    item.get("document_title") or "unknown",
+                    item.get("source_report_header") or "unknown",
+                    item.get("source_prompt") or "unknown",
+                    item.get("export_folder") or "unknown",
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "Safety:",
+                "- Index read only.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _format_latest_qa_export_report(self):
+        latest, index_dir, error = self._read_latest_qa_export()
+        if error:
+            return "\n".join(
+                [
+                    "[QA EXPORT INDEX]",
+                    "QA export index exists but could not be read safely. Generate a new evidence snapshot or inspect the index file manually.",
+                    "Index folder: {0}".format(index_dir),
+                    "Error: {0}".format(error),
+                ]
+            )
+        if not latest:
+            return "\n".join(
+                [
+                    "[QA EXPORT INDEX]",
+                    "No QA export index was found. Run an evidence snapshot export first.",
+                ]
+            )
+        files = latest.get("generated_files") or []
+        lines = [
+            "[LATEST QA EXPORT]",
+            "",
+            "Timestamp: {0}".format(latest.get("export_timestamp_local") or "unknown"),
+            "Document: {0}".format(latest.get("document_title") or "unknown"),
+            "Active view: {0} [{1}]".format(latest.get("active_view_name") or "unknown", latest.get("active_view_type") or "unknown"),
+            "Source prompt: {0}".format(latest.get("source_prompt") or "unknown"),
+            "Source header: {0}".format(latest.get("source_report_header") or "unknown"),
+            "Scope: {0}".format(latest.get("report_scope") or "unknown"),
+            "Export folder: {0}".format(latest.get("export_folder") or "unknown"),
+            "Generated files:",
+        ]
+        for filename in files:
+            lines.append("- {0}".format(filename))
+        lines.extend(
+            [
+                "",
+                "Safety:",
+                "- Index read only.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _qa_export_index_query_kind(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        latest_routes = [
+            "show latest qa export",
+            "latest qa evidence snapshot",
+            "latest qa export",
+        ]
+        list_routes = [
+            "list qa evidence snapshots",
+            "list qa exports",
+            "show qa export index",
+            "qa export index summary",
+            "evidence snapshot index",
+            "show evidence snapshots",
+        ]
+        if normalized in latest_routes:
+            return "latest"
+        if normalized in list_routes:
+            return "list"
+        return None
+
+    def answer_qa_export_index_question(self, prompt):
+        kind = self._qa_export_index_query_kind(prompt)
+        if kind == "latest":
+            return self._format_latest_qa_export_report()
+        if kind == "list":
+            return self._format_qa_export_index_report()
+        return None
+
+    def _parse_split_dry_run_candidates(self, report_text):
+        candidates = []
+        pattern = re.compile(
+            r"(?ms)^\d+\. Pipe\s+(\d+).*?"
+            r"Candidate split point:\s+internal ft:\s+\(([^,]+),\s*([^,]+),\s*([^)]+)\).*?"
+            r"Estimated segment A:\s+([0-9.]+)\s+ft.*?"
+            r"Estimated segment B:\s+([0-9.]+)\s+ft"
+        )
+        for match in pattern.finditer(safe_str(report_text)):
+            try:
+                pipe_id = int(match.group(1))
+                point = DB.XYZ(float(match.group(2)), float(match.group(3)), float(match.group(4)))
+                segment_a = float(match.group(5))
+                segment_b = float(match.group(6))
+                candidates.append(
+                    {
+                        "pipe_id": pipe_id,
+                        "point": point,
+                        "estimated_segment_a": segment_a,
+                        "estimated_segment_b": segment_b,
+                    }
+                )
+            except:
+                continue
+        return candidates
+
+    def _latest_split_dry_run_source_for_rollback(self):
+        state = self.latest_split_pipe_dry_run
+        if state and state.get("report_text"):
+            parsed_candidates = self._parse_split_dry_run_candidates(state.get("report_text", ""))
+            return {
+                "source_status": "available",
+                "source_feature_id": "MEP-WR-001",
+                "source_prompt": state.get("source_prompt", ""),
+                "source_header": "[SPLIT SELECTED PIPES DRY RUN]",
+                "eligible_pipe_count": state.get("eligible_pipe_count", 0) or len(parsed_candidates),
+                "candidate_count": state.get("candidate_count", 0) or len(parsed_candidates),
+                "dry_run_result": state.get("dry_run_result", ""),
+                "dry_run_id": state.get("dry_run_id", ""),
+                "document_title": state.get("document_title", ""),
+                "document_path": state.get("document_path", None),
+                "report_text": state.get("report_text", ""),
+                "candidates": parsed_candidates,
+            }
+        report = self.latest_deterministic_report
+        if report and report.get("report_header") == "[SPLIT SELECTED PIPES DRY RUN]":
+            report_text = report.get("report_text", "")
+            result_match = re.search(r"Dry-run result:\s*\n([^\n]+)", safe_str(report_text))
+            parsed_candidates = self._parse_split_dry_run_candidates(report_text)
+            return {
+                "source_status": "available",
+                "source_feature_id": "MEP-WR-001",
+                "source_prompt": report.get("source_prompt", ""),
+                "source_header": "[SPLIT SELECTED PIPES DRY RUN]",
+                "eligible_pipe_count": len(parsed_candidates),
+                "candidate_count": len(parsed_candidates),
+                "dry_run_result": result_match.group(1).strip() if result_match else "",
+                "dry_run_id": "",
+                "document_title": _document_title(doc),
+                "document_path": self._safe_document_path(),
+                "report_text": report_text,
+                "candidates": parsed_candidates,
+            }
+        return {
+            "source_status": "unavailable",
+            "source_feature_id": "none",
+            "source_prompt": "none",
+            "source_header": "none",
+            "eligible_pipe_count": 0,
+            "candidate_count": 0,
+            "dry_run_result": "",
+            "dry_run_id": "",
+            "report_text": "",
+            "candidates": [],
+        }
+
+    def _point_distance_to_pipe_segment(self, point, p0, p1):
+        try:
+            vx = float(p1.X - p0.X)
+            vy = float(p1.Y - p0.Y)
+            vz = float(p1.Z - p0.Z)
+            wx = float(point.X - p0.X)
+            wy = float(point.Y - p0.Y)
+            wz = float(point.Z - p0.Z)
+            length_sq = vx * vx + vy * vy + vz * vz
+            if length_sq <= 0:
+                return None
+            t = (wx * vx + wy * vy + wz * vz) / length_sq
+            if t < 0.0:
+                t = 0.0
+            if t > 1.0:
+                t = 1.0
+            cx = p0.X + t * vx
+            cy = p0.Y + t * vy
+            cz = p0.Z + t * vz
+            dx = point.X - cx
+            dy = point.Y - cy
+            dz = point.Z - cz
+            return math.sqrt(dx * dx + dy * dy + dz * dz)
+        except:
+            return None
+
+    def _validate_split_rollback_candidate(self, candidate):
+        pipe_id = candidate.get("pipe_id")
+        try:
+            elem = doc.GetElement(DB.ElementId(int(pipe_id)))
+        except:
+            elem = None
+        if elem is None:
+            return None, "original pipe id no longer resolves"
+        if not _split_pipe_dry_run_is_pipe(elem):
+            return None, "candidate element is no longer a pipe"
+        try:
+            if bool(elem.Pinned):
+                return None, "pipe is pinned"
+        except:
+            pass
+        try:
+            group_id = getattr(elem, "GroupId", None)
+            if group_id is not None and group_id != DB.ElementId.InvalidElementId:
+                return None, "pipe is in a group"
+        except:
+            pass
+        try:
+            design_option = getattr(elem, "DesignOption", None)
+            if design_option is not None:
+                return None, "pipe is in a design option"
+        except:
+            pass
+        curve, status = _split_pipe_dry_run_safe_curve(elem)
+        if status != "ok":
+            return None, status.replace("_", " ")
+        p0, p1 = _split_pipe_dry_run_endpoints(curve)
+        if _split_pipe_dry_run_is_near_vertical(p0, p1):
+            return None, "pipe is near vertical"
+        point = candidate.get("point")
+        if point is None:
+            return None, "candidate split point is unavailable"
+        distance = self._point_distance_to_pipe_segment(point, p0, p1)
+        if distance is None or distance > ROLLBACK_SPLIT_LENGTH_TOLERANCE_FT:
+            return None, "candidate split point is not on or near the current pipe curve"
+        segment_a = _split_pipe_dry_run_length_from_endpoints(p0, point)
+        segment_b = _split_pipe_dry_run_length_from_endpoints(point, p1)
+        if segment_a is None or segment_b is None:
+            return None, "candidate segment lengths are unreadable"
+        if segment_a < PIPE_SPLIT_DRY_RUN_MIN_SEGMENT_LENGTH_FT or segment_b < PIPE_SPLIT_DRY_RUN_MIN_SEGMENT_LENGTH_FT:
+            return None, "candidate would create a segment below the minimum length rule"
+        try:
+            original_length = float(curve.Length)
+        except:
+            original_length = _split_pipe_dry_run_length_from_endpoints(p0, p1)
+        return {
+            "pipe": elem,
+            "pipe_id": pipe_id,
+            "point": point,
+            "original_length": original_length,
+            "segment_a": segment_a,
+            "segment_b": segment_b,
+        }, ""
+
+    def _safe_pipe_length_by_id(self, pipe_id):
+        try:
+            elem = doc.GetElement(DB.ElementId(int(pipe_id)))
+        except:
+            elem = None
+        if elem is None:
+            return None
+        try:
+            curve, status = _split_pipe_dry_run_safe_curve(elem)
+            if status != "ok":
+                return None
+            return float(curve.Length)
+        except:
+            return None
+
+    def _run_split_rollback_batch(self, validated):
+        results = []
+        failures = []
+        transaction_opened = False
+        breakcurve_called = False
+        group_rolled_back = False
+        group = None
+        try:
+            try:
+                from Autodesk.Revit.DB.Plumbing import PlumbingUtils
+            except:
+                from Autodesk.Revit.DB import PlumbingUtils
+            group = DB.TransactionGroup(doc, "AI Split Selected Pipes Rollback Test")
+            group.Start()
+            transaction_opened = True
+            for item in validated:
+                trans = None
+                new_id_value = None
+                try:
+                    trans = DB.Transaction(doc, "AI rollback pipe split candidate")
+                    trans.Start()
+                    breakcurve_called = True
+                    new_id = PlumbingUtils.BreakCurve(doc, item.get("pipe").Id, item.get("point"))
+                    try:
+                        doc.Regenerate()
+                    except:
+                        pass
+                    try:
+                        new_id_value = new_id.IntegerValue
+                    except:
+                        new_id_value = None
+                    temp_original_length = self._safe_pipe_length_by_id(item.get("pipe_id"))
+                    temp_new_length = self._safe_pipe_length_by_id(new_id_value) if new_id_value is not None else None
+                    trans.Commit()
+                    results.append(
+                        {
+                            "pipe_id": item.get("pipe_id"),
+                            "point": item.get("point"),
+                            "original_length": item.get("original_length"),
+                            "new_id": new_id_value,
+                            "temp_original_length": temp_original_length,
+                            "temp_new_length": temp_new_length,
+                            "status": "temporary split succeeded / rolled back",
+                        }
+                    )
+                except Exception as exc:
+                    try:
+                        if trans is not None:
+                            trans.RollBack()
+                    except:
+                        pass
+                    failures.append({"pipe_id": item.get("pipe_id"), "reason": safe_str(exc)})
+            try:
+                group.RollBack()
+                group_rolled_back = True
+            except Exception as exc:
+                failures.append({"pipe_id": "(group)", "reason": "TransactionGroup rollback failed: {0}".format(safe_str(exc))})
+        except Exception as exc:
+            failures.append({"pipe_id": "(setup)", "reason": safe_str(exc)})
+            try:
+                if group is not None:
+                    group.RollBack()
+                    group_rolled_back = True
+            except:
+                pass
+        return {
+            "results": results,
+            "failures": failures,
+            "transaction_opened": transaction_opened,
+            "breakcurve_called": breakcurve_called,
+            "group_rolled_back": group_rolled_back,
+        }
+
+    def _format_split_rollback_test_report(self, prompt, source, token_present, rollback_data=None, skipped=None, reason=None):
+        rollback_data = rollback_data or {}
+        skipped = skipped or []
+        rollback_test_id = "MEP-WR-002-{0}".format(time.strftime("%Y%m%d_%H%M%S"))
+        has_source = source.get("source_status") == "available"
+        candidates = source.get("candidates") or []
+        results = rollback_data.get("results") or []
+        failures = rollback_data.get("failures") or []
+        transaction_opened = bool(rollback_data.get("transaction_opened"))
+        breakcurve_called = bool(rollback_data.get("breakcurve_called"))
+        group_rolled_back = bool(rollback_data.get("group_rolled_back"))
+        if not has_source:
+            result_text = "Not ready"
+            reason_text = "No valid split selected pipes dry-run is available in the current AI Workbench session."
+        elif not token_present:
+            result_text = "Confirmation required"
+            reason_text = "Confirmation token is required before opening a rollback-only transaction group."
+        elif failures and results:
+            result_text = "Passed with warnings" if group_rolled_back else "Failed and rolled back"
+            reason_text = reason or "Some candidates failed during rollback-test validation or temporary split."
+        elif failures and not results:
+            result_text = "Failed and rolled back" if group_rolled_back else "Failed"
+            reason_text = reason or "No candidate completed a temporary split."
+        else:
+            result_text = "Passed" if group_rolled_back and results else "Not ready"
+            reason_text = reason or ""
+        execution_available = bool(token_present and has_source and source.get("dry_run_result") == "Ready for reviewed apply design" and transaction_opened)
+
+        lines = [
+            "[SPLIT SELECTED PIPES ROLLBACK TEST]",
+            "",
+            "Rollback Test ID:",
+            rollback_test_id,
+            "",
+            "Scope:",
+            "latest split dry-run candidates / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(self._safe_active_view_name(), self._safe_active_view_type()),
+            "",
+            "Source dry-run:",
+            "- Source status: {0}".format(source.get("source_status")),
+        ]
+        if has_source:
+            lines.extend(
+                [
+                    "- Source feature: {0}".format(source.get("source_feature_id")),
+                    "- Source prompt: {0}".format(source.get("source_prompt")),
+                    "- Source header: {0}".format(source.get("source_header")),
+                    "- Eligible pipes: {0}".format(source.get("eligible_pipe_count")),
+                    "- Candidate split points: {0}".format(source.get("candidate_count") or len(candidates)),
+                    "- Dry-run result: {0}".format(source.get("dry_run_result")),
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Execution status:",
+                "- Rollback test requested: true",
+                "- Confirmation token present: {0}".format("true" if token_present else "false"),
+                "- Execution available: {0}".format("true" if execution_available else "false"),
+                "- Transaction opened: {0}".format("true" if transaction_opened else "false"),
+                "- BreakCurve called: {0}".format("true" if breakcurve_called else "false"),
+                "- Transaction group rolled back: {0}".format("true" if group_rolled_back else "false"),
+                "- Persistent model changes: false",
+            ]
+        )
+        if not has_source:
+            lines.extend(
+                [
+                    "",
+                    "Rollback-test result:",
+                    result_text,
+                    "",
+                    "Reason:",
+                    reason_text,
+                    "",
+                    "Required previous step:",
+                    "dry run split selected pipes",
+                ]
+            )
+        elif not token_present:
+            lines.extend(
+                [
+                    "",
+                    "Rollback-test result:",
+                    result_text,
+                    "",
+                    "Required command:",
+                    "run split rollback test ROLLBACK-TEST-OK",
+                ]
+            )
+        else:
+            verification_warnings = 0
+            original_resolve = 0
+            new_removed = 0
+            length_restored = 0
+            for result in results:
+                after_length = self._safe_pipe_length_by_id(result.get("pipe_id"))
+                if after_length is not None:
+                    original_resolve += 1
+                if result.get("new_id") is not None and self._safe_pipe_length_by_id(result.get("new_id")) is None:
+                    new_removed += 1
+                if after_length is not None and result.get("original_length") is not None and abs(after_length - result.get("original_length")) <= ROLLBACK_SPLIT_LENGTH_TOLERANCE_FT:
+                    length_restored += 1
+                else:
+                    verification_warnings += 1
+            lines.extend(
+                [
+                    "",
+                    "Rollback test summary:",
+                    "- Candidates available from dry-run: {0}".format(len(candidates)),
+                    "- Candidates selected for rollback test: {0}".format(min(len(candidates), MAX_ROLLBACK_SPLIT_CANDIDATES)),
+                    "- Successful temporary splits: {0}".format(len(results)),
+                    "- Failed temporary splits: {0}".format(len(failures)),
+                    "- Skipped candidates: {0}".format(len(skipped)),
+                    "- Processing cap: {0}".format(MAX_ROLLBACK_SPLIT_CANDIDATES),
+                    "- Result: Rolled back" if group_rolled_back else "- Result: Rollback incomplete or not opened",
+                    "",
+                    "Candidate results:",
+                ]
+            )
+            if results:
+                for index, result in enumerate(results):
+                    lines.extend(
+                        [
+                            "{0}. Pipe {1}".format(index + 1, result.get("pipe_id")),
+                            "   - Candidate point: {0}".format(_split_pipe_dry_run_xyz_text(result.get("point"))),
+                            "   - Original length before rollback test: {0}".format(_split_pipe_dry_run_length_text(result.get("original_length"))),
+                            "   - Temporary returned new pipe id: {0}".format(result.get("new_id")),
+                            "   - Temporary original segment length: {0}".format(_split_pipe_dry_run_length_text(result.get("temp_original_length"))),
+                            "   - Temporary new segment length: {0}".format(_split_pipe_dry_run_length_text(result.get("temp_new_length"))),
+                            "   - Rollback verification: original restored check performed after TransactionGroup rollback",
+                            "   - Status: {0}".format(result.get("status")),
+                        ]
+                    )
+            else:
+                lines.append("- none")
+            lines.append("")
+            lines.append("Failed candidates:")
+            if failures:
+                for failure in failures:
+                    lines.append("- Pipe {0} | reason: {1}".format(failure.get("pipe_id"), failure.get("reason")))
+            else:
+                lines.append("- none")
+            lines.append("")
+            lines.append("Skipped candidates:")
+            if skipped:
+                for item in skipped:
+                    lines.append("- Pipe {0} | reason: {1}".format(item.get("pipe_id"), item.get("reason")))
+            else:
+                lines.append("- none")
+            lines.extend(
+                [
+                    "",
+                    "Rollback verification:",
+                    "- Original pipe ids still resolve after rollback: {0}/{1}".format(original_resolve, len(results)),
+                    "- Temporary returned new pipe ids no longer resolve after rollback: {0}/{1}".format(new_removed, len(results)),
+                    "- Original lengths restored within tolerance: {0}/{1}".format(length_restored, len(results)),
+                    "- Verification warnings: {0}".format(verification_warnings),
+                    "",
+                    "Rollback-test result:",
+                    result_text,
+                ]
+            )
+            if reason_text:
+                lines.extend(["", "Reason:", reason_text])
+        lines.extend(
+            [
+                "",
+                "Safety:",
+                "- Rollback test only.",
+                "- TransactionGroup was rolled back." if group_rolled_back else "- No persistent TransactionGroup assimilation occurred.",
+                "- No persistent pipe split was applied.",
+                "- Revit model data should be unchanged.",
+                "- This is not a reviewed apply feature.",
+                "",
+                "Next required feature:",
+                "MEP-WR-003 or MEP-WR-002B - Split Selected Pipes Persistent Reviewed Apply",
+            ]
+        )
+        report_text = "\n".join(lines)
+        self.latest_split_rollback_test_state = {
+            "rollback_test_id": rollback_test_id,
+            "feature_id": "MEP-WR-002",
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": _document_title(doc),
+            "document_path": self._safe_document_path(),
+            "active_view_name": self._safe_active_view_name(),
+            "active_view_type": self._safe_active_view_type(),
+            "source_dry_run_id": source.get("dry_run_id"),
+            "source_feature_id": source.get("source_feature_id"),
+            "source_report_header": source.get("source_header"),
+            "rollback_report_header": "[SPLIT SELECTED PIPES ROLLBACK TEST]",
+            "confirmation_token_present": token_present,
+            "transaction_opened": transaction_opened,
+            "breakcurve_called": breakcurve_called,
+            "transaction_group_rolled_back": group_rolled_back,
+            "persistent_model_changes": False,
+            "candidates_available": len(candidates),
+            "candidates_tested": len(results) + len(failures),
+            "temporary_success_count": len(results),
+            "failure_count": len(failures),
+            "skipped_count": len(skipped),
+            "verification_warning_count": verification_warnings if token_present and has_source else 0,
+            "rollback_test_result": result_text,
+            "deterministic_route": True,
+            "report_text": report_text,
+        }
+        return report_text
+
+    def _latest_split_apply_sources(self):
+        dry_source = self._latest_split_dry_run_source_for_rollback()
+        rollback_state = self.latest_split_rollback_test_state
+        rollback_report = rollback_state.get("report_text", "") if rollback_state else ""
+        rollback_result = rollback_state.get("rollback_test_result", "") if rollback_state else ""
+        success_ids = []
+        if rollback_report:
+            try:
+                candidate_section = rollback_report.split("Candidate results:", 1)[1].split("Failed candidates:", 1)[0]
+            except:
+                candidate_section = ""
+            for match in re.finditer(r"(?m)^\d+\. Pipe\s+(\d+)", safe_str(candidate_section)):
+                try:
+                    success_ids.append(int(match.group(1)))
+                except:
+                    pass
+        rollback_source = {
+            "source_status": "available" if rollback_state and rollback_report else "unavailable",
+            "source_feature_id": "MEP-WR-002" if rollback_state else "none",
+            "source_prompt": rollback_state.get("source_prompt", "") if rollback_state else "none",
+            "source_header": rollback_state.get("rollback_report_header", "none") if rollback_state else "none",
+            "rollback_test_result": rollback_result or "Unavailable",
+            "successful_pipe_ids": success_ids,
+            "document_title": rollback_state.get("document_title", "") if rollback_state else "",
+            "document_path": rollback_state.get("document_path", None) if rollback_state else None,
+            "report_text": rollback_report,
+        }
+        return dry_source, rollback_source
+
+    def _split_apply_candidate_lists(self, dry_source, rollback_source):
+        dry_candidates = dry_source.get("candidates") or []
+        rollback_success_ids = set(rollback_source.get("successful_pipe_ids") or [])
+        eligible = []
+        blocked = []
+        for index, candidate in enumerate(dry_candidates):
+            item = dict(candidate)
+            item["candidate_number"] = index + 1
+            pipe_id = item.get("pipe_id")
+            if pipe_id in rollback_success_ids:
+                eligible.append(item)
+            else:
+                item["blocked_reason"] = "not rollback-tested / capped in rollback test"
+                blocked.append(item)
+        return eligible, blocked
+
+    def _selected_split_apply_candidate(self, selection, dry_source):
+        candidates = dry_source.get("candidates") or []
+        kind = selection.get("kind")
+        value = selection.get("value")
+        if kind == "candidate_number":
+            if value is None or value < 1 or value > len(candidates):
+                return None
+            item = dict(candidates[value - 1])
+            item["candidate_number"] = value
+            return item
+        if kind == "pipe_id":
+            for index, candidate in enumerate(candidates):
+                try:
+                    if int(candidate.get("pipe_id")) == int(value):
+                        item = dict(candidate)
+                        item["candidate_number"] = index + 1
+                        return item
+                except:
+                    pass
+        return None
+
+    def _validate_persistent_split_candidate(self, candidate, rollback_source):
+        if not candidate:
+            return None, "candidate not found"
+        try:
+            pipe_id = int(candidate.get("pipe_id"))
+        except:
+            return None, "candidate pipe id is unreadable"
+        if pipe_id not in set(rollback_source.get("successful_pipe_ids") or []):
+            return None, "candidate was not validated by MEP-WR-002 rollback test"
+        valid, reason = self._validate_split_rollback_candidate(candidate)
+        if not valid:
+            return None, reason
+        return valid, ""
+
+    def _run_single_split_persistent_apply(self, validated):
+        transaction_opened = False
+        breakcurve_called = False
+        group_assimilated = False
+        group = None
+        trans = None
+        warnings = []
+        try:
+            try:
+                from Autodesk.Revit.DB.Plumbing import PlumbingUtils
+            except:
+                from Autodesk.Revit.DB import PlumbingUtils
+            group = DB.TransactionGroup(doc, "AI Split Selected Pipe Reviewed Apply")
+            group.Start()
+            transaction_opened = True
+            trans = DB.Transaction(doc, "AI apply one pipe split candidate")
+            trans.Start()
+            breakcurve_called = True
+            new_id = PlumbingUtils.BreakCurve(doc, validated.get("pipe").Id, validated.get("point"))
+            try:
+                doc.Regenerate()
+            except:
+                pass
+            try:
+                new_id_value = new_id.IntegerValue
+            except:
+                new_id_value = None
+            original_segment = self._safe_pipe_length_by_id(validated.get("pipe_id"))
+            new_segment = self._safe_pipe_length_by_id(new_id_value) if new_id_value is not None else None
+            if new_id_value is None or doc.GetElement(DB.ElementId(int(new_id_value))) is None:
+                try:
+                    trans.RollBack()
+                except:
+                    pass
+                try:
+                    group.RollBack()
+                except:
+                    pass
+                return {
+                    "transaction_opened": transaction_opened,
+                    "breakcurve_called": breakcurve_called,
+                    "group_assimilated": False,
+                    "persistent_model_changes": False,
+                    "apply_result": "Failed",
+                    "reason": "BreakCurve did not return a resolvable new pipe id.",
+                    "warnings": warnings,
+                }
+            if original_segment is None or new_segment is None:
+                try:
+                    trans.RollBack()
+                except:
+                    pass
+                try:
+                    group.RollBack()
+                except:
+                    pass
+                return {
+                    "transaction_opened": transaction_opened,
+                    "breakcurve_called": breakcurve_called,
+                    "group_assimilated": False,
+                    "persistent_model_changes": False,
+                    "apply_result": "Failed",
+                    "reason": "Post-split segment lengths were unreadable.",
+                    "warnings": warnings,
+                }
+            combined = original_segment + new_segment
+            original_length = validated.get("original_length")
+            length_delta = abs(combined - original_length) if original_length is not None else None
+            if length_delta is not None and length_delta > ROLLBACK_SPLIT_LENGTH_TOLERANCE_FT:
+                warnings.append("Combined segment length differs from original length beyond tolerance.")
+            trans.Commit()
+            group.Assimilate()
+            group_assimilated = True
+            return {
+                "transaction_opened": transaction_opened,
+                "breakcurve_called": breakcurve_called,
+                "group_assimilated": group_assimilated,
+                "persistent_model_changes": True,
+                "apply_result": "Applied",
+                "returned_new_pipe_id": new_id_value,
+                "original_segment_length_after_apply": original_segment,
+                "new_segment_length_after_apply": new_segment,
+                "combined_segment_length": combined,
+                "length_delta": length_delta,
+                "warnings": warnings,
+            }
+        except Exception as exc:
+            try:
+                if trans is not None:
+                    trans.RollBack()
+            except:
+                pass
+            try:
+                if group is not None and not group_assimilated:
+                    group.RollBack()
+            except:
+                pass
+            return {
+                "transaction_opened": transaction_opened,
+                "breakcurve_called": breakcurve_called,
+                "group_assimilated": group_assimilated,
+                "persistent_model_changes": group_assimilated,
+                "apply_result": "Failed",
+                "reason": safe_str(exc),
+                "warnings": warnings,
+            }
+
+    def _format_split_reviewed_apply_report(self, prompt, request_kind, dry_source, rollback_source, selection, selected_candidate=None, apply_data=None, reason=None):
+        apply_data = apply_data or {}
+        reviewed_apply_id = "MEP-WR-003-{0}".format(time.strftime("%Y%m%d_%H%M%S"))
+        token_present = _has_persistent_split_token(prompt)
+        persistent_requested = request_kind == "apply"
+        candidate_selected = selection.get("kind") in ("candidate_number", "pipe_id")
+        transaction_opened = bool(apply_data.get("transaction_opened"))
+        breakcurve_called = bool(apply_data.get("breakcurve_called"))
+        group_assimilated = bool(apply_data.get("group_assimilated"))
+        persistent_changes = bool(apply_data.get("persistent_model_changes"))
+        eligible, blocked = self._split_apply_candidate_lists(dry_source, rollback_source)
+        dry_available = dry_source.get("source_status") == "available"
+        rollback_available = rollback_source.get("source_status") == "available"
+        rollback_passed = rollback_source.get("rollback_test_result") in ("Passed", "Passed with warnings")
+        if request_kind == "status":
+            result_text = "Status only" if dry_available and rollback_available else "Not ready"
+        elif selection.get("kind") == "batch":
+            result_text = "Blocked"
+        elif not candidate_selected:
+            result_text = "Candidate selection required"
+        elif not token_present:
+            result_text = "Confirmation required"
+        elif apply_data.get("apply_result") == "Applied":
+            result_text = "Applied"
+        else:
+            result_text = "Not ready"
+
+        lines = [
+            "[SPLIT SELECTED PIPE REVIEWED APPLY]",
+            "",
+            "Reviewed Apply ID:",
+            reviewed_apply_id,
+            "",
+            "Request:",
+            "persistent apply requested" if persistent_requested else "status / readiness",
+            "",
+            "Scope:",
+            "single split candidate / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(self._safe_active_view_name(), self._safe_active_view_type()),
+            "",
+            "Source dry-run:",
+            "- Source status: {0}".format(dry_source.get("source_status")),
+            "- Source feature: {0}".format(dry_source.get("source_feature_id")),
+            "- Source prompt: {0}".format(dry_source.get("source_prompt")),
+            "- Source header: {0}".format(dry_source.get("source_header")),
+            "- Candidate split points: {0}".format(dry_source.get("candidate_count") or len(dry_source.get("candidates") or [])),
+            "- Dry-run result: {0}".format(dry_source.get("dry_run_result")),
+            "",
+            "Source rollback test:",
+            "- Source status: {0}".format(rollback_source.get("source_status")),
+            "- Source feature: {0}".format(rollback_source.get("source_feature_id")),
+            "- Source prompt: {0}".format(rollback_source.get("source_prompt")),
+            "- Source header: {0}".format(rollback_source.get("source_header")),
+            "- Rollback-test result: {0}".format(rollback_source.get("rollback_test_result")),
+            "- Successful rollback-tested candidates: {0}".format(len(rollback_source.get("successful_pipe_ids") or [])),
+        ]
+        if request_kind == "status":
+            lines.extend(["", "Eligible persistent apply candidates:"])
+            if eligible:
+                for item in eligible:
+                    lines.append("{0}. Candidate {0} | Pipe {1} | rollback-tested: yes | original length: {2}".format(
+                        item.get("candidate_number"),
+                        item.get("pipe_id"),
+                        _split_pipe_dry_run_length_text((item.get("estimated_segment_a") or 0.0) + (item.get("estimated_segment_b") or 0.0)),
+                    ))
+            else:
+                lines.append("- none")
+            lines.extend(["", "Blocked candidates:"])
+            if blocked:
+                for item in blocked:
+                    lines.append("{0}. Candidate {0} | Pipe {1} | reason: {2}".format(item.get("candidate_number"), item.get("pipe_id"), item.get("blocked_reason")))
+            else:
+                lines.append("- none")
+        else:
+            lines.extend(
+                [
+                    "",
+                    "Selected candidate:",
+                    "- Candidate: {0}".format(selection.get("value") if selection.get("value") is not None else "none"),
+                    "- Candidate status: {0}".format("available" if selected_candidate else "unavailable"),
+                ]
+            )
+            if selected_candidate:
+                lines.extend(
+                    [
+                        "- Candidate number: {0}".format(selected_candidate.get("candidate_number")),
+                        "- Original pipe id: {0}".format(selected_candidate.get("pipe_id")),
+                        "- Candidate point: {0}".format(_split_pipe_dry_run_xyz_text(selected_candidate.get("point"))),
+                    ]
+                )
+        lines.extend(
+            [
+                "",
+                "Execution status:",
+                "- Persistent apply requested: {0}".format("true" if persistent_requested else "false"),
+                "- Candidate selected: {0}".format("true" if candidate_selected else "false"),
+                "- Confirmation token present: {0}".format("true" if token_present else "false"),
+                "- Execution available: {0}".format("true" if transaction_opened and token_present and candidate_selected else "false"),
+                "- Transaction opened: {0}".format("true" if transaction_opened else "false"),
+                "- BreakCurve called: {0}".format("true" if breakcurve_called else "false"),
+                "- Transaction group assimilated: {0}".format("true" if group_assimilated else "false"),
+                "- Persistent model changes: {0}".format("true" if persistent_changes else "false"),
+            ]
+        )
+        if apply_data.get("apply_result") == "Applied":
+            original_length = selected_candidate.get("estimated_segment_a") + selected_candidate.get("estimated_segment_b")
+            lines.extend(
+                [
+                    "",
+                    "Apply result:",
+                    "- Returned new pipe id: {0}".format(apply_data.get("returned_new_pipe_id")),
+                    "- Original pipe id after apply: {0}".format(selected_candidate.get("pipe_id")),
+                    "- Original segment length after apply: {0}".format(_split_pipe_dry_run_length_text(apply_data.get("original_segment_length_after_apply"))),
+                    "- New segment length after apply: {0}".format(_split_pipe_dry_run_length_text(apply_data.get("new_segment_length_after_apply"))),
+                    "- Combined segment length: {0}".format(_split_pipe_dry_run_length_text(apply_data.get("combined_segment_length"))),
+                    "- Length delta from original: {0}".format(_split_pipe_dry_run_length_text(apply_data.get("length_delta"))),
+                    "- Warnings: {0}".format(len(apply_data.get("warnings") or [])),
+                    "",
+                    "Expected source lengths:",
+                    "- Original length before apply: {0}".format(_split_pipe_dry_run_length_text(original_length)),
+                    "- Expected segment A: {0}".format(_split_pipe_dry_run_length_text(selected_candidate.get("estimated_segment_a"))),
+                    "- Expected segment B: {0}".format(_split_pipe_dry_run_length_text(selected_candidate.get("estimated_segment_b"))),
+                ]
+            )
+        lines.extend(["", "Reviewed apply result:", result_text])
+        if reason or apply_data.get("reason"):
+            lines.extend(["", "Reason:", reason or apply_data.get("reason")])
+        if result_text == "Candidate selection required":
+            lines.extend(
+                [
+                    "",
+                    "Suggested commands:",
+                    "- apply split candidate 1 PERSISTENT-SPLIT-OK",
+                    "- apply pipe split candidate 3003513 PERSISTENT-SPLIT-OK",
+                ]
+            )
+        elif result_text == "Confirmation required":
+            lines.extend(["", "Required command:", "apply split candidate <n> PERSISTENT-SPLIT-OK"])
+        elif result_text == "Not ready":
+            lines.extend(["", "Required previous steps:", "1. dry run split selected pipes", "2. run split rollback test ROLLBACK-TEST-OK"])
+        elif result_text == "Status only":
+            lines.extend(["", "Suggested command:", "apply split candidate 1 PERSISTENT-SPLIT-OK"])
+        lines.extend(
+            [
+                "",
+                "Safety:",
+                "- Persistent reviewed apply was explicitly confirmed." if persistent_changes else "- No persistent split was applied.",
+                "- Exactly one candidate was applied." if persistent_changes else "- No transaction opened." if not transaction_opened else "- Transaction was rolled back or not assimilated.",
+                "- No batch apply was performed.",
+                "- No connector traversal was performed.",
+                "- No geometry extraction was performed.",
+                "- Revit model data was modified by this reviewed apply." if persistent_changes else "- Revit model data was not modified.",
+            ]
+        )
+        if persistent_changes:
+            lines.extend(["", "Next recommended step:", "Run dry run split selected pipes again to verify the updated candidate state."])
+        report_text = "\n".join(lines)
+        self.latest_split_reviewed_apply_state = {
+            "reviewed_apply_id": reviewed_apply_id,
+            "feature_id": "MEP-WR-003",
+            "source_dry_run_feature_id": "MEP-WR-001",
+            "source_rollback_feature_id": "MEP-WR-002",
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": _document_title(doc),
+            "document_path": self._safe_document_path(),
+            "active_view_name": self._safe_active_view_name(),
+            "active_view_type": self._safe_active_view_type(),
+            "source_dry_run_header": "[SPLIT SELECTED PIPES DRY RUN]",
+            "source_rollback_header": "[SPLIT SELECTED PIPES ROLLBACK TEST]",
+            "report_header": "[SPLIT SELECTED PIPE REVIEWED APPLY]",
+            "selected_candidate_number": selected_candidate.get("candidate_number") if selected_candidate else None,
+            "selected_pipe_id": selected_candidate.get("pipe_id") if selected_candidate else None,
+            "returned_new_pipe_id": apply_data.get("returned_new_pipe_id"),
+            "original_length_before_apply": (selected_candidate.get("estimated_segment_a") + selected_candidate.get("estimated_segment_b")) if selected_candidate else None,
+            "original_segment_length_after_apply": apply_data.get("original_segment_length_after_apply"),
+            "new_segment_length_after_apply": apply_data.get("new_segment_length_after_apply"),
+            "combined_segment_length": apply_data.get("combined_segment_length"),
+            "length_delta": apply_data.get("length_delta"),
+            "confirmation_token_present": token_present,
+            "transaction_opened": transaction_opened,
+            "breakcurve_called": breakcurve_called,
+            "transaction_group_assimilated": group_assimilated,
+            "persistent_model_changes": persistent_changes,
+            "apply_result": result_text,
+            "deterministic_route": True,
+            "report_text": report_text,
+        }
+        return report_text
+
+    def _parse_reviewed_apply_report_source(self, report_text):
+        text = safe_str(report_text)
+        def int_match(pattern):
+            match = re.search(pattern, text, re.I)
+            try:
+                return int(match.group(1)) if match else None
+            except:
+                return None
+        def length_match(pattern):
+            match = re.search(pattern, text, re.I)
+            try:
+                return float(match.group(1)) if match else None
+            except:
+                return None
+        return {
+            "source_status": "available",
+            "source_feature_id": "MEP-WR-003",
+            "source_prompt": self.latest_deterministic_report.get("source_prompt", "") if self.latest_deterministic_report else "",
+            "source_header": "[SPLIT SELECTED PIPE REVIEWED APPLY]",
+            "apply_result": "Applied" if re.search(r"Reviewed apply result:\s*\nApplied", text, re.I) else "",
+            "persistent_model_changes": bool(re.search(r"Persistent model changes:\s*true", text, re.I)),
+            "original_pipe_id": int_match(r"Original pipe id(?: after apply)?:\s*(\d+)"),
+            "returned_new_pipe_id": int_match(r"Returned new pipe id:\s*(\d+)"),
+            "source_original_length_before_apply": length_match(r"Original length before apply:\s*([0-9.]+)\s*ft"),
+            "source_original_segment_length_after_apply": length_match(r"Original segment length after apply:\s*([0-9.]+)\s*ft"),
+            "source_new_segment_length_after_apply": length_match(r"New segment length after apply:\s*([0-9.]+)\s*ft"),
+            "source_combined_length": length_match(r"Combined segment length:\s*([0-9.]+)\s*ft"),
+            "source_length_delta": length_match(r"Length delta from original:\s*([0-9.]+)\s*ft"),
+            "document_title": _document_title(doc),
+            "document_path": self._safe_document_path(),
+        }
+
+    def _latest_split_apply_verification_source(self, prompt):
+        state = self.latest_split_reviewed_apply_state
+        if state and state.get("apply_result") == "Applied":
+            return {
+                "source_status": "available",
+                "source_feature_id": "MEP-WR-003",
+                "source_prompt": state.get("source_prompt", ""),
+                "source_header": state.get("report_header", "[SPLIT SELECTED PIPE REVIEWED APPLY]"),
+                "apply_result": state.get("apply_result", ""),
+                "persistent_model_changes": bool(state.get("persistent_model_changes")),
+                "original_pipe_id": state.get("selected_pipe_id"),
+                "returned_new_pipe_id": state.get("returned_new_pipe_id"),
+                "source_original_length_before_apply": state.get("original_length_before_apply"),
+                "source_original_segment_length_after_apply": state.get("original_segment_length_after_apply"),
+                "source_new_segment_length_after_apply": state.get("new_segment_length_after_apply"),
+                "source_combined_length": state.get("combined_segment_length"),
+                "source_length_delta": state.get("length_delta"),
+                "document_title": state.get("document_title", ""),
+                "document_path": state.get("document_path", None),
+            }
+        report = self.latest_deterministic_report
+        if report and report.get("report_header") == "[SPLIT SELECTED PIPE REVIEWED APPLY]":
+            parsed = self._parse_reviewed_apply_report_source(report.get("report_text", ""))
+            if parsed.get("original_pipe_id") and parsed.get("returned_new_pipe_id"):
+                parsed["source_prompt"] = report.get("source_prompt", "")
+                return parsed
+        original_id, new_id = _parse_explicit_split_verification_ids(prompt)
+        if original_id and new_id:
+            return {
+                "source_status": "explicit prompt IDs",
+                "source_feature_id": "explicit prompt IDs",
+                "source_prompt": safe_str(prompt),
+                "source_header": "explicit prompt IDs",
+                "apply_result": "unknown",
+                "persistent_model_changes": False,
+                "original_pipe_id": original_id,
+                "returned_new_pipe_id": new_id,
+                "source_original_length_before_apply": None,
+                "source_original_segment_length_after_apply": None,
+                "source_new_segment_length_after_apply": None,
+                "source_combined_length": None,
+                "source_length_delta": None,
+                "document_title": _document_title(doc),
+                "document_path": self._safe_document_path(),
+            }
+        return {
+            "source_status": "unavailable",
+            "source_feature_id": "none",
+            "source_prompt": "none",
+            "source_header": "none",
+            "apply_result": "Unavailable",
+            "persistent_model_changes": False,
+            "original_pipe_id": None,
+            "returned_new_pipe_id": None,
+        }
+
+    def _pipe_verification_info(self, pipe_id):
+        info = {
+            "pipe_id": pipe_id,
+            "resolves": False,
+            "is_pipe": False,
+            "length_readable": False,
+            "length": None,
+            "reason": "",
+        }
+        try:
+            elem = doc.GetElement(DB.ElementId(int(pipe_id)))
+        except Exception as exc:
+            info["reason"] = safe_str(exc)
+            return info
+        if elem is None:
+            info["reason"] = "element id does not resolve"
+            return info
+        info["resolves"] = True
+        info["is_pipe"] = bool(_split_pipe_dry_run_is_pipe(elem))
+        if not info["is_pipe"]:
+            info["reason"] = "element is not a pipe"
+            return info
+        try:
+            curve, status = _split_pipe_dry_run_safe_curve(elem)
+            if status != "ok":
+                info["reason"] = status.replace("_", " ")
+                return info
+            info["length"] = float(curve.Length)
+            info["length_readable"] = True
+        except Exception as exc:
+            info["reason"] = safe_str(exc)
+        return info
+
+    def _length_delta(self, value, reference):
+        if value is None or reference is None:
+            return None
+        try:
+            return abs(float(value) - float(reference))
+        except:
+            return None
+
+    def _split_apply_verification_check(self, source):
+        original = self._pipe_verification_info(source.get("original_pipe_id"))
+        returned = self._pipe_verification_info(source.get("returned_new_pipe_id"))
+        combined = None
+        if original.get("length_readable") and returned.get("length_readable"):
+            combined = original.get("length") + returned.get("length")
+        source_combined = source.get("source_combined_length")
+        source_original = source.get("source_original_length_before_apply")
+        comparison_source = source_combined if source_combined is not None else source_original
+        delta_combined = self._length_delta(combined, source_combined)
+        delta_original = self._length_delta(combined, source_original)
+        delta_comparison = self._length_delta(combined, comparison_source)
+        delta_original_segment = self._length_delta(original.get("length"), source.get("source_original_segment_length_after_apply"))
+        delta_new_segment = self._length_delta(returned.get("length"), source.get("source_new_segment_length_after_apply"))
+        warnings = []
+        failures = []
+        both_resolve = bool(original.get("resolves") and returned.get("resolves"))
+        both_pipes = bool(original.get("is_pipe") and returned.get("is_pipe"))
+        both_lengths_readable = bool(original.get("length_readable") and returned.get("length_readable"))
+        combined_check = "not evaluated"
+        if both_resolve and both_pipes and both_lengths_readable and combined is not None and comparison_source is not None:
+            if delta_comparison is not None and delta_comparison <= SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT:
+                combined_check = "pass"
+            else:
+                combined_check = "fail"
+        source_persistent_check = "not evaluated"
+        if source.get("source_status") != "explicit prompt IDs":
+            if source.get("source_feature_id") == "MEP-WR-003" and source.get("apply_result") == "Applied" and bool(source.get("persistent_model_changes")):
+                source_persistent_check = "pass"
+            elif source.get("source_feature_id") == "MEP-WR-003" or source.get("apply_result") or source.get("persistent_model_changes") is not None:
+                source_persistent_check = "fail"
+        if not original.get("resolves"):
+            failures.append("Original pipe id does not resolve.")
+        if not returned.get("resolves"):
+            failures.append("Returned new pipe id does not resolve.")
+        if original.get("resolves") and not original.get("is_pipe"):
+            failures.append("Original element is not a pipe.")
+        if returned.get("resolves") and not returned.get("is_pipe"):
+            failures.append("Returned new element is not a pipe.")
+        if original.get("is_pipe") and not original.get("length_readable"):
+            failures.append("Original pipe length is unreadable.")
+        if returned.get("is_pipe") and not returned.get("length_readable"):
+            failures.append("Returned new pipe length is unreadable.")
+        if delta_combined is not None and delta_combined > SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT:
+            failures.append("Combined length differs from source combined length beyond tolerance.")
+        if delta_original is not None and delta_original > SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT:
+            failures.append("Combined length differs from source original length beyond tolerance.")
+        if combined_check == "fail" and not any("Combined length differs" in failure for failure in failures):
+            failures.append("Combined length differs from available source length beyond tolerance.")
+        if delta_original_segment is not None and delta_original_segment > SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT:
+            warnings.append("Current original segment differs from apply report segment length beyond tolerance.")
+        if delta_new_segment is not None and delta_new_segment > SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT:
+            warnings.append("Current returned segment differs from apply report segment length beyond tolerance.")
+        if source.get("source_status") == "explicit prompt IDs" and (source_combined is None and source_original is None):
+            warnings.append("Explicit ID source has no original pre-apply length for full source comparison.")
+        if source_persistent_check == "fail":
+            warnings.append("Source apply result does not explicitly confirm MEP-WR-003 Applied with persistent model changes true.")
+        if source.get("document_title") and source.get("document_title") != _document_title(doc):
+            warnings.append("Source document title differs from active document title.")
+        if failures:
+            result = "Failed"
+        elif source.get("source_status") == "unavailable":
+            result = "Not ready"
+        elif combined_check == "pass" and source_persistent_check in ("pass", "not evaluated") and not warnings:
+            result = "Verified"
+        elif both_resolve and both_pipes and both_lengths_readable:
+            result = "Verified with warnings"
+        elif warnings:
+            result = "Verified with warnings"
+        else:
+            result = "Failed"
+        return {
+            "original": original,
+            "returned": returned,
+            "combined": combined,
+            "delta_combined": delta_combined,
+            "delta_original": delta_original,
+            "delta_comparison": delta_comparison,
+            "combined_check": combined_check,
+            "source_persistent_check": source_persistent_check,
+            "delta_original_segment": delta_original_segment,
+            "delta_new_segment": delta_new_segment,
+            "warnings": warnings,
+            "failures": failures,
+            "result": result,
+        }
+
+    def _format_split_apply_verification_report(self, prompt, source):
+        verification_id = "MEP-WR-004-{0}".format(time.strftime("%Y%m%d_%H%M%S"))
+        has_source = source.get("source_status") != "unavailable"
+        data = self._split_apply_verification_check(source) if has_source else {}
+        original = data.get("original", {})
+        returned = data.get("returned", {})
+        lines = [
+            "[SPLIT APPLY VERIFICATION REPORT]",
+            "",
+            "Verification ID:",
+            verification_id,
+            "",
+            "Request:",
+            "verification",
+            "",
+            "Scope:",
+            "latest reviewed split apply result / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(self._safe_active_view_name(), self._safe_active_view_type()),
+            "",
+            "Source reviewed apply:",
+            "- Source status: {0}".format(source.get("source_status")),
+        ]
+        if has_source:
+            lines.extend(
+                [
+                    "- Source feature: {0}".format(source.get("source_feature_id")),
+                    "- Source prompt: {0}".format(source.get("source_prompt")),
+                    "- Source header: {0}".format(source.get("source_header")),
+                    "- Reviewed apply result: {0}".format(source.get("apply_result")),
+                    "- Persistent model changes: {0}".format("true" if source.get("persistent_model_changes") else "false"),
+                    "",
+                    "Source split result:",
+                    "- Original pipe id: {0}".format(source.get("original_pipe_id")),
+                    "- Returned new pipe id: {0}".format(source.get("returned_new_pipe_id")),
+                    "- Original length before apply: {0}".format(_split_pipe_dry_run_length_text(source.get("source_original_length_before_apply"))),
+                    "- Source original segment length after apply: {0}".format(_split_pipe_dry_run_length_text(source.get("source_original_segment_length_after_apply"))),
+                    "- Source new segment length after apply: {0}".format(_split_pipe_dry_run_length_text(source.get("source_new_segment_length_after_apply"))),
+                    "- Source combined segment length: {0}".format(_split_pipe_dry_run_length_text(source.get("source_combined_length"))),
+                    "- Source length delta: {0}".format(_split_pipe_dry_run_length_text(source.get("source_length_delta"))),
+                    "",
+                    "Current verification:",
+                    "- Original pipe resolves: {0}".format("true" if original.get("resolves") else "false"),
+                    "- Returned new pipe resolves: {0}".format("true" if returned.get("resolves") else "false"),
+                    "- Original element is pipe: {0}".format("true" if original.get("is_pipe") else "false"),
+                    "- Returned new element is pipe: {0}".format("true" if returned.get("is_pipe") else "false"),
+                    "- Original segment length readable: {0}".format("true" if original.get("length_readable") else "false"),
+                    "- Returned new segment length readable: {0}".format("true" if returned.get("length_readable") else "false"),
+                    "- Current original segment length: {0}".format(_split_pipe_dry_run_length_text(original.get("length"))),
+                    "- Current new segment length: {0}".format(_split_pipe_dry_run_length_text(returned.get("length"))),
+                    "- Current combined segment length: {0}".format(_split_pipe_dry_run_length_text(data.get("combined"))),
+                    "- Delta from source combined length: {0}".format(_split_pipe_dry_run_length_text(data.get("delta_combined"))),
+                    "- Delta from source original length before apply: {0}".format(_split_pipe_dry_run_length_text(data.get("delta_original"))),
+                    "- Length tolerance: {0}".format(_split_pipe_dry_run_length_text(SPLIT_APPLY_VERIFICATION_LENGTH_TOLERANCE_FT)),
+                    "",
+                    "Verification checks:",
+                    "- Original pipe id still exists: {0}".format("pass" if original.get("resolves") else "fail"),
+                    "- Returned new pipe id exists: {0}".format("pass" if returned.get("resolves") else "fail"),
+                    "- Both elements are pipes: {0}".format("pass" if original.get("is_pipe") and returned.get("is_pipe") else "fail"),
+                    "- Segment lengths readable: {0}".format("pass" if original.get("length_readable") and returned.get("length_readable") else "fail"),
+                    "- Combined length within tolerance: {0}".format(data.get("combined_check", "not evaluated")),
+                    "- Source apply result was persistent: {0}".format(data.get("source_persistent_check", "not evaluated")),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "Reason:",
+                    "No latest MEP-WR-003 reviewed apply state is available in the current AI Workbench session.",
+                    "",
+                    "Supported fallback:",
+                    "verify split result pipe <original pipe id> new pipe <returned new pipe id>",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Execution status:",
+                "- Verification requested: true",
+                "- Transaction opened: false",
+                "- BreakCurve called: false",
+                "- Model modified: false",
+                "",
+                "Verification result:",
+                data.get("result", "Not ready") if has_source else "Not ready",
+                "",
+                "Warnings:",
+            ]
+        )
+        warnings = data.get("warnings") or []
+        failures = data.get("failures") or []
+        if warnings:
+            for warning in warnings:
+                lines.append("- {0}".format(warning))
+        else:
+            lines.append("- none")
+        if failures:
+            lines.extend(["", "Failures:"])
+            for failure in failures:
+                lines.append("- {0}".format(failure))
+        lines.extend(
+            [
+                "",
+                "Safety:",
+                "- Read-only verification only.",
+                "- No transaction opened.",
+                "- No pipe was split.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        report_text = "\n".join(lines)
+        self.latest_split_apply_verification_state = {
+            "verification_id": verification_id,
+            "feature_id": "MEP-WR-004",
+            "source_feature_id": source.get("source_feature_id"),
+            "source_prompt": source.get("source_prompt"),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": _document_title(doc),
+            "document_path": self._safe_document_path(),
+            "active_view_name": self._safe_active_view_name(),
+            "active_view_type": self._safe_active_view_type(),
+            "report_header": "[SPLIT APPLY VERIFICATION REPORT]",
+            "source_report_header": source.get("source_header"),
+            "original_pipe_id": source.get("original_pipe_id"),
+            "returned_new_pipe_id": source.get("returned_new_pipe_id"),
+            "original_pipe_resolves": original.get("resolves", False),
+            "returned_new_pipe_resolves": returned.get("resolves", False),
+            "original_is_pipe": original.get("is_pipe", False),
+            "returned_new_is_pipe": returned.get("is_pipe", False),
+            "original_length_current": original.get("length"),
+            "returned_new_length_current": returned.get("length"),
+            "combined_length_current": data.get("combined"),
+            "source_original_length_before_apply": source.get("source_original_length_before_apply"),
+            "source_combined_length": source.get("source_combined_length"),
+            "delta_from_source_combined": data.get("delta_combined"),
+            "delta_from_original_before_apply": data.get("delta_original"),
+            "verification_result": data.get("result", "Not ready") if has_source else "Not ready",
+            "warning_count": len(data.get("warnings") or []),
+            "deterministic_route": True,
+            "model_modified": False,
+            "transaction_opened": False,
+            "breakcurve_called": False,
+            "report_text": report_text,
+        }
+        return report_text
+
+    def answer_split_apply_verification_question(self, prompt):
+        if not _is_split_apply_verification_prompt(prompt):
+            return None
+        source = self._latest_split_apply_verification_source(prompt)
+        return self._format_split_apply_verification_report(prompt, source)
+
+    def answer_split_reviewed_apply_question(self, prompt):
+        request_kind = _split_reviewed_apply_request_kind(prompt)
+        if not request_kind:
+            return None
+        dry_source, rollback_source = self._latest_split_apply_sources()
+        selection = _parse_split_apply_candidate_selection(prompt)
+        selected_candidate = self._selected_split_apply_candidate(selection, dry_source)
+        if request_kind == "status":
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate)
+        if selection.get("kind") == "batch":
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="MEP-WR-003 applies exactly one explicitly selected candidate per command. Batch apply is not implemented.")
+        if selection.get("kind") == "missing":
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="MEP-WR-003 applies exactly one candidate. Specify candidate number or pipe id.")
+        if not _has_persistent_split_token(prompt):
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate)
+        if dry_source.get("source_status") != "available":
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="Latest MEP-WR-001 split dry-run state is missing.")
+        if rollback_source.get("source_status") != "available":
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="Latest MEP-WR-002 rollback-test state is missing.")
+        if dry_source.get("document_title") and dry_source.get("document_title") != _document_title(doc):
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="Latest dry-run document does not match the active document.")
+        if rollback_source.get("document_title") and rollback_source.get("document_title") != _document_title(doc):
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="Latest rollback-test document does not match the active document.")
+        if rollback_source.get("rollback_test_result") not in ("Passed", "Passed with warnings"):
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="Rollback test did not pass.")
+        if not selected_candidate:
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason="Selected candidate was not found in the latest dry-run.")
+        validated, reason = self._validate_persistent_split_candidate(selected_candidate, rollback_source)
+        if not validated:
+            return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, reason=reason)
+        apply_data = self._run_single_split_persistent_apply(validated)
+        return self._format_split_reviewed_apply_report(prompt, request_kind, dry_source, rollback_source, selection, selected_candidate, apply_data, apply_data.get("reason"))
+
+    def answer_split_selected_pipes_rollback_test_question(self, prompt):
+        if not _is_split_rollback_test_prompt(prompt):
+            return None
+        source = self._latest_split_dry_run_source_for_rollback()
+        token_present = _has_rollback_test_token(prompt)
+        if source.get("source_status") != "available":
+            return self._format_split_rollback_test_report(prompt, source, token_present)
+        if not token_present:
+            return self._format_split_rollback_test_report(prompt, source, token_present)
+        if source.get("dry_run_result") != "Ready for reviewed apply design":
+            return self._format_split_rollback_test_report(prompt, source, token_present, reason="Source dry-run result is not ready for reviewed apply design.")
+        candidates = source.get("candidates") or []
+        validated = []
+        skipped = []
+        for candidate in candidates[:MAX_ROLLBACK_SPLIT_CANDIDATES]:
+            valid, reason = self._validate_split_rollback_candidate(candidate)
+            if valid:
+                validated.append(valid)
+            else:
+                skipped.append({"pipe_id": candidate.get("pipe_id"), "reason": reason})
+        if len(candidates) > MAX_ROLLBACK_SPLIT_CANDIDATES:
+            for candidate in candidates[MAX_ROLLBACK_SPLIT_CANDIDATES:]:
+                skipped.append({"pipe_id": candidate.get("pipe_id"), "reason": "rollback test capped for safety"})
+        if not validated:
+            return self._format_split_rollback_test_report(prompt, source, token_present, {"results": [], "failures": [], "transaction_opened": False, "breakcurve_called": False, "group_rolled_back": False}, skipped, "No candidates passed current rollback-test validation.")
+        rollback_data = self._run_split_rollback_batch(validated)
+        return self._format_split_rollback_test_report(prompt, source, token_present, rollback_data, skipped)
+
+    def answer_split_selected_pipes_dry_run_question(self, prompt):
+        if not _is_split_selected_pipes_dry_run_prompt(prompt):
+            return None
+        report_text = split_selected_pipes_dry_run(doc, uidoc, {"requested_prompt": prompt, "prompt_text": prompt})
+        def metric(label):
+            match = re.search(r"- {0}: (\d+)".format(re.escape(label)), report_text)
+            if not match and label == "Total selected elements":
+                match = re.search(r"Total selected elements: (\d+)", report_text)
+            try:
+                return int(match.group(1)) if match else 0
+            except:
+                return 0
+        result_match = re.search(r"Dry-run result:\s*\n([^\n]+)", report_text)
+        self.latest_split_pipe_dry_run = {
+            "dry_run_id": "MEP-WR-001-{0}".format(time.strftime("%Y%m%d_%H%M%S")),
+            "feature_id": "MEP-WR-001",
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": _document_title(doc),
+            "document_path": self._safe_document_path(),
+            "active_view_name": self._safe_active_view_name(),
+            "active_view_type": self._safe_active_view_type(),
+            "scope": "selected elements / active document only",
+            "total_selected": metric("Total selected elements"),
+            "inspected_count": metric("Elements inspected"),
+            "eligible_pipe_count": metric("Eligible pipes"),
+            "candidate_count": metric("Candidate split points"),
+            "skipped_count": metric("Skipped elements"),
+            "warning_count": metric("Warnings"),
+            "dry_run_result": result_match.group(1).strip() if result_match else "",
+            "candidate_summary": "midpoint candidate only",
+            "report_text": report_text,
+            "deterministic_route": True,
+            "read_only": True,
+            "model_modified": False,
+            "execution_available": False,
+        }
+        return report_text
+
+    def _latest_guard_source_state(self, prompt):
+        normalized = _normalize_deterministic_route_text(prompt)
+        prefer_proposal = "proposal" in normalized or "reviewed action" in normalized or "reviewed proposal" in normalized
+        prefer_dry_run = "dry run" in normalized
+
+        def split_state():
+            state = self.latest_split_pipe_dry_run
+            if not state:
+                return None
+            return {
+                "source_state_type": "split_dry_run",
+                "source_feature_id": "MEP-WR-001",
+                "source_report_header": "[SPLIT SELECTED PIPES DRY RUN]",
+                "source_report_prompt": state.get("source_prompt", ""),
+                "source_report_timestamp": state.get("created_timestamp_local", ""),
+                "source_status": "available",
+                "summary": [
+                    "- Eligible pipes: {0}".format(state.get("eligible_pipe_count", 0)),
+                    "- Candidate split points: {0}".format(state.get("candidate_count", 0)),
+                    "- Skipped elements: {0}".format(state.get("skipped_count", 0)),
+                    "- Dry-run result: {0}".format(state.get("dry_run_result", "")),
+                    "- Exportable source header: [SPLIT SELECTED PIPES DRY RUN]",
+                ],
+            }
+
+        def proposal_state():
+            state = self.latest_reviewed_action_proposal
+            if not state:
+                return None
+            return {
+                "source_state_type": "reviewed_proposal",
+                "source_feature_id": "MEP-ACT-001",
+                "source_report_header": "[REVIEWED ACTION PROPOSAL]",
+                "source_report_prompt": state.get("source_prompt", ""),
+                "source_report_timestamp": state.get("created_timestamp_local", ""),
+                "source_status": "available",
+                "summary": [
+                    "- Action label: {0}".format(state.get("action_label", "")),
+                    "- Proposal status: {0}".format(state.get("proposal_status", "")),
+                    "- Eligible count: {0}".format(state.get("eligible_count", 0)),
+                    "- Skipped count: {0}".format(state.get("skipped_count", 0)),
+                    "- Warning count: {0}".format(state.get("warning_count", 0)),
+                ],
+            }
+
+        def deterministic_state():
+            state = self.latest_deterministic_report
+            if not state:
+                return None
+            header = state.get("report_header", "")
+            if header == "[SPLIT SELECTED PIPES DRY RUN]":
+                source_feature = "MEP-WR-001"
+                source_type = "deterministic_report"
+            elif header == "[REVIEWED ACTION PROPOSAL]":
+                source_feature = "MEP-ACT-001"
+                source_type = "deterministic_report"
+            else:
+                return None
+            return {
+                "source_state_type": source_type,
+                "source_feature_id": source_feature,
+                "source_report_header": header,
+                "source_report_prompt": state.get("source_prompt", ""),
+                "source_report_timestamp": state.get("report_timestamp", ""),
+                "source_status": "available",
+                "summary": [
+                    "- Source report scope: {0}".format(state.get("report_scope", "")),
+                    "- Exportable source header: {0}".format(header),
+                ],
+            }
+
+        if prefer_dry_run:
+            ordered = [split_state, proposal_state, deterministic_state]
+        elif prefer_proposal:
+            ordered = [proposal_state, split_state, deterministic_state]
+        else:
+            ordered = [split_state, proposal_state, deterministic_state]
+        for getter in ordered:
+            source = getter()
+            if source:
+                return source
+        return {
+            "source_state_type": "none",
+            "source_feature_id": "none",
+            "source_report_header": "none",
+            "source_report_prompt": "none",
+            "source_report_timestamp": "",
+            "source_status": "unavailable",
+            "summary": [],
+        }
+
+    def answer_reviewed_action_confirmation_guard_question(self, prompt):
+        kind = _reviewed_action_confirmation_guard_request_kind(prompt)
+        if not kind:
+            return None
+        execution_requested = kind == "confirmation"
+        source = self._latest_guard_source_state(prompt)
+        has_source = source.get("source_state_type") != "none"
+        guard_id = "MEP-ACT-002-{0}".format(time.strftime("%Y%m%d_%H%M%S"))
+        if not has_source:
+            confirmation_result = "Not ready"
+            reason = "No reviewed action proposal or split dry-run is available in the current AI Workbench session. Run a proposal or dry-run first."
+        elif execution_requested:
+            confirmation_result = "Blocked"
+            reason = "The latest reviewed proposal or dry-run cannot be applied because MEP-WR-002 reviewed apply is not implemented. MEP-ACT-002 only validates confirmation flow and prevents accidental model mutation."
+        else:
+            confirmation_result = "Status only"
+            reason = "MEP-ACT-002 is a confirmation guard only. No reviewed apply feature is implemented yet."
+        request_label = "confirmation / apply requested" if execution_requested else "status"
+
+        lines = [
+            "[REVIEWED ACTION CONFIRMATION GUARD]",
+            "",
+            "Guard ID:",
+            guard_id,
+            "",
+            "Request:",
+            request_label,
+            "",
+            "Scope:",
+            "session-local reviewed action state / active document only",
+            "",
+            "Active document:",
+            _document_title(doc),
+            "",
+            "Active view:",
+            "{0} [{1}]".format(self._safe_active_view_name(), self._safe_active_view_type()),
+            "",
+            "Latest reviewed source:",
+            "- Source type: {0}".format(source.get("source_state_type")),
+            "- Source feature: {0}".format(source.get("source_feature_id")),
+            "- Source prompt: {0}".format(source.get("source_report_prompt")),
+            "- Source header: {0}".format(source.get("source_report_header")),
+            "- Source status: {0}".format(source.get("source_status")),
+        ]
+        if source.get("source_report_timestamp"):
+            lines.append("- Source timestamp: {0}".format(source.get("source_report_timestamp")))
+        if source.get("summary"):
+            lines.extend(["", "Source summary:"])
+            lines.extend(source.get("summary"))
+        lines.extend(
+            [
+                "",
+                "Execution status:",
+                "- Execution requested: {0}".format("true" if execution_requested else "false"),
+                "- Execution available: false",
+                "- Execution performed: false",
+                "",
+                "Confirmation result:",
+                confirmation_result,
+                "",
+                "Reason:",
+                reason,
+            ]
+        )
+        if not has_source:
+            lines.extend(
+                [
+                    "",
+                    "Suggested prompts:",
+                    "- propose split selected pipes",
+                    "- dry run split selected pipes",
+                    "- split selected pipes dry run",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Next required feature:",
+                "MEP-WR-002 - Split Selected Pipes Reviewed Apply",
+                "",
+                "Safety:",
+                "- Confirmation guard only.",
+                "- Read-only.",
+                "- No transaction opened.",
+                "- No action was applied.",
+                "- No pipe was split.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        report_text = "\n".join(lines)
+        self.latest_reviewed_action_confirmation_guard = {
+            "guard_id": guard_id,
+            "feature_id": "MEP-ACT-002",
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": _document_title(doc),
+            "document_path": self._safe_document_path(),
+            "active_view_name": self._safe_active_view_name(),
+            "active_view_type": self._safe_active_view_type(),
+            "source_state_type": source.get("source_state_type"),
+            "source_feature_id": source.get("source_feature_id"),
+            "source_report_header": source.get("source_report_header"),
+            "source_report_prompt": source.get("source_report_prompt"),
+            "source_report_timestamp": source.get("source_report_timestamp"),
+            "execution_requested": execution_requested,
+            "execution_available": False,
+            "execution_performed": False,
+            "confirmation_result": confirmation_result,
+            "reason": reason,
+            "next_required_feature": "MEP-WR-002",
+            "deterministic_route": True,
+            "read_only": True,
+            "model_modified": False,
+            "transaction_opened": False,
+            "report_text": report_text,
+        }
+        return report_text
+
+    def _reviewed_action_proposal_route(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        split_routes = [
+            "propose split selected pipes",
+            "propose splitting selected pipes",
+            "review split selected pipes",
+            "prepare split selected pipes",
+            "plan split selected pipes",
+            "split selected pipes proposal",
+            "preflight split selected pipes",
+        ]
+        future_routes = {
+            "propose tag selected elements": "tag_selected_mep_elements",
+            "propose tag selected mep elements": "tag_selected_mep_elements",
+            "propose fill missing marks": "fill_missing_marks",
+            "propose create schedule from report": "create_schedule_from_report",
+            "propose export qa report": "export_latest_qa_report",
+            "propose create qa snapshot": "create_qa_snapshot",
+        }
+        general_routes = [
+            "propose reviewed action",
+            "create reviewed action proposal",
+            "reviewed action proposal",
+            "plan reviewed action",
+            "prepare reviewed action",
+            "action proposal",
+            "propose next action",
+            "what action can you propose",
+        ]
+        if normalized in split_routes:
+            return "split_selected_pipes"
+        if normalized in future_routes:
+            return future_routes.get(normalized)
+        if normalized in general_routes:
+            return "unknown_reviewed_action"
+        if "split" in normalized and "selected pipe" in normalized:
+            return "split_selected_pipes"
+        if "tag" in normalized and ("selected" in normalized or "mep" in normalized):
+            return "tag_selected_mep_elements"
+        if "fill" in normalized and "missing mark" in normalized:
+            return "fill_missing_marks"
+        if "schedule" in normalized and "report" in normalized and "propose" in normalized:
+            return "create_schedule_from_report"
+        if "export" in normalized and "qa report" in normalized and "propose" in normalized:
+            return "export_latest_qa_report"
+        if "qa snapshot" in normalized and "propose" in normalized:
+            return "create_qa_snapshot"
+        return None
+
+    def _proposal_action_label(self, action_key):
+        labels = {
+            "split_selected_pipes": "Split selected pipes",
+            "tag_selected_mep_elements": "Tag selected MEP elements",
+            "fill_missing_marks": "Fill missing marks",
+            "export_latest_qa_report": "Export QA report",
+            "create_qa_snapshot": "QA evidence snapshot",
+            "create_schedule_from_report": "Schedule from report",
+            "unknown_reviewed_action": "Unknown reviewed action",
+        }
+        return labels.get(action_key, "Unknown reviewed action")
+
+    def _proposal_id(self, action_key):
+        return "MEP-ACT-001-{0}-{1}".format(time.strftime("%Y%m%d_%H%M%S"), slugify_text(action_key))
+
+    def _pipe_split_category_group(self, category_name):
+        if category_name == "Pipes":
+            return "pipes"
+        if category_name == "Pipe Fittings":
+            return "pipe_fittings"
+        if category_name == "Pipe Accessories":
+            return "pipe_accessories"
+        return "non_pipe"
+
+    def _append_sample(self, groups, key, elem, limit=10):
+        bucket = groups.setdefault(key, {"count": 0, "ids": [], "categories": {}})
+        bucket["count"] += 1
+        elem_id = _safe_int_id(elem)
+        if elem_id is not None and len(bucket["ids"]) < limit and elem_id not in bucket["ids"]:
+            bucket["ids"].append(elem_id)
+        cat = _category_name(elem)
+        if cat:
+            bucket["categories"][cat] = bucket["categories"].get(cat, 0) + 1
+
+    def _pipe_location_curve_status(self, elem):
+        try:
+            location = elem.Location
+        except:
+            location = None
+        try:
+            if not isinstance(location, DB.LocationCurve):
+                return None, "unreadable"
+        except:
+            if not hasattr(location, "Curve"):
+                return None, "unreadable"
+        try:
+            curve = location.Curve
+        except:
+            return None, "unreadable"
+        if curve is None:
+            return None, "unreadable"
+        try:
+            _ = curve.GetEndPoint(0)
+            _ = curve.GetEndPoint(1)
+        except:
+            return curve, "unsupported"
+        return curve, "ok"
+
+    def _pipe_is_near_vertical(self, curve):
+        try:
+            p0 = curve.GetEndPoint(0)
+            p1 = curve.GetEndPoint(1)
+            dx = float(p1.X - p0.X)
+            dy = float(p1.Y - p0.Y)
+            dz = float(p1.Z - p0.Z)
+            length = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if length <= 0:
+                return False
+            return abs(dz / length) > 0.90
+        except:
+            return False
+
+    def _pipe_curve_length(self, curve):
+        try:
+            return float(curve.Length)
+        except:
+            return None
+
+    def _pipe_too_short(self, curve):
+        length = self._pipe_curve_length(curve)
+        if length is None:
+            return False
+        try:
+            threshold = _meters_to_feet(1.0)
+            return length < threshold
+        except:
+            return False
+
+    def _group_line(self, label, bucket):
+        ids = bucket.get("ids") or []
+        categories = bucket.get("categories") or {}
+        parts = ["- {0}: {1}".format(label, bucket.get("count", 0))]
+        if ids:
+            parts.append("sample ids: {0}".format(", ".join([safe_str(item) for item in ids[:10]])))
+        if categories:
+            cat_text = ", ".join(["{0}={1}".format(key, value) for key, value in sorted(categories.items())[:5]])
+            parts.append("categories: {0}".format(cat_text))
+        return " | ".join(parts)
+
+    def _store_reviewed_action_proposal(self, proposal, proposal_text):
+        proposal["proposal_text"] = proposal_text
+        self.latest_reviewed_action_proposal = proposal
+        self.remember_latest_deterministic_report(proposal.get("source_prompt"), proposal_text)
+
+    def _build_split_selected_pipes_proposal(self, prompt):
+        elements = _selected_elements(doc, uidoc)
+        total_selected = len(elements)
+        proposal_id = self._proposal_id("split_selected_pipes")
+        doc_title = _document_title(doc)
+        active_view_name = self._safe_active_view_name()
+        active_view_type = self._safe_active_view_type()
+        groups = {}
+        warnings = {}
+        eligible = []
+        inspected = 0
+        capped = False
+        max_items = 200
+
+        for elem in elements[:max_items]:
+            inspected += 1
+            cat = _category_name(elem)
+            group = self._pipe_split_category_group(cat)
+            if group != "pipes":
+                self._append_sample(groups, group, elem)
+                continue
+            try:
+                if bool(elem.Pinned):
+                    self._append_sample(groups, "pinned_pipes", elem)
+                    continue
+            except:
+                pass
+            try:
+                group_id = getattr(elem, "GroupId", None)
+                if group_id is not None and group_id != DB.ElementId.InvalidElementId:
+                    self._append_sample(groups, "grouped_pipes", elem)
+                    continue
+            except:
+                pass
+            try:
+                design_option = getattr(elem, "DesignOption", None)
+                if design_option is not None:
+                    self._append_sample(groups, "design_option_pipes", elem)
+                    continue
+            except:
+                pass
+            curve, status = self._pipe_location_curve_status(elem)
+            if status == "unreadable":
+                self._append_sample(groups, "unreadable_location_curve", elem)
+                continue
+            if status == "unsupported":
+                self._append_sample(groups, "unsupported_curve_type", elem)
+                continue
+            if self._pipe_is_near_vertical(curve):
+                self._append_sample(groups, "near_vertical_pipes", elem)
+                continue
+            if self._pipe_too_short(curve):
+                self._append_sample(groups, "too_short_pipes", elem)
+                continue
+            eligible.append(elem)
+            if not _element_level_name(doc, elem):
+                self._append_sample(warnings, "missing_level", elem)
+            if not _system_assignment_value(elem):
+                self._append_sample(warnings, "missing_system", elem)
+            if not _safe_param_text(elem, ["Diameter", "Size", "Nominal Diameter", "Outside Diameter"]):
+                self._append_sample(warnings, "missing_diameter_or_size", elem)
+            if not _safe_param_text(elem, ["Length"]):
+                self._append_sample(warnings, "missing_length", elem)
+            if not _safe_param_text(elem, ["Slope"]):
+                self._append_sample(warnings, "missing_slope", elem)
+        if len(elements) > max_items:
+            capped = True
+
+        skipped_count = sum([bucket.get("count", 0) for bucket in groups.values()])
+        warning_count = sum([bucket.get("count", 0) for bucket in warnings.values()])
+        ready = bool(eligible)
+        lines = [
+            "[REVIEWED ACTION PROPOSAL]",
+            "",
+            "Proposal ID:",
+            proposal_id,
+            "",
+            "Action:",
+            "Split selected pipes",
+            "",
+            "Status:",
+            "Proposal only / not executed",
+            "",
+            "Scope:",
+            "selected elements / active document only",
+            "",
+            "Active document:",
+            doc_title,
+            "",
+            "Active view:",
+            "{0} [{1}]".format(active_view_name, active_view_type),
+            "",
+            "Selection summary:",
+            "- Total selected elements: {0}".format(total_selected),
+            "- Elements inspected for preflight: {0}".format(inspected),
+            "- Eligible pipes: {0}".format(len(eligible)),
+            "- Skipped elements: {0}".format(skipped_count),
+            "- Warnings: {0}".format(warning_count),
+            "",
+        ]
+        if total_selected == 0:
+            lines.extend(
+                [
+                    "Preflight result:",
+                    "Not ready",
+                    "",
+                    "No elements selected. Select pipes before requesting a split proposal.",
+                    "",
+                    "Safety:",
+                    "- Proposal only.",
+                    "- Read-only.",
+                    "- No transaction opened.",
+                    "- Revit model data was not modified.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Eligible pipes:",
+                    "- {0} | sample ids: {1}".format(len(eligible), _sample_id_text(eligible, 10)),
+                    "",
+                    "Skipped elements:",
+                    self._group_line("Pipe fittings", groups.get("pipe_fittings", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Pipe accessories", groups.get("pipe_accessories", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Non-pipe categories", groups.get("non_pipe", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Near-vertical pipes", groups.get("near_vertical_pipes", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Too-short pipes", groups.get("too_short_pipes", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Unreadable location curve", groups.get("unreadable_location_curve", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Pinned pipes", groups.get("pinned_pipes", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Grouped pipes", groups.get("grouped_pipes", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Design-option pipes", groups.get("design_option_pipes", {"count": 0, "ids": [], "categories": {}})),
+                    self._group_line("Unsupported curve type", groups.get("unsupported_curve_type", {"count": 0, "ids": [], "categories": {}})),
+                    "",
+                    "Preflight warnings:",
+                ]
+            )
+            if warnings:
+                for key in sorted(warnings.keys()):
+                    lines.append(self._group_line(key.replace("_", " ").title(), warnings.get(key)))
+            else:
+                lines.append("- none")
+            if capped:
+                lines.append("- Selection preflight was capped at 200 elements for readability/performance.")
+            lines.extend(
+                [
+                    "",
+                    "Risks:",
+                    "- Pipe splitting can affect connected fittings, slopes, systems, tags, dimensions, schedules, and downstream coordination.",
+                    "- MEP-ACT-001 does not inspect connectors or modify networks.",
+                    "- Actual execution must be implemented as a separate reviewed write action with rollback.",
+                    "",
+                    "Preflight result:",
+                    "Ready for future dry-run" if ready else "Not ready",
+                    "",
+                    "Proposed split count:",
+                    "not calculated in MEP-ACT-001",
+                    "",
+                    "Next step:",
+                    "Future feature MEP-WR-001 should implement split selected pipes dry-run. Future feature MEP-WR-002 should implement reviewed apply with explicit confirmation and rollback.",
+                    "",
+                    "Safety:",
+                    "- Proposal only.",
+                    "- Read-only.",
+                    "- No transaction opened.",
+                    "- Revit model data was not modified.",
+                ]
+            )
+        text = "\n".join(lines)
+        proposal = {
+            "proposal_id": proposal_id,
+            "feature_id": "MEP-ACT-001",
+            "action_key": "split_selected_pipes",
+            "action_label": "Split selected pipes",
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": doc_title,
+            "document_path": self._safe_document_path(),
+            "active_view_name": active_view_name,
+            "active_view_type": active_view_type,
+            "scope": "selected elements / active document only",
+            "eligible_count": len(eligible),
+            "skipped_count": skipped_count,
+            "warning_count": warning_count,
+            "proposed_next_command": "MEP-WR-001 split selected pipes dry-run",
+            "proposal_status": "ready_for_future_dry_run" if ready else "not_ready",
+            "deterministic_route": True,
+            "read_only": True,
+            "model_modified": False,
+            "execution_available": False,
+        }
+        self._store_reviewed_action_proposal(proposal, text)
+        return text
+
+    def _build_future_reviewed_action_proposal(self, prompt, action_key):
+        proposal_id = self._proposal_id(action_key)
+        label = self._proposal_action_label(action_key)
+        doc_title = _document_title(doc)
+        active_view_name = self._safe_active_view_name()
+        active_view_type = self._safe_active_view_type()
+        scope = "selected elements / active document only" if action_key in ("tag_selected_mep_elements", "fill_missing_marks") else "current session / active document only"
+        text = "\n".join(
+            [
+                "[REVIEWED ACTION PROPOSAL]",
+                "",
+                "Proposal ID:",
+                proposal_id,
+                "",
+                "Action:",
+                label,
+                "",
+                "Status:",
+                "Proposal only / future action not implemented",
+                "",
+                "Scope:",
+                scope,
+                "",
+                "Active document:",
+                doc_title,
+                "",
+                "Active view:",
+                "{0} [{1}]".format(active_view_name, active_view_type),
+                "",
+                "Eligibility summary:",
+                "- Eligible elements: 0",
+                "- Skipped elements: 0",
+                "- Warnings: 0",
+                "",
+                "Preflight result:",
+                "Future reviewed action recognized, but execution/dry-run logic is not implemented in MEP-ACT-001.",
+                "",
+                "Next step:",
+                "Implement a dedicated dry-run feature before any reviewed apply action.",
+                "",
+                "Safety:",
+                "- Proposal only.",
+                "- Read-only.",
+                "- No transaction opened.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        proposal = {
+            "proposal_id": proposal_id,
+            "feature_id": "MEP-ACT-001",
+            "action_key": action_key,
+            "action_label": label,
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": doc_title,
+            "document_path": self._safe_document_path(),
+            "active_view_name": active_view_name,
+            "active_view_type": active_view_type,
+            "scope": scope,
+            "eligible_count": 0,
+            "skipped_count": 0,
+            "warning_count": 0,
+            "proposed_next_command": "dedicated dry-run feature required",
+            "proposal_status": "future_action_not_implemented",
+            "deterministic_route": True,
+            "read_only": True,
+            "model_modified": False,
+            "execution_available": False,
+        }
+        self._store_reviewed_action_proposal(proposal, text)
+        return text
+
+    def _build_unknown_reviewed_action_proposal(self, prompt):
+        proposal_id = self._proposal_id("unknown_reviewed_action")
+        doc_title = _document_title(doc)
+        active_view_name = self._safe_active_view_name()
+        active_view_type = self._safe_active_view_type()
+        text = "\n".join(
+            [
+                "[REVIEWED ACTION PROPOSAL]",
+                "",
+                "Proposal ID:",
+                proposal_id,
+                "",
+                "Action:",
+                "Unknown reviewed action",
+                "",
+                "Status:",
+                "Proposal only / not executed",
+                "",
+                "Active document:",
+                doc_title,
+                "",
+                "Active view:",
+                "{0} [{1}]".format(active_view_name, active_view_type),
+                "",
+                "Preflight result:",
+                "No specific reviewed action could be classified from the prompt.",
+                "",
+                "Suggested supported proposal prompts:",
+                "- propose split selected pipes",
+                "- dry run split selected pipes",
+                "- propose tag selected MEP elements",
+                "- propose fill missing marks",
+                "- propose create QA snapshot",
+                "",
+                "Safety:",
+                "- Proposal only.",
+                "- Read-only.",
+                "- No transaction opened.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        proposal = {
+            "proposal_id": proposal_id,
+            "feature_id": "MEP-ACT-001",
+            "action_key": "unknown_reviewed_action",
+            "action_label": "Unknown reviewed action",
+            "source_prompt": safe_str(prompt),
+            "created_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": doc_title,
+            "document_path": self._safe_document_path(),
+            "active_view_name": active_view_name,
+            "active_view_type": active_view_type,
+            "scope": "active document only",
+            "eligible_count": 0,
+            "skipped_count": 0,
+            "warning_count": 0,
+            "proposed_next_command": "use a supported proposal prompt",
+            "proposal_status": "unknown_action",
+            "deterministic_route": True,
+            "read_only": True,
+            "model_modified": False,
+            "execution_available": False,
+        }
+        self._store_reviewed_action_proposal(proposal, text)
+        return text
+
+    def answer_reviewed_action_proposal_question(self, prompt):
+        action_key = self._reviewed_action_proposal_route(prompt)
+        if not action_key:
+            return None
+        if action_key == "split_selected_pipes":
+            return self._build_split_selected_pipes_proposal(prompt)
+        if action_key == "unknown_reviewed_action":
+            return self._build_unknown_reviewed_action_proposal(prompt)
+        return self._build_future_reviewed_action_proposal(prompt, action_key)
+
+    def _safe_document_path(self):
+        try:
+            path_name = doc.PathName
+            if path_name:
+                return safe_str(path_name)
+        except:
+            pass
+        return None
+
+    def _safe_active_view_name(self):
+        try:
+            if uidoc and uidoc.ActiveView:
+                return safe_str(uidoc.ActiveView.Name)
+        except:
+            pass
+        return "(unknown view)"
+
+    def _safe_active_view_type(self):
+        try:
+            if uidoc and uidoc.ActiveView:
+                return safe_str(uidoc.ActiveView.ViewType)
+        except:
+            pass
+        return "unknown"
+
+    def _write_utf8_file(self, path, text):
+        stream = codecs.open(path, "w", "utf-8")
+        try:
+            stream.write(safe_str(text))
+        finally:
+            stream.close()
+
+    def export_latest_qa_report(self, export_prompt):
+        if not self.latest_deterministic_report:
+            return "\n".join(
+                [
+                    "[QA REPORT EXPORT]",
+                    "No exportable deterministic report is available yet. Run a read-only report first.",
+                ]
+            )
+        if not self.latest_chat_output_is_deterministic_report:
+            return "\n".join(
+                [
+                    "[QA REPORT EXPORT]",
+                    "Latest output is not a deterministic AI Workbench QA report. Run a read-only deterministic report first.",
+                ]
+            )
+        report = self.latest_deterministic_report
+        report_text = report.get("report_text") or ""
+        if not self._is_exportable_report_text(report_text):
+            return "\n".join(
+                [
+                    "[QA REPORT EXPORT]",
+                    "Latest output is not a deterministic AI Workbench QA report. Run a read-only deterministic report first.",
+                ]
+            )
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        export_folder = os.path.join(self._qa_export_base_folder(), timestamp)
+        try:
+            if not os.path.isdir(export_folder):
+                os.makedirs(export_folder)
+        except Exception as exc:
+            return "\n".join(
+                [
+                    "[QA REPORT EXPORT]",
+                    "Export failed: {0}".format(str(exc)),
+                ]
+            )
+
+        doc_title = _document_title(doc)
+        active_view_name = self._safe_active_view_name()
+        active_view_type = self._safe_active_view_type()
+        header = report.get("report_header") or self._extract_report_header(report_text)
+        source_prompt = report.get("source_prompt") or ""
+        scope = report.get("report_scope") or self._detect_report_scope(report_text)
+        generated_files = ["report.md", "report.txt", "metadata.json", "artifact_manifest.txt"]
+
+        metadata = {
+            "feature_id": "MEP-RO-005",
+            "export_timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "document_title": doc_title,
+            "document_path": self._safe_document_path(),
+            "active_view_name": active_view_name,
+            "active_view_type": active_view_type,
+            "source_prompt": source_prompt,
+            "source_report_header": header,
+            "report_scope": scope,
+            "deterministic_route": True,
+            "read_only": True,
+            "model_modified": False,
+            "linked_documents_scanned": False,
+            "connector_traversal_used": False,
+            "geometry_extraction_used": False,
+            "export_folder": export_folder,
+            "generated_files": generated_files,
+        }
+
+        report_md = "\n".join(
+            [
+                "# AI Workbench QA Evidence Snapshot",
+                "",
+                "## Metadata",
+                "- Document: {0}".format(doc_title),
+                "- Active view: {0} [{1}]".format(active_view_name, active_view_type),
+                "- Export timestamp: {0}".format(metadata.get("export_timestamp_local")),
+                "- Source prompt: {0}".format(source_prompt),
+                "- Source report header: {0}".format(header),
+                "- Scope: {0}".format(scope),
+                "- Safety: read-only; no model data modified.",
+                "",
+                "## Report",
+                report_text,
+                "",
+            ]
+        )
+        report_txt = "\n".join(
+            [
+                "AI Workbench QA Evidence Snapshot",
+                "",
+                "Document: {0}".format(doc_title),
+                "Active view: {0} [{1}]".format(active_view_name, active_view_type),
+                "Export timestamp: {0}".format(metadata.get("export_timestamp_local")),
+                "Source prompt: {0}".format(source_prompt),
+                "Source report header: {0}".format(header),
+                "Scope: {0}".format(scope),
+                "Safety: read-only; no model data modified.",
+                "",
+                report_text,
+                "",
+            ]
+        )
+        manifest = "\n".join(
+            [
+                "AI Workbench QA Evidence Snapshot Manifest",
+                "Feature: MEP-RO-005",
+                "Export timestamp: {0}".format(metadata.get("export_timestamp_local")),
+                "Export folder: {0}".format(export_folder),
+                "",
+                "Generated files:",
+                "- report.md",
+                "- report.txt",
+                "- metadata.json",
+                "- artifact_manifest.txt",
+                "",
+                "Safety:",
+                "- Export only.",
+                "- Revit model data was not modified.",
+                "- Linked document internals, connector data, and geometry were not exported.",
+            ]
+        )
+
+        try:
+            self._write_utf8_file(os.path.join(export_folder, "report.md"), report_md)
+            self._write_utf8_file(os.path.join(export_folder, "report.txt"), report_txt)
+            metadata_path = os.path.join(export_folder, "metadata.json")
+            metadata_stream = codecs.open(metadata_path, "w", "utf-8")
+            try:
+                metadata_stream.write(json.dumps(metadata, indent=2, sort_keys=True))
+            finally:
+                metadata_stream.close()
+            self._write_utf8_file(os.path.join(export_folder, "artifact_manifest.txt"), manifest)
+        except Exception as exc:
+            return "\n".join(
+                [
+                    "[QA REPORT EXPORT]",
+                    "Export failed: {0}".format(str(exc)),
+                ]
+            )
+
+        index_result = self._write_qa_export_index_entry(metadata)
+        lines = [
+            "[QA REPORT EXPORT COMPLETE]",
+            "",
+            "Export folder:",
+            export_folder,
+            "",
+            "Generated files:",
+            "- report.md",
+            "- report.txt",
+            "- metadata.json",
+            "- artifact_manifest.txt",
+            "",
+            "Index:",
+        ]
+        if index_result.get("ok"):
+            lines.extend(
+                [
+                    "- qa_export_index.jsonl updated",
+                    "- qa_export_index.csv updated",
+                    "- latest_export.json updated",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Index warning:",
+                    "- {0}".format(index_result.get("warning") or "Index write failed."),
+                    "- Export files were still created.",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Source:",
+                "- prompt: {0}".format(source_prompt),
+                "- header: {0}".format(header),
+                "- document: {0}".format(doc_title),
+                "- active view: {0} [{1}]".format(active_view_name, active_view_type),
+                "",
+                "Safety:",
+                "- Export only.",
+                "- Revit model data was not modified.",
+            ]
+        )
+        return "\n".join(lines)
+
     def _context_tree_item(self, header, children=None):
         from System.Windows.Controls import TreeViewItem
 
@@ -9533,6 +15462,77 @@ class OllamaAIChat(forms.WPFWindow):
             return "empty (0 body rows)"
         return "unknown body row count"
 
+    def _coord_number(self, value, precision=3):
+        try:
+            return "{0:.{1}f}".format(float(value), int(precision))
+        except:
+            return "unknown"
+
+    def _coord_origin_text(self, item):
+        origin = item.get("origin_internal_feet") or {}
+        return "X={0}, Y={1}, Z={2}".format(
+            self._coord_number(origin.get("x")),
+            self._coord_number(origin.get("y")),
+            self._coord_number(origin.get("z")),
+        )
+
+    def _coord_rotation_text(self, item):
+        return "{0} deg".format(self._coord_number(item.get("rotation_z_degrees")))
+
+    def _link_load_status_text(self, item):
+        if item.get("loaded_readable") is True:
+            return "loaded"
+        if item.get("status_label") == "UNLOADED" or "unloaded_or_unavailable_link" in (item.get("coordinate_flags") or []):
+            return "unloaded"
+        return "unavailable"
+
+    def _coord_transform_text(self, item):
+        if item.get("close_to_identity") is True:
+            return "identity / near identity"
+        if item.get("close_to_identity") is False:
+            return "non-identity"
+        return "unknown"
+
+    def _coord_reason_list(self, item):
+        flags = item.get("coordinate_flags") or []
+        reason_map = {
+            "unloaded_or_unavailable_link": "link document is not readable",
+            "non_identity_transform": "transform differs from identity",
+            "z_offset_detected": "Z offset detected",
+            "rotated_link_detected": "rotation around Z detected",
+            "duplicate_link_instances": "duplicate link type/instance detected",
+            "unknown_coordinate_state": "coordinate state could not be read",
+            "basis_not_orthonormal": "basis vectors are not orthonormal",
+        }
+        return [reason_map.get(flag, flag.replace("_", " ")) for flag in flags] or ["none"]
+
+    def _coordinate_health_counts(self, health):
+        links = health.get("links", []) if isinstance(health, dict) else []
+        counts = {"OK": 0, "REVIEW": 0, "UNLOADED": 0, "UNKNOWN": 0}
+        for item in links:
+            label = item.get("status_label") or "UNKNOWN"
+            counts[label] = counts.get(label, 0) + 1
+        return counts
+
+    def _coordinate_health_main_flags(self, health):
+        flags = []
+        for item in (health.get("links", []) if isinstance(health, dict) else []):
+            flags.extend(item.get("coordinate_flags") or [])
+        unique = sorted(set(flags))
+        return unique or ["none"]
+
+    def _coordinate_health_reason_summary(self, health):
+        if not isinstance(health, dict):
+            return "Linked model coordinate health was not scanned."
+        return "status {0}; links {1}; review {2}; unloaded {3}; unknown {4}; flags {5}".format(
+            health.get("overall_status", "unknown"),
+            health.get("total_links", 0),
+            self._coordinate_health_counts(health).get("REVIEW", 0),
+            health.get("unavailable_count", 0),
+            self._coordinate_health_counts(health).get("UNKNOWN", 0),
+            ", ".join(self._coordinate_health_main_flags(health)),
+        )
+
     def _issue_suggested_action(self, issue_id):
         mapping = {
             "ambiguous_level_names": "Use exact level names in level-targeted schedule prompts.",
@@ -9543,6 +15543,19 @@ class OllamaAIChat(forms.WPFWindow):
             "rotated_link_detected": "Review rotated link transforms before coordination checks.",
             "duplicate_link_instances": "Review duplicate link instances/types before coordination work.",
             "unknown_coordinate_state": "Review links with unreadable coordinate state before relying on alignment assumptions.",
+            "host_duplicate_level_names": "Review duplicate host level names before BIM Basis / ILS-style exchanges.",
+            "linked_duplicate_level_names": "Review duplicate linked level names with the model author.",
+            "linked_level_elevation_mismatch": "Review level elevation deltas against the project BIM Basis / ILS rules.",
+            "linked_level_missing_in_host": "Review linked-only levels before coordination or schedule filtering.",
+            "host_level_missing_in_link": "Review host levels missing from linked models with the coordination team.",
+            "linked_level_possible_name_mismatch": "Review level naming consistency for levels with matching elevations.",
+            "host_duplicate_grid_names": "Review duplicate host grid names before coordination.",
+            "linked_duplicate_grid_names": "Review duplicate linked grid names with the model author.",
+            "linked_grid_missing_in_host": "Review linked-only grids before coordination.",
+            "host_grid_missing_in_link": "Review host grids missing from linked models with the coordination team.",
+            "linked_grid_geometry_mismatch": "Review grid geometry offsets/angles manually before coordination.",
+            "linked_grid_geometry_unknown": "Review non-linear or unknown grid geometry manually.",
+            "level_grid_scan_partial": "Run Scan Project with accessible loaded links or review skipped links manually.",
             "cad_imports_present": "Run read-only active-view health checks before coordination work.",
             "view_specific_imports_present": "Inspect view-specific imports before relying on sheet/view outputs.",
             "empty_or_suspicious_schedules": "Use Show Schedules or Empty / Suspicious Schedules before template-backed actions.",
@@ -9579,7 +15592,8 @@ class OllamaAIChat(forms.WPFWindow):
         links = context.get("links", {})
         imports = context.get("imports_cad", {})
         schedules = context.get("schedules", {})
-        coord_health = context.get("linked_model_coordinate_health", {})
+        coord_health = _get_linked_model_coordinate_health(context)
+        level_grid_health = _get_host_link_level_grid_health(context)
         selection = context.get("selection", {})
         warnings = context.get("warnings_summary", {})
         issues = context.get("detected_issues", [])
@@ -9700,29 +15714,119 @@ class OllamaAIChat(forms.WPFWindow):
             )
         )
         for item in coord_health.get("links", [])[:PROJECT_CONTEXT_MAX_ITEMS] if isinstance(coord_health, dict) else []:
-            flags = item.get("coordinate_flags") or []
-            origin = item.get("origin_internal_feet") or {}
-            origin_display = item.get("origin_display") or {}
+            reasons = self._coord_reason_list(item)
+            load_status = self._link_load_status_text(item)
+            duplicate_text = "yes ({0})".format(item.get("duplicate_type_instance_count")) if item.get("duplicate_type_instance_count", 0) and item.get("duplicate_type_instance_count", 0) > 1 else "no"
             coord_children.append(
                 self._context_tree_item(
-                    "{0} [{1}]".format(item.get("display_name") or item.get("type_name") or item.get("instance_name"), item.get("status_label", "UNKNOWN")),
+                    "{0} [{1}] [{2}]".format(
+                        item.get("display_name") or item.get("type_name") or item.get("instance_name"),
+                        load_status,
+                        item.get("status_label", "UNKNOWN"),
+                    ),
                     [
                         "instance: {0} (id {1})".format(item.get("instance_name"), item.get("instance_id")),
                         "type: {0} (id {1})".format(item.get("type_name"), item.get("type_id")),
+                        "loaded/unloaded/unavailable: {0}".format(load_status),
                         "linked document: {0}".format(item.get("linked_document_title") or "not loaded/not scanned"),
                         "pinned: {0}".format(item.get("pinned")),
                         "path: {0}".format(item.get("path_info") or "<path not available>"),
-                        "origin internal ft: X={0}, Y={1}, Z={2}".format(origin.get("x"), origin.get("y"), origin.get("z")),
-                        "origin display: X={0}, Y={1}, Z={2}".format(origin_display.get("x"), origin_display.get("y"), origin_display.get("z")),
-                        "rotation Z: {0} deg".format(item.get("rotation_z_degrees")),
-                        "transform: {0}".format("identity" if item.get("close_to_identity") is True else "non-identity/unknown"),
+                        "origin internal ft: {0}".format(self._coord_origin_text(item)),
+                        "rotation Z: {0}".format(self._coord_rotation_text(item)),
+                        "transform: {0}".format(self._coord_transform_text(item)),
+                        "Z offset flag: {0}".format("yes" if "z_offset_detected" in (item.get("coordinate_flags") or []) else "no"),
                         "basis orthonormal: {0}".format(item.get("basis_orthonormal")),
-                        "coordinate flags: {0}".format(", ".join(flags) if flags else "none"),
+                        "duplicate link/type: {0}".format(duplicate_text),
+                        "final status: {0}".format(item.get("status_label", "UNKNOWN")),
+                        "reasons: {0}".format("; ".join(reasons)),
                     ],
                 )
             )
         self.ProjectContextTree.Items.Add(
             self._context_tree_item("Links / Coordinate Health", coord_children)
+        )
+
+        lg_children = [
+            "Profile: {0}".format(level_grid_health.get("profile", "Configurable BIM Basis / ILS-style")),
+            "Level elevation tolerance: {0} mm".format(level_grid_health.get("level_elevation_tolerance_mm", LEVEL_ELEVATION_TOLERANCE_MM)),
+            "Grid offset tolerance: {0} mm".format(level_grid_health.get("grid_linear_offset_tolerance_mm", GRID_LINEAR_OFFSET_TOLERANCE_MM)),
+            "Grid angle tolerance: {0} deg".format(level_grid_health.get("grid_angle_tolerance_degrees", GRID_ANGLE_TOLERANCE_DEG)),
+            "Host level count: {0}".format(level_grid_health.get("host_level_count", "not scanned")),
+            "Host grid count: {0}".format(level_grid_health.get("host_grid_count", "not scanned")),
+            "Links compared: {0}".format(level_grid_health.get("links_compared_count", 0)),
+            "Links skipped/inaccessible: {0}".format(level_grid_health.get("links_skipped_count", 0)),
+            "Overall status: {0}".format(level_grid_health.get("overall_status", "not scanned")),
+            "Status meaning: {0}".format((level_grid_health.get("status_wording") or {}).get(level_grid_health.get("overall_status"), "not scanned")),
+        ]
+        if level_grid_health.get("host_grid_basis_limited"):
+            lg_children.append("Host contains no grids; linked grid comparison is basis-dependent.")
+            lg_children.append("If grids are intentionally maintained in the architectural/structural link, this is not necessarily an error.")
+        lg_children.append(
+            self._context_tree_item(
+                "Level findings summary",
+                [
+                    "host duplicate names: {0}".format(len(level_grid_health.get("host_duplicate_level_names", []) or [])),
+                    "all level findings: {0}".format(level_grid_health.get("level_findings_count", 0)),
+                    "by type: {0}".format(_format_level_grid_type_counts(level_grid_health.get("level_findings_by_type") or {})),
+                    "sample affected levels: {0}".format("; ".join([name for row in _aggregate_level_grid_findings(level_grid_health.get("level_findings") or [], 5) for name in row.get("sample_names", [])][:8]) or "none"),
+                ],
+            )
+        )
+        lg_children.append(
+            self._context_tree_item(
+                "Grid findings summary",
+                [
+                    "host duplicate names: {0}".format(len(level_grid_health.get("host_duplicate_grid_names", []) or [])),
+                    "all grid findings: {0}".format(level_grid_health.get("grid_findings_count", 0)),
+                    "by type: {0}".format(_format_level_grid_type_counts(level_grid_health.get("grid_findings_by_type") or {})),
+                    "sample affected grids: {0}".format("; ".join([name for row in _aggregate_level_grid_findings(level_grid_health.get("grid_findings") or [], 5) for name in row.get("sample_names", [])][:8]) or "none"),
+                ],
+            )
+        )
+        top_links = level_grid_health.get("top_affected_links") or []
+        if top_links:
+            lg_children.append(
+                self._context_tree_item(
+                    "Top affected links",
+                    [
+                        "{0}: level findings {1}, grid findings {2} | {3}".format(
+                            item.get("link_name"),
+                            item.get("level_findings_count", 0),
+                            item.get("grid_findings_count", 0),
+                            item.get("issue_types", "none"),
+                        )
+                        for item in top_links[:8]
+                    ],
+                )
+            )
+        for link_row in level_grid_health.get("links_compared", [])[:PROJECT_CONTEXT_MAX_ITEMS] if isinstance(level_grid_health, dict) else []:
+            coord_status = "unknown"
+            for coord_link in coord_health.get("links", []) if isinstance(coord_health, dict) else []:
+                if coord_link.get("display_name") == link_row.get("linked_document_title") or coord_link.get("instance_name") == link_row.get("link_name"):
+                    coord_status = coord_link.get("status_label", "unknown")
+                    break
+            level_groups = _aggregate_level_grid_findings(link_row.get("level_findings") or [], 5)
+            grid_groups = _aggregate_level_grid_findings(link_row.get("grid_findings") or [], 5)
+            lg_children.append(
+                self._context_tree_item(
+                    "{0} [{1}]".format(link_row.get("link_name"), link_row.get("status", "UNKNOWN")),
+                    [
+                        "linked document: {0}".format(link_row.get("linked_document_title")),
+                        "coordinate-health status: {0}".format(coord_status),
+                        "levels: {0}".format(link_row.get("level_count")),
+                        "grids: {0}".format(link_row.get("grid_count")),
+                        "level findings: {0}".format(len(link_row.get("level_findings") or [])),
+                        "grid findings: {0}".format(len(link_row.get("grid_findings") or [])),
+                        "issue types: {0}".format(_link_level_grid_issue_types(link_row)),
+                        "sample levels: {0}".format("; ".join([name for row in level_groups for name in row.get("sample_names", [])][:5]) or "none"),
+                        "sample grids: {0}".format("; ".join([name for row in grid_groups for name in row.get("sample_names", [])][:5]) or "none"),
+                    ],
+                )
+            )
+        for skipped in level_grid_health.get("links_skipped", [])[:PROJECT_CONTEXT_MAX_ITEMS] if isinstance(level_grid_health, dict) else []:
+            lg_children.append("Skipped: {0} | {1}".format(skipped.get("link_name"), skipped.get("reason")))
+        self.ProjectContextTree.Items.Add(
+            self._context_tree_item("BIM Basis / Levels & Grids", lg_children)
         )
 
         import_children = [
@@ -9817,6 +15921,30 @@ class OllamaAIChat(forms.WPFWindow):
                 [self._context_tree_item("{0}: {1}".format(issue.get("id"), issue.get("message")), ["severity: {0}".format(issue.get("severity", "info")), "suggested next safe step: {0}".format(self._issue_suggested_action(issue.get("id")))]) for issue in issues[:10]] or ["No issues detected in scanned sections."],
             )
         )
+        onboarding = build_project_onboarding_checklist(context)
+        onboarding_children = [
+            "Overall status: {0}".format(onboarding.get("overall_status", "UNKNOWN")),
+            "Automation readiness: {0}".format(onboarding.get("automation_readiness_status", "UNKNOWN")),
+        ]
+        onboarding_children.append(
+            self._context_tree_item(
+                "Checklist sections",
+                [
+                    "{0} [{1}] - {2}".format(section.get("title"), section.get("status"), section.get("result"))
+                    for section in (onboarding.get("sections") or [])
+                ],
+            )
+        )
+        onboarding_children.append(
+            self._context_tree_item(
+                "Recommended next actions",
+                ["{0}. {1}".format(index + 1, action) for index, action in enumerate(onboarding.get("recommended_next_actions", [])[:8])] or ["No onboarding recommendations available."],
+            )
+        )
+        onboarding_children.append("Safety: read-only checklist; no model data was modified.")
+        self.ProjectContextTree.Items.Add(
+            self._context_tree_item("Project Onboarding", onboarding_children)
+        )
         self.ProjectContextTree.Items.Add(
             self._context_tree_item(
                 "Suggested Actions",
@@ -9888,7 +16016,9 @@ class OllamaAIChat(forms.WPFWindow):
         self._pump_ui()
         try:
             result = self.run_project_context_scan("standard")
-            self.append_chat_notice("PROJECT SCAN COMPLETE", result.get("summary", ""))
+            summary = result.get("summary", "")
+            self.remember_latest_deterministic_report("scan current project", summary)
+            self.append_chat_notice("PROJECT SCAN COMPLETE", summary)
             self.update_window_status("ready_to_execute", "Standard project scan complete")
         except Exception as exc:
             self.append_chat_notice("PROJECT SCAN FAILED", str(exc))
@@ -9898,46 +16028,111 @@ class OllamaAIChat(forms.WPFWindow):
             self.hide_busy()
             self._set_thinking("Thinking...")
 
+    def _normalize_context_prompt(self, prompt):
+        text = safe_str(prompt).lower().strip()
+        text = text.replace("&", " and ")
+        text = text.replace("/", " and ")
+        text = text.replace("\\", " and ")
+        text = re.sub(r"[-_]+", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
     def _is_scan_request(self, prompt):
-        text = (prompt or "").lower()
+        text = self._normalize_context_prompt(prompt)
         return text in ("scan current project", "refresh project context", "project context") or "scan current project" in text or "refresh project context" in text
 
     def _is_project_context_question(self, prompt):
-        text = (prompt or "").lower()
+        text = self._normalize_context_prompt(prompt)
         triggers = [
             "summarize current project",
             "what is in this revit model",
+            "summary",
             "what links are loaded",
             "what linked models are loaded",
             "list revit links",
             "show revit links",
+            "links",
             "check linked model coordinates",
             "linked model coordinate health",
+            "link coordinates",
             "are the links aligned",
             "do the linked models match coordinates",
             "check revit link transforms",
             "are any links unloaded",
             "coordinate health check",
             "project coordinates check",
+            "project onboarding checklist",
+            "project onboarding",
+            "onboarding",
+            "onboarding checklist",
+            "start project checklist",
+            "startup checklist",
+            "project startup checklist",
+            "bim startup checklist",
+            "project readiness",
+            "what should i check first when opening a project",
+            "what should i do first in this project",
+            "guide me through this project",
+            "project readiness check",
+            "automation readiness check",
+            "guided project startup plan",
+            "project startup plan",
+            "startup plan",
+            "create project startup plan",
+            "what should the agent do first",
+            "agent project plan",
+            "project diagnostic plan",
+            "check bim basis",
+            "bim basis ils check",
+            "iso style check",
+            "iso 19650 style check",
+            "bim basis",
+            "bim basis and levels and grids",
+            "compare host and linked levels",
+            "compare linked model levels",
+            "compare host and linked grids",
+            "compare linked model grids",
+            "compare host and linked levels and grids",
+            "check levels and grids",
+            "levels and grids",
+            "levels grids",
+            "host link levels and grids",
+            "host vs linked levels",
+            "host vs linked grids",
+            "host vs linked model level grid check",
+            "are linked model levels aligned",
+            "are linked model grids aligned",
+            "level grid health check",
+            "host vs link level grid check",
             "what cad imports",
+            "cad and imports",
             "list cad imports",
             "show imports",
+            "imports",
             "what schedules",
             "list schedules",
             "show schedules",
+            "schedules",
             "empty schedules",
+            "empty and suspicious",
             "suspicious schedules",
             "template schedules",
             "list levels",
             "show levels",
+            "levels",
             "list views",
             "show views",
+            "views",
             "list sheets",
             "show sheets",
+            "sheets",
             "what categories",
             "show category counts",
+            "categories",
             "show warnings",
+            "warnings",
             "main bim issues",
+            "issues",
             "what should i check first",
             "what should i test first",
             "what should i inspect first",
@@ -9945,6 +16140,7 @@ class OllamaAIChat(forms.WPFWindow):
             "first checks",
             "recommended checks",
             "project first checks",
+            "recommended project checks",
             "project context",
             "loaded links",
             "ai-generated",
@@ -9960,61 +16156,109 @@ class OllamaAIChat(forms.WPFWindow):
         return self.get_latest_project_context(require_standard=(depth == "standard"))
 
     def _context_query_kind(self, prompt):
-        text = (prompt or "").strip().lower()
-        normalized = re.sub(r"\s+", " ", text)
+        normalized = self._normalize_context_prompt(prompt)
         exact = {
             "scan current project": "scan",
             "refresh project context": "scan",
             "summarize current project": "summary",
+            "summary": "summary",
             "project context": "summary",
+            "project onboarding checklist": "onboarding",
+            "project onboarding": "onboarding",
+            "onboarding": "onboarding",
+            "onboarding checklist": "onboarding",
+            "start project checklist": "onboarding",
+            "startup checklist": "onboarding",
+            "project startup checklist": "onboarding",
+            "bim startup checklist": "onboarding",
+            "project readiness": "onboarding",
+            "what should i check first when opening a project": "onboarding",
+            "what should i check first in this project": "onboarding",
+            "what should i test first in this project": "onboarding",
+            "what should i do first in this project": "onboarding",
+            "guide me through this project": "onboarding",
+            "project first checks": "onboarding",
+            "recommended project checks": "onboarding",
+            "project readiness check": "onboarding",
+            "automation readiness check": "onboarding",
+            "guided project startup plan": "guided_startup_plan",
+            "project startup plan": "guided_startup_plan",
+            "startup plan": "guided_startup_plan",
+            "create project startup plan": "guided_startup_plan",
+            "what should the agent do first": "guided_startup_plan",
+            "agent project plan": "guided_startup_plan",
+            "project diagnostic plan": "guided_startup_plan",
             "list levels": "levels",
             "show levels": "levels",
+            "levels": "levels",
             "list views": "views",
             "show views": "views",
+            "views": "views",
             "list sheets": "sheets",
             "show sheets": "sheets",
+            "sheets": "sheets",
             "what links are loaded": "links",
             "what linked models are loaded": "link_coordinate_health",
             "are any links unloaded": "link_coordinate_health",
             "list revit links": "links",
             "show revit links": "links",
+            "links": "links",
             "check linked model coordinates": "link_coordinate_health",
             "linked model coordinate health": "link_coordinate_health",
+            "link coordinates": "link_coordinate_health",
             "are the links aligned": "link_coordinate_health",
             "do the linked models match coordinates": "link_coordinate_health",
             "check revit link transforms": "link_coordinate_health",
             "coordinate health check": "link_coordinate_health",
             "project coordinates check": "link_coordinate_health",
+            "check bim basis": "level_grid_health",
+            "bim basis": "level_grid_health",
+            "bim basis and levels and grids": "level_grid_health",
+            "bim basis ils check": "level_grid_health",
+            "iso style check": "level_grid_health",
+            "iso 19650 style check": "level_grid_health",
+            "compare host and linked levels": "level_grid_health",
+            "compare linked model levels": "level_grid_health",
+            "compare host and linked grids": "level_grid_health",
+            "compare linked model grids": "level_grid_health",
+            "compare host and linked levels and grids": "level_grid_health",
+            "check levels and grids": "level_grid_health",
+            "levels and grids": "level_grid_health",
+            "levels grids": "level_grid_health",
+            "host link levels and grids": "level_grid_health",
+            "host vs linked levels": "level_grid_health",
+            "host vs linked grids": "level_grid_health",
+            "host vs linked model level grid check": "level_grid_health",
+            "are linked model levels aligned": "level_grid_health",
+            "are linked model grids aligned": "level_grid_health",
+            "level grid health check": "level_grid_health",
+            "host vs link level grid check": "level_grid_health",
             "what cad imports are in this model": "imports",
+            "cad and imports": "imports",
             "list cad imports": "imports",
             "show imports": "imports",
+            "imports": "imports",
             "what schedules exist": "schedules",
             "list schedules": "schedules",
             "show schedules": "schedules",
+            "schedules": "schedules",
             "show empty schedules": "empty_schedules",
             "show suspicious schedules": "empty_schedules",
+            "empty and suspicious": "empty_schedules",
             "show template schedules": "template_schedules",
             "what categories are in this model": "categories",
             "show category counts": "categories",
+            "categories": "categories",
             "what are the main bim issues": "issues",
             "show warnings": "warnings",
-            "what should i check first in this project": "first_checks",
-            "what should i test first in this project": "first_checks",
+            "warnings": "warnings",
+            "issues": "issues",
             "what should i inspect first": "first_checks",
             "where should i start": "first_checks",
             "first checks": "first_checks",
             "recommended checks": "first_checks",
-            "project first checks": "first_checks",
+            "project first checks": "onboarding",
             "summary": "summary",
-            "levels": "levels",
-            "views": "views",
-            "sheets": "sheets",
-            "links": "links",
-            "imports": "imports",
-            "categories": "categories",
-            "schedules": "schedules",
-            "warnings": "warnings",
-            "issues": "issues",
             "first checks": "first_checks",
             "empty schedules": "empty_schedules",
         }
@@ -10022,6 +16266,10 @@ class OllamaAIChat(forms.WPFWindow):
             return exact[normalized]
         if "scan current project" in normalized or "refresh project context" in normalized:
             return "scan"
+        if "project onboarding" in normalized or normalized == "onboarding" or "onboarding checklist" in normalized or "startup checklist" in normalized or "bim startup" in normalized or "project readiness" in normalized or "automation readiness" in normalized or "guide me through this project" in normalized or "what should i do first in this project" in normalized or "what should i check first when opening a project" in normalized or "what should i check first in this project" in normalized or "what should i test first in this project" in normalized or "recommended project checks" in normalized:
+            return "onboarding"
+        if "guided project startup plan" in normalized or "project startup plan" in normalized or normalized == "startup plan" or "create project startup plan" in normalized or "what should the agent do first" in normalized or "agent project plan" in normalized or "project diagnostic plan" in normalized:
+            return "guided_startup_plan"
         if "empty" in normalized and "schedule" in normalized:
             return "empty_schedules"
         if "suspicious" in normalized and "schedule" in normalized:
@@ -10032,6 +16280,8 @@ class OllamaAIChat(forms.WPFWindow):
             return "schedules"
         if ("coordinate" in normalized and ("link" in normalized or "project" in normalized)) or "link transform" in normalized or "links aligned" in normalized or "linked models match coordinates" in normalized or "links unloaded" in normalized or "linked models are loaded" in normalized:
             return "link_coordinate_health"
+        if "bim basis" in normalized or "ils check" in normalized or "iso style" in normalized or "iso 19650 style" in normalized or "level grid" in normalized or ("level" in normalized and "grid" in normalized) or ("linked model levels" in normalized) or ("linked model grids" in normalized) or ("host and linked levels" in normalized) or ("host and linked grids" in normalized):
+            return "level_grid_health"
         if "cad" in normalized or "import" in normalized:
             return "imports"
         if "link" in normalized:
@@ -10053,6 +16303,19 @@ class OllamaAIChat(forms.WPFWindow):
         if "summarize current project" in normalized or "what is in this revit model" in normalized:
             return "summary"
         return None
+
+    def _level_grid_query_focus(self, prompt):
+        text = (prompt or "").strip().lower()
+        normalized = re.sub(r"\s+", " ", text)
+        if "grid" in normalized and "level" not in normalized:
+            return "grids"
+        if "levels" in normalized and "grid" not in normalized:
+            return "levels"
+        if "linked model levels" in normalized or "host and linked levels" in normalized or "levels aligned" in normalized:
+            return "levels"
+        if "linked model grids" in normalized or "host and linked grids" in normalized or "grids aligned" in normalized:
+            return "grids"
+        return "both"
 
     def _format_context_levels(self, context):
         levels = context.get("levels", {})
@@ -10142,34 +16405,157 @@ class OllamaAIChat(forms.WPFWindow):
         return "\n".join(lines)
 
     def _format_link_coordinate_health(self, context):
-        health = context.get("linked_model_coordinate_health", {}) or {}
+        health = _get_linked_model_coordinate_health(context)
+        counts = self._coordinate_health_counts(health)
         lines = [
-            "[LINKED MODEL COORDINATE HEALTH]",
-            "Total links: {0}".format(health.get("total_links", 0)),
-            "Loaded/readable: {0}".format(health.get("loaded_readable_count", 0)),
-            "Unavailable: {0}".format(health.get("unavailable_count", 0)),
-            "Non-identity transforms: {0}".format(health.get("non_identity_transform_count", 0)),
-            "Rotated links: {0}".format(health.get("rotated_link_count", 0)),
-            "Z-offset links: {0}".format(health.get("z_offset_link_count", 0)),
-            "Duplicate link instances: {0}".format(health.get("duplicate_link_instance_count", 0)),
-            "Overall status: {0}".format(health.get("overall_status", "not scanned")),
+            "[LINK COORDINATE HEALTH]",
+            "",
+            "Summary",
+            "- Links scanned: {0}".format(health.get("total_links", 0)),
+            "- Loaded: {0}".format(health.get("loaded_readable_count", 0)),
+            "- Unloaded/unavailable: {0}".format(health.get("unavailable_count", 0)),
+            "- OK: {0}".format(counts.get("OK", 0)),
+            "- Review: {0}".format(counts.get("REVIEW", 0)),
+            "- Unknown: {0}".format(counts.get("UNKNOWN", 0)),
+            "- Non-identity transforms: {0}".format(health.get("non_identity_transform_count", 0)),
+            "- Rotated links: {0}".format(health.get("rotated_link_count", 0)),
+            "- Z-offset links: {0}".format(health.get("z_offset_link_count", 0)),
+            "- Duplicate link instances/types: {0}".format(health.get("duplicate_link_instance_count", 0)),
+            "- Overall status: {0}".format(health.get("overall_status", "not scanned")),
             "",
         ]
         links = health.get("links", []) or []
         suspicious = [item for item in links if item.get("status_label") != "OK"]
-        if suspicious:
-            lines.append("[LINKS TO REVIEW]")
-            for item in suspicious[:10]:
+        if links and not suspicious:
+            lines.append("Links")
+            lines.append("All sampled links are currently marked OK by the deterministic transform checks.")
+            lines.append("Full per-link origin/rotation details remain available in Project Context > Links / Coordinate Health.")
+        elif links:
+            ordered = suspicious + [item for item in links if item.get("status_label") == "OK"]
+            lines.append("Links")
+            for index, item in enumerate(ordered[:10]):
+                reasons = self._coord_reason_list(item)
                 flags = item.get("coordinate_flags") or []
-                origin = item.get("origin_display") or {}
-                lines.append("- {0} [{1}] | flags: {2}".format(item.get("display_name") or item.get("type_name") or item.get("instance_name"), item.get("status_label", "UNKNOWN"), ", ".join(flags) if flags else "none"))
-                lines.append("  origin: X={0}, Y={1}, Z={2} | rotation Z: {3} deg".format(origin.get("x"), origin.get("y"), origin.get("z"), item.get("rotation_z_degrees")))
-                lines.append("  document: {0} | path: {1}".format(item.get("linked_document_title") or "not loaded/not scanned", item.get("path_info") or "<path not available>"))
-            if len(suspicious) > 10:
-                lines.append("More suspicious links are available in Project Context > Links / Coordinate Health.")
+                load_status = self._link_load_status_text(item)
+                lines.append("{0}. {1} [{2}] [{3}]".format(index + 1, item.get("display_name") or item.get("type_name") or item.get("instance_name"), load_status, item.get("status_label", "UNKNOWN")))
+                lines.append("   - Origin: {0}".format(self._coord_origin_text(item)))
+                lines.append("   - Rotation Z: {0}".format(self._coord_rotation_text(item)))
+                lines.append("   - Transform: {0}".format(self._coord_transform_text(item)))
+                if flags:
+                    lines.append("   - Flags: {0}".format(", ".join(flags)))
+                    lines.append("   - Suggested safe step: inspect link placement and coordinate setup manually.")
+                else:
+                    lines.append("   - Notes: no coordinate flags detected")
+                if item.get("status_label") in ("REVIEW", "UNLOADED", "UNKNOWN"):
+                    lines.append("   - Reasons: {0}".format("; ".join(reasons)))
+            if len(ordered) > 10:
+                lines.append("")
+                lines.append("More links are available in Project Context > Links / Coordinate Health.")
         else:
-            lines.append("No suspicious linked-model coordinate flags were found in the sampled context.")
-            lines.append("Full per-link transform details are available in Project Context > Links / Coordinate Health.")
+            lines.append("No link coordinate details were scanned. Run Scan Project first.")
+        lines.append("")
+        lines.append("Safety")
+        lines.append("- This is a read-only diagnostic.")
+        lines.append("- Linked-model placement and coordinate state were not changed.")
+        return "\n".join(lines)
+
+    def _format_level_grid_health(self, context, focus="both"):
+        health = _get_host_link_level_grid_health(context)
+        if not health:
+            return "\n".join(
+                [
+                    "[BIM BASIS / LEVELS & GRIDS]",
+                    "",
+                    "Level/grid health is not available; run standard Scan Project first.",
+                    "",
+                    "Safety",
+                    "- This is a read-only diagnostic.",
+                    "- No levels, grids, links, coordinates, or model data were modified.",
+                ]
+            )
+        lines = [
+            "[BIM BASIS / LEVELS & GRIDS]",
+            "",
+            "Summary",
+            "- Profile: {0}".format(health.get("profile", "Configurable BIM Basis / ILS-style")),
+            "- Note: project coordination diagnostic, not formal ISO 19650 certification.",
+            "- Overall status: {0}".format(health.get("overall_status", "UNKNOWN")),
+            "- Host levels: {0}".format(health.get("host_level_count", "not scanned")),
+            "- Host grids: {0}".format(health.get("host_grid_count", "not scanned")),
+            "- Links compared: {0}".format(health.get("links_compared_count", 0)),
+            "- Links skipped: {0}".format(health.get("links_skipped_count", 0)),
+            "- Level tolerance: {0} mm".format(health.get("level_elevation_tolerance_mm", LEVEL_ELEVATION_TOLERANCE_MM)),
+            "- Grid offset tolerance: {0} mm".format(health.get("grid_linear_offset_tolerance_mm", GRID_LINEAR_OFFSET_TOLERANCE_MM)),
+            "- Grid angle tolerance: {0} deg".format(health.get("grid_angle_tolerance_degrees", GRID_ANGLE_TOLERANCE_DEG)),
+        ]
+        status_text = (health.get("status_wording") or {}).get(health.get("overall_status"))
+        if status_text:
+            lines.append("- Status wording: {0}".format(status_text))
+        if health.get("host_grid_basis_limited"):
+            lines.append("- Grid basis note: Host contains no grids; linked grid comparison is basis-dependent.")
+            lines.append("- Coordination note: If grids are intentionally maintained in the architectural/structural link, this is not necessarily an error.")
+        lines.extend(["", "Compact Findings"])
+        if focus in ("both", "levels"):
+            lines.append("- Level findings by type: {0}".format(_format_level_grid_type_counts(health.get("level_findings_by_type") or {})))
+        if focus in ("both", "grids"):
+            lines.append("- Grid findings by type: {0}".format(_format_level_grid_type_counts(health.get("grid_findings_by_type") or {})))
+        top_links = health.get("top_affected_links") or []
+        if top_links:
+            lines.append("- Top affected links: {0}".format("; ".join([
+                "{0} (L{1}/G{2})".format(item.get("link_name"), item.get("level_findings_count", 0), item.get("grid_findings_count", 0))
+                for item in top_links[:5]
+            ])))
+        if focus in ("both", "levels"):
+            lines.extend(["", "Level Findings"])
+            lines.append("- Total: {0}".format(health.get("level_findings_count", 0)))
+            groups = _aggregate_level_grid_findings(health.get("level_findings") or [], 5)
+            for group in groups[:10]:
+                sample = ", ".join(group.get("sample_names") or [])
+                lines.append("  - {0} [{1}]: {2}{3}".format(group.get("type"), group.get("severity"), group.get("count"), " | samples: {0}".format(sample) if sample else ""))
+            if not groups:
+                lines.append("  - none")
+        if focus in ("both", "grids"):
+            lines.extend(["", "Grid Findings", "- Total: {0}".format(health.get("grid_findings_count", 0))])
+            groups = _aggregate_level_grid_findings(health.get("grid_findings") or [], 5)
+            for group in groups[:10]:
+                sample = ", ".join(group.get("sample_names") or [])
+                lines.append("  - {0} [{1}]: {2}{3}".format(group.get("type"), group.get("severity"), group.get("count"), " | samples: {0}".format(sample) if sample else ""))
+            if not groups:
+                lines.append("  - none")
+        lines.extend(["", "Per-Link Findings"])
+        link_rows = health.get("links_compared") or []
+        for index, link_row in enumerate(link_rows[:10]):
+            all_findings = (link_row.get("level_findings") or []) + (link_row.get("grid_findings") or [])
+            lines.append("{0}. {1} [{2}]".format(index + 1, link_row.get("link_name"), link_row.get("status", "UNKNOWN")))
+            lines.append("   - linked document: {0}".format(link_row.get("linked_document_title")))
+            if focus in ("both", "levels"):
+                level_groups = _aggregate_level_grid_findings(link_row.get("level_findings") or [], 5)
+                lines.append("   - Levels: {0} | level findings: {1}".format(link_row.get("level_count"), len(link_row.get("level_findings") or [])))
+                lines.append("   - Level issue types: {0}".format(_format_level_grid_type_counts(_level_grid_findings_by_type(link_row.get("level_findings") or []))))
+                lines.append("   - Sample levels: {0}".format(", ".join([name for row in level_groups for name in row.get("sample_names", [])][:5]) or "none"))
+            if focus in ("both", "grids"):
+                grid_groups = _aggregate_level_grid_findings(link_row.get("grid_findings") or [], 5)
+                lines.append("   - Grids: {0} | grid findings: {1}".format(link_row.get("grid_count"), len(link_row.get("grid_findings") or [])))
+                lines.append("   - Grid issue types: {0}".format(_format_level_grid_type_counts(_level_grid_findings_by_type(link_row.get("grid_findings") or []))))
+                lines.append("   - Sample grids: {0}".format(", ".join([name for row in grid_groups for name in row.get("sample_names", [])][:5]) or "none"))
+            if focus == "both" and not all_findings:
+                lines.append("   - Findings: none")
+        if len(link_rows) > 10:
+            lines.append("More per-link findings are available in Project Context > BIM Basis / Levels & Grids.")
+        skipped = health.get("links_skipped") or []
+        if skipped:
+            lines.append("")
+            lines.append("Skipped / Inaccessible Links")
+            for item in skipped[:8]:
+                lines.append("- {0}: {1}".format(item.get("link_name"), item.get("reason")))
+        lines.extend(
+            [
+                "",
+                "Safety",
+                "- This is a read-only diagnostic.",
+                "- No levels, grids, links, coordinates, or model data were modified.",
+            ]
+        )
         return "\n".join(lines)
 
     def _format_context_categories(self, context):
@@ -10301,6 +16687,246 @@ class OllamaAIChat(forms.WPFWindow):
             lines.append("{0}. {1}".format(index + 1, check))
         return "\n".join(lines)
 
+    def _format_project_onboarding_checklist(self, context):
+        depth = (context.get("scan_depth") or self.latest_project_context_scan_depth or "").lower()
+        if depth != "standard":
+            return "\n".join(
+                [
+                    "[PROJECT ONBOARDING CHECKLIST]",
+                    "",
+                    "Project onboarding checklist requires a standard Scan Project run.",
+                    "Current context depth: {0}".format(depth or "not scanned"),
+                    "",
+                    "Safety",
+                    "- This checklist is read-only.",
+                    "- No model data was modified.",
+                ]
+            )
+        return format_project_onboarding_checklist(build_project_onboarding_checklist(context))
+
+    def _active_view_report_kind(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        exact = {
+            "active view mep summary": ("summary", None),
+            "active view mep report": ("summary", None),
+            "count mep elements in active view": ("count", None),
+            "count mep in active view": ("count", None),
+            "report active view elements by category": ("category", None),
+            "active view category report": ("category", None),
+            "report active view elements by type": ("type", None),
+            "active view type report": ("type", None),
+            "active view qa report": ("qa", None),
+            "active view health check": ("qa", None),
+            "report missing parameters in active view": ("missing_parameters", None),
+            "missing parameters in active view": ("missing_parameters", None),
+            "active view missing parameters": ("missing_parameters", None),
+            "count pipes in active view": ("summary", "Piping"),
+            "report pipes in active view": ("summary", "Piping"),
+            "active view pipe report": ("summary", "Piping"),
+            "active view piping report": ("summary", "Piping"),
+            "count ducts in active view": ("summary", "HVAC"),
+            "report ducts in active view": ("summary", "HVAC"),
+            "active view duct report": ("summary", "HVAC"),
+            "active view hvac report": ("summary", "HVAC"),
+            "count electrical elements in active view": ("summary", "Electrical"),
+            "report electrical elements in active view": ("summary", "Electrical"),
+            "active view electrical report": ("summary", "Electrical"),
+        }
+        if normalized in exact:
+            return exact[normalized]
+        if "active view" not in normalized:
+            return None
+        if "missing" in normalized and "parameter" in normalized:
+            return ("missing_parameters", None)
+        if "category" in normalized and "report" in normalized:
+            return ("category", None)
+        if "type" in normalized and "report" in normalized:
+            return ("type", None)
+        if "qa report" in normalized or "health check" in normalized:
+            return ("qa", None)
+        if "pipe" in normalized or "piping" in normalized:
+            return ("summary", "Piping")
+        if "duct" in normalized or "hvac" in normalized:
+            return ("summary", "HVAC")
+        if "electrical" in normalized:
+            return ("summary", "Electrical")
+        if "mep" in normalized:
+            return ("summary", None)
+        return None
+
+    def answer_active_view_report_question(self, prompt):
+        route = self._active_view_report_kind(prompt)
+        if not route:
+            return None
+        mode, discipline = route
+        if mode == "missing_parameters":
+            return report_active_view_missing_parameters(doc, uidoc, discipline_filter=discipline)
+        return active_view_mep_report(doc, uidoc, mode=mode, discipline_filter=discipline)
+
+    def _system_assignment_report_route(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        exact = {
+            "selected mep system assignment report": ("selection", None),
+            "check selected mep systems": ("selection", None),
+            "selected system qa report": ("selection", None),
+            "selected elements system report": ("selection", None),
+            "report selected elements by system": ("selection", None),
+            "selected pipe system report": ("selection", "Piping"),
+            "check selected pipe systems": ("selection", "Piping"),
+            "selected duct system report": ("selection", "HVAC"),
+            "check selected duct systems": ("selection", "HVAC"),
+            "selected electrical system report": ("selection", "Electrical"),
+            "check selected electrical systems": ("selection", "Electrical"),
+            "selected circuit report": ("selection", "Electrical"),
+            "active view mep system assignment report": ("active_view", None),
+            "check active view mep systems": ("active_view", None),
+            "active view system qa report": ("active_view", None),
+            "report active view elements by system": ("active_view", None),
+            "count systems in active view": ("active_view", None),
+            "active view pipe system report": ("active_view", "Piping"),
+            "check pipe systems in active view": ("active_view", "Piping"),
+            "active view duct system report": ("active_view", "HVAC"),
+            "check duct systems in active view": ("active_view", "HVAC"),
+            "active view electrical system report": ("active_view", "Electrical"),
+            "check electrical systems in active view": ("active_view", "Electrical"),
+            "active view circuit report": ("active_view", "Electrical"),
+        }
+        if normalized in exact:
+            return exact[normalized]
+        if "system" not in normalized and "circuit" not in normalized:
+            return None
+        scope = None
+        if "selected" in normalized or "selection" in normalized:
+            scope = "selection"
+        elif "active view" in normalized:
+            scope = "active_view"
+        if not scope:
+            return None
+        discipline = None
+        if "pipe" in normalized or "piping" in normalized:
+            discipline = "Piping"
+        elif "duct" in normalized or "hvac" in normalized:
+            discipline = "HVAC"
+        elif "electrical" in normalized or "circuit" in normalized:
+            discipline = "Electrical"
+        return (scope, discipline)
+
+    def answer_system_assignment_report_question(self, prompt):
+        route = self._system_assignment_report_route(prompt)
+        if not route:
+            return None
+        scope, discipline = route
+        if scope == "selection":
+            return selected_mep_system_assignment_report(doc, uidoc, discipline_filter=discipline)
+        return active_view_mep_system_assignment_report(doc, uidoc, discipline_filter=discipline)
+
+    def _discipline_qa_report_route(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        exact = {
+            "selected discipline qa report": ("selection", None),
+            "selected mep qa rules report": ("selection", None),
+            "check selected mep qa rules": ("selection", None),
+            "selected piping qa report": ("selection", "Piping"),
+            "selected pipe qa report": ("selection", "Piping"),
+            "selected hvac qa report": ("selection", "HVAC"),
+            "selected duct qa report": ("selection", "HVAC"),
+            "selected electrical qa report": ("selection", "Electrical"),
+            "selected electrical circuit qa report": ("selection", "Electrical"),
+            "active view discipline qa report": ("active_view", None),
+            "active view mep qa rules report": ("active_view", None),
+            "check active view mep qa rules": ("active_view", None),
+            "active view piping qa report": ("active_view", "Piping"),
+            "active view pipe qa report": ("active_view", "Piping"),
+            "active view hvac qa report": ("active_view", "HVAC"),
+            "active view duct qa report": ("active_view", "HVAC"),
+            "active view electrical qa report": ("active_view", "Electrical"),
+            "active view electrical circuit qa report": ("active_view", "Electrical"),
+        }
+        if normalized in exact:
+            return exact[normalized]
+        if "qa" not in normalized and "rules" not in normalized:
+            return None
+        scope = None
+        if "selected" in normalized or "selection" in normalized:
+            scope = "selection"
+        elif "active view" in normalized:
+            scope = "active_view"
+        if not scope:
+            return None
+        discipline = None
+        if "pipe" in normalized or "piping" in normalized:
+            discipline = "Piping"
+        elif "duct" in normalized or "hvac" in normalized:
+            discipline = "HVAC"
+        elif "electrical" in normalized or "circuit" in normalized:
+            discipline = "Electrical"
+        return (scope, discipline)
+
+    def answer_discipline_qa_report_question(self, prompt):
+        route = self._discipline_qa_report_route(prompt)
+        if not route:
+            return None
+        scope, discipline = route
+        if scope == "selection":
+            return selected_discipline_qa_report(doc, uidoc, discipline_filter=discipline)
+        return active_view_discipline_qa_report(doc, uidoc, discipline_filter=discipline)
+
+    def _selection_report_kind(self, prompt):
+        normalized = self._normalize_context_prompt(prompt)
+        exact = {
+            "report selected elements by category": "category",
+            "selection category report": "category",
+            "selected elements by category": "category",
+            "report selection by category": "category",
+            "report selected elements by type": "type",
+            "selection type report": "type",
+            "selected elements by type": "type",
+            "report selection by type": "type",
+            "count selected elements": "count",
+            "count selection": "count",
+            "bim qa count selected elements": "count",
+            "health check selected elements": "health",
+            "health check selection": "health",
+            "selection health check": "health",
+            "report missing parameters from selection": "missing_parameters",
+            "report missing parameters from selected elements": "missing_parameters",
+            "missing parameters from selection": "missing_parameters",
+            "missing selected parameters": "missing_parameters",
+        }
+        if normalized in exact:
+            return exact[normalized]
+        if "selected elements" in normalized and "category" in normalized:
+            return "category"
+        if "selection" in normalized and "category" in normalized and "report" in normalized:
+            return "category"
+        if "selected elements" in normalized and "type" in normalized:
+            return "type"
+        if "selection" in normalized and "type" in normalized and "report" in normalized:
+            return "type"
+        if ("count" in normalized and "selected elements" in normalized) or normalized == "count selection":
+            return "count"
+        if ("health check" in normalized and "selected" in normalized) or normalized == "selection health check" or normalized == "health check selection":
+            return "health"
+        if "missing" in normalized and "parameter" in normalized and ("selection" in normalized or "selected" in normalized):
+            return "missing_parameters"
+        return None
+
+    def answer_selection_report_question(self, prompt):
+        kind = self._selection_report_kind(prompt)
+        if not kind:
+            return None
+        if kind == "category":
+            return report_selected_elements_by_category(doc, uidoc)
+        if kind == "type":
+            return report_selected_elements_by_type(doc, uidoc)
+        if kind == "count":
+            return count_selected_elements(doc, uidoc)
+        if kind == "health":
+            return health_check_selected_elements(doc, uidoc)
+        if kind == "missing_parameters":
+            return report_missing_parameters_from_selection(doc, uidoc)
+        return None
+
     def deterministic_project_context_answer(self, prompt):
         kind = self._context_query_kind(prompt)
         if not kind:
@@ -10308,9 +16934,24 @@ class OllamaAIChat(forms.WPFWindow):
         if kind == "scan":
             result = self.run_project_context_scan("standard")
             return result.get("summary", "")
-        context = self.get_latest_project_context(require_standard=True)
+        context = self.get_latest_project_context(require_standard=False)
+        context_depth = (context.get("scan_depth") or self.latest_project_context_scan_depth or "").lower()
+        standard_required = kind in ("onboarding", "guided_startup_plan", "link_coordinate_health", "level_grid_health")
+        if standard_required and context_depth != "standard":
+            return "\n".join(
+                [
+                    "[PROJECT CONTEXT]",
+                    "",
+                    "Run Scan Project first for full project-context diagnostics.",
+                    "Current context depth: {0}".format(context_depth or "not scanned"),
+                ]
+            )
         if kind == "summary":
-            return self.get_latest_project_context_summary(require_standard=True)
+            return _summarize_project_context(context)
+        if kind == "onboarding":
+            return self._format_project_onboarding_checklist(context)
+        if kind == "guided_startup_plan":
+            return format_guided_project_startup_plan(build_guided_project_startup_plan(context))
         if kind == "levels":
             return self._format_context_levels(context)
         if kind == "views":
@@ -10321,6 +16962,8 @@ class OllamaAIChat(forms.WPFWindow):
             return self._format_context_links(context)
         if kind == "link_coordinate_health":
             return self._format_link_coordinate_health(context)
+        if kind == "level_grid_health":
+            return self._format_level_grid_health(context, self._level_grid_query_focus(prompt))
         if kind == "imports":
             return self._format_context_imports(context)
         if kind == "categories":
@@ -10388,14 +17031,24 @@ class OllamaAIChat(forms.WPFWindow):
                 item["recommendation_reason"] = reason
                 recommendations.append(item)
 
-        if "aco_bunge_templates_present" in issues:
-            add("create-aco-pipe-fitting-summary-from-template", "ACO/Bunge template-like schedules were observed; this reviewed summary action has runtime evidence.")
-        if "empty_or_suspicious_schedules" in issues:
-            add("scan-current-project", "Suspicious or empty schedule candidates were observed; keep inspection read-only before using schedule templates.")
+        onboarding = build_project_onboarding_checklist(context)
+        if onboarding:
+            add("project-onboarding-checklist", "Start with the deterministic project onboarding checklist. Overall status {0}; automation readiness {1}.".format(onboarding.get("overall_status", "UNKNOWN"), onboarding.get("automation_readiness_status", "UNKNOWN")))
+        if any(flag in issues for flag in ["host_duplicate_level_names", "linked_duplicate_level_names", "linked_level_elevation_mismatch", "linked_level_missing_in_host", "host_level_missing_in_link", "linked_level_possible_name_mismatch", "host_duplicate_grid_names", "linked_duplicate_grid_names", "linked_grid_missing_in_host", "host_grid_missing_in_link", "linked_grid_geometry_mismatch", "linked_grid_geometry_unknown", "level_grid_scan_partial"]):
+            level_grid = _get_host_link_level_grid_health(context)
+            add("check-bim-basis-level-grid-health", "BIM Basis / Levels & Grids review. status {0}; level findings {1}; grid findings {2}; links compared {3}.".format(level_grid.get("overall_status", "unknown"), level_grid.get("level_findings_count", 0), level_grid.get("grid_findings_count", 0), level_grid.get("links_compared_count", 0)))
+        if any(flag in issues for flag in ["unloaded_or_unavailable_link", "non_identity_link_transform", "link_z_offset_detected", "rotated_link_detected", "duplicate_link_instances", "unknown_coordinate_state"]):
+            add("check-linked-model-coordinate-health", "Review linked model coordinate health. {0}".format(self._coordinate_health_reason_summary(_get_linked_model_coordinate_health(context))))
         if "unloaded_or_unavailable_revit_links" in issues:
             add("scan-current-project", "Unloaded or unavailable Revit links were observed; use the context scan before coordination decisions.")
-        if any(flag in issues for flag in ["unloaded_or_unavailable_link", "non_identity_link_transform", "link_z_offset_detected", "rotated_link_detected", "duplicate_link_instances", "unknown_coordinate_state"]):
-            add("check-linked-model-coordinate-health", "Linked model coordinate health flags were observed; run the read-only coordinate health check before coordination work.")
+        if "cad_imports_present" in issues or "view_specific_imports_present" in issues:
+            add("health-check-active-view-selection", "CAD/import or active-view coordination issues were observed; run a read-only active-view health check.")
+        if context.get("warnings_summary", {}).get("total_warning_count", 0):
+            add("scan-current-project", "Revit warnings were observed; review warning groups before production schedule/template actions.")
+        if "empty_or_suspicious_schedules" in issues:
+            add("scan-current-project", "Suspicious or empty schedule candidates were observed; keep inspection read-only before using schedule templates.")
+        if "aco_bunge_templates_present" in issues:
+            add("create-aco-pipe-fitting-summary-from-template", "ACO/Bunge template-like schedules were observed; schedule/template actions should come after read-only diagnostics.")
         for item in categories:
             if item.get("category") == "Pipes" and isinstance(item.get("total_count"), int) and item.get("total_count") > 0:
                 add("create-pipe-schedule-by-level", "Pipes were found in the project context.")
@@ -10408,8 +17061,6 @@ class OllamaAIChat(forms.WPFWindow):
             add("report-selected-elements-by-category", "An active-document selection is present.")
         else:
             add("health-check-active-view-selection", "No active-document selection is present; start with active-view read-only health checks.")
-        if "cad_imports_present" in issues or "view_specific_imports_present" in issues:
-            add("health-check-active-view-selection", "CAD/import or active-view coordination issues were observed; run a read-only active-view health check.")
         if not recommendations:
             add("health-check-active-view-selection", "Use a read-only active-view health check as a first reviewed inspection.")
         deduped = []
@@ -10423,7 +17074,22 @@ class OllamaAIChat(forms.WPFWindow):
 
     def build_project_agent_plan(self):
         context = self.get_latest_project_context(require_standard=True)
-        recommendations = self._recommended_project_actions_from_context(context)
+        guided_plan = build_guided_project_startup_plan(context)
+        recommendations = []
+        seen_action_keys = set()
+        for step in guided_plan.get("steps", []):
+            action_key = step.get("action_key")
+            if not action_key or action_key in seen_action_keys:
+                continue
+            entry = self.catalog.get_entry_by_id(action_key)
+            if not entry:
+                continue
+            item = dict(entry)
+            item["recommendation_reason"] = step.get("reason", "")
+            item["guided_phase"] = step.get("phase", "")
+            item["guided_action_type"] = step.get("action_type", "")
+            recommendations.append(item)
+            seen_action_keys.add(action_key)
         self.agent_session.refresh_catalog(self.catalog.get_agent_commands())
         self.agent_session.reset()
         for entry in recommendations:
@@ -10443,6 +17109,7 @@ class OllamaAIChat(forms.WPFWindow):
             "context_depth": context.get("scan_depth"),
             "context_timestamp": context.get("timestamp_utc"),
             "context_document_title": (context.get("document") or {}).get("title"),
+            "guided_startup_plan": guided_plan,
         }
         self.agent_session.status = "ready_to_execute" if self.agent_session.plan else "failed"
         self.agent_session.message = "Ready to execute" if self.agent_session.plan else "No reviewed plan"
@@ -10461,7 +17128,11 @@ class OllamaAIChat(forms.WPFWindow):
                 doc_info.get("title", "(unknown document)"),
             )
         )
-        self.AgentHistory.AppendText("Observed context\n{0}\n".format(self.get_latest_project_context_summary(require_standard=True)))
+        guided_plan = plan_object.get("guided_startup_plan") or build_guided_project_startup_plan(context)
+        formatted_guided_plan = format_guided_project_startup_plan(guided_plan)
+        self.AgentHistory.AppendText("{0}\n".format(formatted_guided_plan))
+        self.remember_latest_deterministic_report("Ask Agent for Plan", formatted_guided_plan)
+        self.AgentHistory.AppendText("\nObserved context\n{0}\n".format(self.get_latest_project_context_summary(require_standard=True)))
         plan = self.agent_session.get_visible_steps()
         if plan:
             self.AgentHistory.AppendText("Recommended reviewed actions\n")
@@ -10505,7 +17176,10 @@ class OllamaAIChat(forms.WPFWindow):
         unknown = len([item for item in schedule_samples if not isinstance(item.get("body_row_count"), int)])
         warnings = context.get("warnings_summary", {})
         warning_count = warnings.get("total_warning_count", "not scanned")
-        coord_health = context.get("linked_model_coordinate_health", {})
+        coord_health = _get_linked_model_coordinate_health(context)
+        level_grid_health = _get_host_link_level_grid_health(context)
+        onboarding = build_project_onboarding_checklist(context)
+        guided_plan = build_guided_project_startup_plan(context)
         doc_title = doc_info.get("title") or self.latest_project_context_doc_title or _document_title(doc)
         active_view = "(unknown view)"
         try:
@@ -10513,8 +17187,9 @@ class OllamaAIChat(forms.WPFWindow):
         except:
             pass
         issue_text = observed_issue or "Runtime validation/export tooling for ModelMind actions."
-        return "\n".join(
-            [
+        coord_counts = self._coordinate_health_counts(coord_health)
+        flagged_links = [item for item in (coord_health.get("links", []) if isinstance(coord_health, dict) else []) if item.get("status_label") != "OK"]
+        brief_lines = [
                 "Codex Task Brief",
                 "",
                 "Current document: {0}".format(doc_title),
@@ -10528,16 +17203,41 @@ class OllamaAIChat(forms.WPFWindow):
                     unknown,
                 ),
                 "Warning count: {0}".format(warning_count),
-                "Linked coordinate health: links {0}, loaded {1}, unavailable {2}, non-identity {3}, rotated {4}, z-offset {5}, duplicate types {6}, status {7}".format(
-                    coord_health.get("total_links", "not scanned"),
-                    coord_health.get("loaded_readable_count", "not scanned"),
-                    coord_health.get("unavailable_count", "not scanned"),
-                    coord_health.get("non_identity_transform_count", "not scanned"),
-                    coord_health.get("rotated_link_count", "not scanned"),
-                    coord_health.get("z_offset_link_count", "not scanned"),
-                    coord_health.get("duplicate_link_instance_count", "not scanned"),
-                    coord_health.get("overall_status", "not scanned"),
-                ),
+                "Linked model coordinate health:",
+                "- Links scanned: {0}".format(coord_health.get("total_links", "not scanned")),
+                "- OK: {0}".format(coord_counts.get("OK", 0)),
+                "- Review: {0}".format(coord_counts.get("REVIEW", 0)),
+                "- Unloaded/unavailable: {0}".format(coord_health.get("unavailable_count", "not scanned")),
+                "- Unknown: {0}".format(coord_counts.get("UNKNOWN", 0)),
+                "- Main flags: {0}".format(", ".join(self._coordinate_health_main_flags(coord_health))),
+                "BIM Basis / Levels & Grids:",
+                "- Status: {0}".format(level_grid_health.get("overall_status", "not scanned")),
+                "- Links compared: {0}".format(level_grid_health.get("links_compared_count", "not scanned")),
+                "- Level findings: {0}".format(level_grid_health.get("level_findings_count", "not scanned")),
+                "- Grid findings: {0}".format(level_grid_health.get("grid_findings_count", "not scanned")),
+                "- Main issue flags: {0}".format(", ".join(level_grid_health.get("issue_flags", []) or ["none"])),
+                "Project onboarding:",
+                "- Overall status: {0}".format(onboarding.get("overall_status", "UNKNOWN")),
+                "- Automation readiness: {0}".format(onboarding.get("automation_readiness_status", "UNKNOWN")),
+                "- Top recommended next actions: {0}".format(" | ".join(onboarding.get("recommended_next_actions", [])[:3]) or "none"),
+                "- Blocking/review items: {0}".format(", ".join(onboarding.get("blocking_review_items", [])[:6]) or "none"),
+                "Guided Agent startup plan:",
+                "- Top phase 1 diagnostics: {0}".format(" | ".join([step.get("action_title") for step in (guided_plan.get("phase1") or [])[:3]]) or "none"),
+                "- Blocked/review items: {0}".format(" | ".join([step.get("action_title") for step in (guided_plan.get("blocked") or [])[:5]]) or "none"),
+                "- First reviewed automation candidate: {0}".format(next((step.get("action_title") for step in (guided_plan.get("phase3") or []) if step.get("action_key")), "none")),
+                "- Execution-safe / plan-only: {0}".format("yes" if guided_plan.get("execution_safe") and guided_plan.get("plan_only") else "unknown"),
+        ]
+        if flagged_links:
+            brief_lines.append("- Flagged links:")
+            for item in flagged_links[:8]:
+                brief_lines.append("  - {0}: {1}".format(item.get("display_name") or item.get("type_name") or item.get("instance_name"), "; ".join(self._coord_reason_list(item))))
+        flagged_lg_links = [item for item in (level_grid_health.get("links_compared", []) if isinstance(level_grid_health, dict) else []) if item.get("status") != "OK"]
+        if flagged_lg_links:
+            brief_lines.append("- Top flagged level/grid links:")
+            for item in flagged_lg_links[:8]:
+                brief_lines.append("  - {0}: level findings {1}, grid findings {2}".format(item.get("link_name"), len(item.get("level_findings") or []), len(item.get("grid_findings") or [])))
+        brief_lines.extend(
+            [
                 "",
                 "Latest scan summary:",
                 self.get_latest_project_context_summary(require_standard=True),
@@ -10569,6 +17269,7 @@ class OllamaAIChat(forms.WPFWindow):
                 "- parse AI.extension/lib/prompt_catalog.json",
             ]
         )
+        return "\n".join(brief_lines)
 
     def on_project_codex_brief(self, sender, args):
         brief = self.build_codex_task_brief()
@@ -10589,12 +17290,17 @@ class OllamaAIChat(forms.WPFWindow):
                 prompt = "summary"
         if prompt == "summary":
             prompt = "summarize current project"
+        elif prompt == "onboarding":
+            prompt = "project onboarding checklist"
         elif prompt == "empty schedules":
             prompt = "show empty schedules"
         elif prompt == "first checks":
             prompt = "what should I check first in this project"
+        elif prompt == "levels grids":
+            prompt = "check levels and grids"
         try:
             reply = self.answer_project_context_question(prompt)
+            self.remember_latest_deterministic_report(prompt, reply)
             self.append_chat_turn(prompt, reply, "PROJECT CONTEXT")
         except Exception as exc:
             self.append_chat_notice("PROJECT CONTEXT QUERY FAILED", str(exc))
@@ -10610,24 +17316,91 @@ class OllamaAIChat(forms.WPFWindow):
         self._pump_ui()
 
         try:
-            if self._is_codex_brief_request(prompt):
-                brief = self.build_codex_task_brief(prompt)
-                self.latest_codex_brief = brief
-                self.populate_project_context_tree()
-                reply = "```\n{0}\n```".format(brief)
-            elif self._is_scan_request(prompt):
-                result = self.run_project_context_scan("standard")
-                reply = result.get("summary", "")
-            elif self._is_project_context_question(prompt):
-                reply = self.answer_project_context_question(prompt)
-            elif "ask ai agent for a plan" in prompt.lower() or "agent plan" in prompt.lower():
-                self.append_project_agent_plan()
-                reply = "AI Agent project-context plan created. Review it in the AI Agent tab; no actions have been executed."
+            remember_report = False
+            preserve_latest_report_state = False
+            index_reply = self.answer_qa_export_index_question(prompt)
+            if index_reply is not None:
+                reply = index_reply
             else:
-                reply = send_ollama_chat(self.model, prompt)
-                reply = self._sanitize_ollama_context_error(reply)
+                split_verification_reply = self.answer_split_apply_verification_question(prompt)
+                if split_verification_reply is not None:
+                    reply = split_verification_reply
+                    remember_report = True
+                else:
+                    reviewed_apply_reply = self.answer_split_reviewed_apply_question(prompt)
+                    if reviewed_apply_reply is not None:
+                        reply = reviewed_apply_reply
+                        remember_report = True
+                    else:
+                        rollback_reply = self.answer_split_selected_pipes_rollback_test_question(prompt)
+                        if rollback_reply is not None:
+                            reply = rollback_reply
+                            remember_report = True
+                        else:
+                            guard_reply = self.answer_reviewed_action_confirmation_guard_question(prompt)
+                            if guard_reply is not None:
+                                reply = guard_reply
+                                remember_report = True
+                            else:
+                                split_dry_run_reply = self.answer_split_selected_pipes_dry_run_question(prompt)
+                                if split_dry_run_reply is not None:
+                                    reply = split_dry_run_reply
+                                    remember_report = True
+                                else:
+                                    proposal_reply = self.answer_reviewed_action_proposal_question(prompt)
+                                    if proposal_reply is not None:
+                                        reply = proposal_reply
+                                        remember_report = True
+                                    else:
+                                        if self._is_qa_export_request(prompt):
+                                            reply = self.export_latest_qa_report(prompt)
+                                            preserve_latest_report_state = True
+                                        elif self._is_codex_brief_request(prompt):
+                                            brief = self.build_codex_task_brief(prompt)
+                                            self.latest_codex_brief = brief
+                                            self.populate_project_context_tree()
+                                            reply = "```\n{0}\n```".format(brief)
+                                        elif self._is_scan_request(prompt):
+                                            result = self.run_project_context_scan("standard")
+                                            reply = result.get("summary", "")
+                                            remember_report = True
+                                        else:
+                                            discipline_qa_reply = self.answer_discipline_qa_report_question(prompt)
+                                            if discipline_qa_reply is not None:
+                                                reply = discipline_qa_reply
+                                                remember_report = True
+                                            else:
+                                                system_reply = self.answer_system_assignment_report_question(prompt)
+                                                if system_reply is not None:
+                                                    reply = system_reply
+                                                    remember_report = True
+                                                else:
+                                                    active_view_reply = self.answer_active_view_report_question(prompt)
+                                                    if active_view_reply is not None:
+                                                        reply = active_view_reply
+                                                        remember_report = True
+                                                    else:
+                                                        selection_reply = self.answer_selection_report_question(prompt)
+                                                        if selection_reply is not None:
+                                                            reply = selection_reply
+                                                            remember_report = True
+                                                        elif self._is_project_context_question(prompt):
+                                                            reply = self.answer_project_context_question(prompt)
+                                                            remember_report = True
+                                                        elif "ask ai agent for a plan" in prompt.lower() or "agent plan" in prompt.lower():
+                                                            self.append_project_agent_plan()
+                                                            reply = "AI Agent project-context plan created. Review it in the AI Agent tab; no actions have been executed."
+                                                            preserve_latest_report_state = True
+                                                        else:
+                                                            reply = send_ollama_chat(self.model, prompt)
+                                                            reply = self._sanitize_ollama_context_error(reply)
+                                                            self.latest_chat_output_is_deterministic_report = False
             if reply.startswith("Error:") and self.model != DEFAULT_MODEL:
                 reply += " Runtime note: this may reflect local model/runtime instability rather than a broken feature. Switching back to phi3:mini is recommended."
+            if remember_report:
+                self.remember_latest_deterministic_report(prompt, reply)
+            elif not preserve_latest_report_state:
+                self.latest_chat_output_is_deterministic_report = False
             self.append_chat_turn(prompt, reply, "AI")
             self.ChatInput.Text = ""
         except Exception as e:

@@ -13,6 +13,7 @@ class PromptCatalog(object):
         "HVAC",
         "Piping",
         "Electrical",
+        "BIM QA",
         "QA / BIM",
         "Selection / Categories",
         "Coordination / Spaces",
@@ -25,10 +26,19 @@ class PromptCatalog(object):
         "Piping",
         "Electrical",
         "Coordination / BIM",
+        "Project Onboarding",
         "Project Context",
         "Links / Imports",
         "AI Agent Planning",
         "Developer Briefs",
+        "Selection Reports",
+        "Evidence Export",
+        "Reviewed Action Verification",
+        "Reviewed Action Apply",
+        "Reviewed Action Rollback Tests",
+        "Reviewed Action Dry Runs",
+        "Reviewed Action Guards",
+        "Reviewed Action Proposals",
         "Pipes",
         "Ducts",
         "Electrical",
@@ -252,6 +262,22 @@ class PromptCatalog(object):
             return self.get_entry_by_id("electrical-qa-preset")
         if "coordination qa preset" in target or "bim qa preset" in target:
             return self.get_entry_by_id("coordination-bim-qa-preset")
+        if (
+            "project onboarding checklist" in target
+            or "onboarding checklist" in target
+            or "start project checklist" in target
+            or "project startup checklist" in target
+            or "bim startup checklist" in target
+            or "what should i check first when opening a project" in target
+            or "what should i check first in this project" in target
+            or "what should i do first in this project" in target
+            or "guide me through this project" in target
+            or "project first checks" in target
+            or "recommended project checks" in target
+            or "project readiness check" in target
+            or "automation readiness check" in target
+        ):
+            return self.get_entry_by_id("project-onboarding-checklist")
         if "scan current project" in target or target == "project context" or "scan this revit model" in target:
             return self.get_entry_by_id("scan-current-project")
         if "summarize current project" in target or "what is in this revit model" in target or "what is in this model" in target:
@@ -268,8 +294,97 @@ class PromptCatalog(object):
             or "project coordinates check" in target
         ):
             return self.get_entry_by_id("check-linked-model-coordinate-health")
-        if "ask ai agent for a plan" in target or "ask agent for project plan" in target or "what should i check first in this project" in target:
+        if (
+            "check bim basis" in target
+            or "bim basis ils check" in target
+            or "iso style check" in target
+            or "iso 19650 style check" in target
+            or "compare host and linked levels" in target
+            or "compare linked model levels" in target
+            or "compare host and linked grids" in target
+            or "compare linked model grids" in target
+            or "check levels and grids" in target
+            or "are linked model levels aligned" in target
+            or "are linked model grids aligned" in target
+            or "level grid health check" in target
+            or "host vs link level grid check" in target
+        ):
+            return self.get_entry_by_id("check-bim-basis-level-grid-health")
+        if "ask ai agent for a plan" in target or "ask agent for project plan" in target:
             return self.get_entry_by_id("ask-agent-for-project-plan")
+        if (
+            "guided project startup plan" in target
+            or "project startup plan" in target
+            or target == "startup plan"
+            or "create project startup plan" in target
+            or "what should the agent do first" in target
+            or "agent project plan" in target
+            or "project diagnostic plan" in target
+        ):
+            return self.get_entry_by_id("guided-project-startup-plan")
+        if (
+            "active view mep summary" in target
+            or "active view mep report" in target
+            or "count mep elements in active view" in target
+            or "count mep in active view" in target
+        ):
+            return self.get_entry_by_id("active-view-mep-summary")
+        if "report active view elements by category" in target or "active view category report" in target:
+            return self.get_entry_by_id("report-active-view-elements-by-category")
+        if "report active view elements by type" in target or "active view type report" in target:
+            return self.get_entry_by_id("report-active-view-elements-by-type")
+        if "active view qa report" in target or "active view health check" in target:
+            return self.get_entry_by_id("active-view-qa-report")
+        if "report missing parameters in active view" in target or "missing parameters in active view" in target or "active view missing parameters" in target:
+            return self.get_entry_by_id("report-missing-parameters-in-active-view")
+        if "count pipes in active view" in target or "report pipes in active view" in target or "active view pipe report" in target or "active view piping report" in target:
+            return self.get_entry_by_id("active-view-piping-report")
+        if "count ducts in active view" in target or "report ducts in active view" in target or "active view duct report" in target or "active view hvac report" in target:
+            return self.get_entry_by_id("active-view-hvac-report")
+        if "count electrical elements in active view" in target or "report electrical elements in active view" in target or "active view electrical report" in target:
+            return self.get_entry_by_id("active-view-electrical-report")
+        if "selected piping qa report" in target or "selected pipe qa report" in target:
+            return self.get_entry_by_id("selected-piping-qa-report")
+        if "active view piping qa report" in target or "active view pipe qa report" in target:
+            return self.get_entry_by_id("active-view-piping-qa-report")
+        if "selected hvac qa report" in target or "selected duct qa report" in target:
+            return self.get_entry_by_id("selected-hvac-qa-report")
+        if "active view hvac qa report" in target or "active view duct qa report" in target:
+            return self.get_entry_by_id("active-view-hvac-qa-report")
+        if "selected electrical qa report" in target or "selected electrical circuit qa report" in target:
+            return self.get_entry_by_id("selected-electrical-qa-report")
+        if "active view electrical qa report" in target or "active view electrical circuit qa report" in target:
+            return self.get_entry_by_id("active-view-electrical-qa-report")
+        if "selected discipline qa report" in target or "selected mep qa rules report" in target or "check selected mep qa rules" in target:
+            return self.get_entry_by_id("selected-discipline-qa-report")
+        if "active view discipline qa report" in target or "active view mep qa rules report" in target or "check active view mep qa rules" in target:
+            return self.get_entry_by_id("active-view-discipline-qa-report")
+        if "selected pipe system report" in target or "check selected pipe systems" in target:
+            return self.get_entry_by_id("selected-pipe-system-report")
+        if "active view pipe system report" in target or "check pipe systems in active view" in target:
+            return self.get_entry_by_id("active-view-pipe-system-report")
+        if "selected duct system report" in target or "check selected duct systems" in target:
+            return self.get_entry_by_id("selected-duct-system-report")
+        if "active view duct system report" in target or "check duct systems in active view" in target:
+            return self.get_entry_by_id("active-view-duct-system-report")
+        if "selected electrical system report" in target or "check selected electrical systems" in target or "selected circuit report" in target:
+            return self.get_entry_by_id("selected-electrical-system-report")
+        if "active view electrical system report" in target or "check electrical systems in active view" in target or "active view circuit report" in target:
+            return self.get_entry_by_id("active-view-electrical-system-report")
+        if "selected mep system assignment report" in target or "selected mep systems" in target or "selected system qa report" in target or "selected elements system report" in target or "report selected elements by system" in target:
+            return self.get_entry_by_id("selected-mep-system-assignment-report")
+        if "active view mep system assignment report" in target or "active view mep systems" in target or "active view system qa report" in target or "report active view elements by system" in target or "count systems in active view" in target:
+            return self.get_entry_by_id("active-view-mep-system-assignment-report")
+        if "count selected elements" in target or "selected element count" in target or "count current selection" in target or "how many elements are selected" in target or target == "selection count" or target == "count selection" or "bim qa count selected elements" in target:
+            return self.get_entry_by_id("count-selected-elements")
+        if "report selected elements by category" in target or "selected elements by category" in target or "selection category report" in target:
+            return self.get_entry_by_id("report-selected-elements-by-category")
+        if "report selected elements by type" in target or "selected elements by type" in target or "selection type report" in target:
+            return self.get_entry_by_id("report-selected-elements-by-type")
+        if "missing parameters from selection" in target or "missing parameters from selected elements" in target or "missing key parameters" in target:
+            return self.get_entry_by_id("report-missing-parameters-from-selection")
+        if "selection health check" in target or "health check selected elements" in target or "health check selection" in target:
+            return self.get_entry_by_id("health-check-active-view-selection")
         if "create codex task brief" in target or "generate developer task" in target or "prepare codex instruction" in target or "make implementation brief" in target:
             return self.get_entry_by_id("create-codex-task-brief")
         if "split" in target and "pipe" in target:
