@@ -1,9 +1,14 @@
 #define MyAppName "BIM3DNA Toolbar"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.2.1"
 #define MyPublisher "BIM3DNA"
 #define MyPublisherURL "https://bim3dna.nl/"
 #define MyExtensionName "BIM3DNA.extension"
-#define MyOutputBaseFilename "BIM3DNA_Toolbar_Installer_0.2.0"
+#define MyOutputBaseFilename "BIM3DNA_Toolbar_Installer_0.2.1"
+#if DirExists("qpdf")
+#define HasBundledQpdf "1"
+#else
+#define HasBundledQpdf "0"
+#endif
 
 [Setup]
 AppName={#MyAppName}
@@ -24,7 +29,8 @@ SetupLogging=yes
 
 [Files]
 ; Main BIM3DNA pyRevit extension
-Source: "BIM3DNA.extension\*"; DestDir: "{userappdata}\pyRevit\Extensions\BIM3DNA.extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "BIM3DNA.extension\*"; DestDir: "{userappdata}\pyRevit\Extensions\BIM3DNA.extension"; Excludes: "BIM3DNA.tab\QuickFix.panel\Create Print Set.pushbutton\create_print_set_pdf_config.json,Resources\RibbonArchive\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "BIM3DNA.extension\BIM3DNA.tab\QuickFix.panel\Create Print Set.pushbutton\create_print_set_pdf_config.json"; DestDir: "{userappdata}\pyRevit\Extensions\BIM3DNA.extension\BIM3DNA.tab\QuickFix.panel\Create Print Set.pushbutton"; Flags: ignoreversion onlyifdoesntexist skipifsourcedoesntexist
 
 ; AI runtime folders kept as siblings to the extension, matching current dev layout
 Source: "Model_Service\*"; DestDir: "{userappdata}\pyRevit\Extensions\Model_Service"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
@@ -32,6 +38,9 @@ Source: "Openai_Server\*"; DestDir: "{userappdata}\pyRevit\Extensions\Openai_Ser
 
 ; Optional bundled Ollama installer
 Source: "OllamaSetup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
+
+; Optional bundled portable qpdf for Create Print Set / PDF cleanup workflows
+Source: "qpdf\*"; DestDir: "{userappdata}\pyRevit\Extensions\BIM3DNA.extension\_runtime\qpdf"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; --------------------------------------------------------------------------
 ; OPTIONAL: only use these if these folders still exist OUTSIDE the extension
@@ -53,7 +62,10 @@ var
   OllamaPage: TInputOptionWizardPage;
   LocalInstallerPage: TInputQueryWizardPage;
   ModelPage: TInputOptionWizardPage;
-  BrowseButton: TNewButton;
+  QpdfPage: TInputOptionWizardPage;
+  QpdfBrowsePage: TInputQueryWizardPage;
+  OllamaBrowseButton: TNewButton;
+  QpdfBrowseButton: TNewButton;
 
 function OllamaExePath(): string;
 begin
@@ -260,6 +272,285 @@ begin
   );
 end;
 
+function ExtensionInstallDir(): string;
+begin
+  Result := ExpandConstant('{userappdata}\pyRevit\Extensions\{#MyExtensionName}');
+end;
+
+function ExternalToolsConfigPath(): string;
+begin
+  Result := ExpandConstant('{userappdata}\BIM3DNA\external_tools.json');
+end;
+
+function BundledQpdfExePath(): string;
+var
+  Candidate: string;
+begin
+  Candidate := ExtensionInstallDir() + '\_runtime\qpdf\bin\qpdf.exe';
+  if FileExists(Candidate) then
+  begin
+    Result := Candidate;
+    exit;
+  end;
+
+  Candidate := ExtensionInstallDir() + '\_runtime\qpdf\qpdf.exe';
+  if FileExists(Candidate) then
+  begin
+    Result := Candidate;
+    exit;
+  end;
+
+  Result := '';
+end;
+
+function IsBundledQpdfAvailable(): Boolean;
+begin
+  Result := BundledQpdfExePath() <> '';
+end;
+
+function TestQpdfExePath(const Path: string): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := False;
+  if (Path = '') or (not FileExists(Path)) then
+    exit;
+
+  Result := Exec(Path, '--version', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+function FindQpdfInFolderPattern(const Root, Prefix: string): string;
+var
+  FindRec: TFindRec;
+  Candidate: string;
+begin
+  Result := '';
+  if not DirExists(Root) then
+    exit;
+
+  if FindFirst(Root + '\' + Prefix + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+        begin
+          Candidate := Root + '\' + FindRec.Name + '\bin\qpdf.exe';
+          if TestQpdfExePath(Candidate) then
+          begin
+            Result := Candidate;
+            exit;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function DetectQpdfOnPath(): string;
+var
+  ResultCode: Integer;
+  TempFile: string;
+  Output: AnsiString;
+  FirstLine: string;
+  BreakPos: Integer;
+begin
+  Result := '';
+  TempFile := ExpandConstant('{tmp}\bim3dna_where_qpdf.txt');
+  if Exec(ExpandConstant('{cmd}'), '/C where qpdf > "' + TempFile + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+  begin
+    if LoadStringFromFile(TempFile, Output) then
+    begin
+      FirstLine := Trim(String(Output));
+      BreakPos := Pos(#13, FirstLine);
+      if BreakPos = 0 then
+        BreakPos := Pos(#10, FirstLine);
+      if BreakPos > 0 then
+        FirstLine := Trim(Copy(FirstLine, 1, BreakPos - 1));
+      if FirstLine <> '' then
+      begin
+        if TestQpdfExePath(FirstLine) then
+          Result := FirstLine;
+      end;
+    end;
+  end;
+end;
+
+function DetectInstalledQpdfPath(): string;
+var
+  Candidate: string;
+begin
+  Candidate := 'C:\Program Files\qpdf\bin\qpdf.exe';
+  if TestQpdfExePath(Candidate) then
+  begin
+    Result := Candidate;
+    exit;
+  end;
+
+  Candidate := FindQpdfInFolderPattern('C:\Program Files', 'qpdf');
+  if Candidate <> '' then
+  begin
+    Result := Candidate;
+    exit;
+  end;
+
+  Candidate := 'C:\Program Files (x86)\qpdf\bin\qpdf.exe';
+  if TestQpdfExePath(Candidate) then
+  begin
+    Result := Candidate;
+    exit;
+  end;
+
+  Candidate := FindQpdfInFolderPattern('C:\Program Files (x86)', 'qpdf');
+  if Candidate <> '' then
+  begin
+    Result := Candidate;
+    exit;
+  end;
+
+  Result := DetectQpdfOnPath();
+end;
+
+function JsonEscape(const Value: string): string;
+var
+  S: string;
+begin
+  S := Value;
+  StringChangeEx(S, '\', '\\', True);
+  StringChangeEx(S, '"', '\"', True);
+  Result := S;
+end;
+
+procedure WriteQpdfConfig(const Path: string);
+var
+  ConfigDir: string;
+  Content: string;
+begin
+  if Path = '' then
+    exit;
+
+  ConfigDir := ExtractFileDir(ExternalToolsConfigPath());
+  if not DirExists(ConfigDir) then
+    ForceDirectories(ConfigDir);
+
+  Content :=
+    '{' + #13#10 +
+    '  "qpdf_path": "' + JsonEscape(Path) + '",' + #13#10 +
+    '  "qpdf_configured_by": "BIM3DNA Toolbar Installer",' + #13#10 +
+    '  "qpdf_configured_at": "installer"' + #13#10 +
+    '}';
+
+  SaveStringToFile(ExternalToolsConfigPath(), Content, False);
+  Log('qpdf config written to ' + ExternalToolsConfigPath() + ': ' + Path);
+end;
+
+function ReadExistingQpdfConfigPath(): string;
+var
+  ConfigPath: string;
+  Content: AnsiString;
+  Text: string;
+  Marker: string;
+  StartPos: Integer;
+  EndPos: Integer;
+begin
+  Result := '';
+  ConfigPath := ExternalToolsConfigPath();
+  if not FileExists(ConfigPath) then
+    exit;
+
+  if not LoadStringFromFile(ConfigPath, Content) then
+    exit;
+
+  Text := String(Content);
+  Marker := '"qpdf_path"';
+  StartPos := Pos(Marker, Text);
+  if StartPos = 0 then
+    exit;
+  StartPos := Pos(':', Copy(Text, StartPos, Length(Text)));
+  if StartPos = 0 then
+    exit;
+  Text := Copy(Text, Pos(Marker, Text) + Length(Marker), Length(Text));
+  StartPos := Pos('"', Text);
+  if StartPos = 0 then
+    exit;
+  Text := Copy(Text, StartPos + 1, Length(Text));
+  EndPos := Pos('"', Text);
+  if EndPos = 0 then
+    exit;
+  Result := Copy(Text, 1, EndPos - 1);
+  StringChangeEx(Result, '\\', '\', True);
+end;
+
+procedure BrowseQpdfExeClick(Sender: TObject);
+var
+  FileName: string;
+begin
+  FileName := Trim(QpdfBrowsePage.Values[0]);
+  if FileName = '' then
+    FileName := 'C:\Program Files\qpdf\bin\qpdf.exe';
+
+  if GetOpenFileName(
+      'Select qpdf.exe',
+      FileName,
+      '',
+      'qpdf.exe|qpdf.exe|Executable files (*.exe)|*.exe',
+      'exe') then
+  begin
+    QpdfBrowsePage.Values[0] := FileName;
+  end;
+end;
+
+procedure ConfigureQpdf();
+var
+  ExistingPath: string;
+  QpdfPath: string;
+begin
+  ExistingPath := ReadExistingQpdfConfigPath();
+  if TestQpdfExePath(ExistingPath) then
+  begin
+    Log('Existing valid qpdf configuration preserved: ' + ExistingPath);
+    exit;
+  end;
+
+  QpdfPath := '';
+  if QpdfPage.Values[0] then
+  begin
+    QpdfPath := BundledQpdfExePath();
+    if QpdfPath = '' then
+      Log('Bundled qpdf was selected but no bundled qpdf executable was installed.');
+  end
+  else if QpdfPage.Values[1] then
+  begin
+    QpdfPath := DetectInstalledQpdfPath();
+  end
+  else if QpdfPage.Values[2] then
+  begin
+    QpdfPath := Trim(QpdfBrowsePage.Values[0]);
+    if not TestQpdfExePath(QpdfPath) then
+      QpdfPath := '';
+  end
+  else
+  begin
+    Log('qpdf setup skipped by user.');
+    exit;
+  end;
+
+  if QpdfPath <> '' then
+  begin
+    WriteQpdfConfig(QpdfPath);
+  end
+  else
+  begin
+    MsgBox(
+      'qpdf was not found. The BIM3DNA toolbar was installed, but qpdf-based compression will remain unavailable until qpdf.exe is configured.',
+      mbInformation,
+      MB_OK
+    );
+    Log('qpdf was not configured.');
+  end;
+end;
+
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
@@ -297,6 +588,15 @@ begin
       Result := False
     else
       Result := True;
+  end;
+
+  if (PageID = QpdfBrowsePage.ID) then
+  begin
+    if not QpdfPage.Values[2] then
+    begin
+      Result := True;
+      exit;
+    end;
   end;
 end;
 
@@ -336,14 +636,14 @@ begin
   LocalInstallerPage.Add('Local Ollama installer path:', False);
   LocalInstallerPage.Values[0] := ExpandConstant('{userdesktop}\OllamaSetup.exe');
 
-  BrowseButton := TNewButton.Create(LocalInstallerPage.Surface);
-  BrowseButton.Parent := LocalInstallerPage.Surface;
-  BrowseButton.Left := LocalInstallerPage.Edits[0].Left + LocalInstallerPage.Edits[0].Width + ScaleX(8);
-  BrowseButton.Top := LocalInstallerPage.Edits[0].Top - ScaleY(1);
-  BrowseButton.Width := ScaleX(75);
-  BrowseButton.Height := LocalInstallerPage.Edits[0].Height + ScaleY(2);
-  BrowseButton.Caption := 'Browse...';
-  BrowseButton.OnClick := @BrowseLocalInstallerClick;
+  OllamaBrowseButton := TNewButton.Create(LocalInstallerPage.Surface);
+  OllamaBrowseButton.Parent := LocalInstallerPage.Surface;
+  OllamaBrowseButton.Left := LocalInstallerPage.Edits[0].Left + LocalInstallerPage.Edits[0].Width + ScaleX(8);
+  OllamaBrowseButton.Top := LocalInstallerPage.Edits[0].Top - ScaleY(1);
+  OllamaBrowseButton.Width := ScaleX(75);
+  OllamaBrowseButton.Height := LocalInstallerPage.Edits[0].Height + ScaleY(2);
+  OllamaBrowseButton.Caption := 'Browse...';
+  OllamaBrowseButton.OnClick := @BrowseLocalInstallerClick;
 
   ModelPage :=
     CreateInputOptionPage(
@@ -363,6 +663,47 @@ begin
   ModelPage.Add('llama3.2:3b');
   ModelPage.Add('Skip model download for now');
   ModelPage.Values[0] := True;
+
+  QpdfPage :=
+    CreateInputOptionPage(
+      ModelPage.ID,
+      'qpdf Setup',
+      'PDF compression dependency',
+      'The Create Print Set / PDF export tools can use qpdf for post-export PDF optimization.' + #13#10 +
+      'Choose how to configure qpdf on this machine.',
+      True,
+      False
+    );
+
+  QpdfPage.Add('Use bundled portable qpdf if included');
+  QpdfPage.Add('Auto-detect existing qpdf installation');
+  QpdfPage.Add('Browse to qpdf.exe');
+  QpdfPage.Add('Skip qpdf setup for now');
+
+  if '{#HasBundledQpdf}' = '1' then
+    QpdfPage.Values[0] := True
+  else
+    QpdfPage.Values[1] := True;
+
+  QpdfBrowsePage :=
+    CreateInputQueryPage(
+      QpdfPage.ID,
+      'qpdf Executable',
+      'Choose qpdf.exe',
+      'Browse to the installed command-line executable, usually under C:\Program Files\qpdf...\bin\qpdf.exe.'
+    );
+
+  QpdfBrowsePage.Add('qpdf.exe path:', False);
+  QpdfBrowsePage.Values[0] := 'C:\Program Files\qpdf\bin\qpdf.exe';
+
+  QpdfBrowseButton := TNewButton.Create(QpdfBrowsePage.Surface);
+  QpdfBrowseButton.Parent := QpdfBrowsePage.Surface;
+  QpdfBrowseButton.Left := QpdfBrowsePage.Edits[0].Left + QpdfBrowsePage.Edits[0].Width + ScaleX(8);
+  QpdfBrowseButton.Top := QpdfBrowsePage.Edits[0].Top - ScaleY(1);
+  QpdfBrowseButton.Width := ScaleX(75);
+  QpdfBrowseButton.Height := QpdfBrowsePage.Edits[0].Height + ScaleY(2);
+  QpdfBrowseButton.Caption := 'Browse...';
+  QpdfBrowseButton.OnClick := @BrowseQpdfExeClick;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -372,6 +713,10 @@ var
 begin
   if CurStep <> ssPostInstall then
     exit;
+
+  Log('BIM3DNA install mode: standard file-copy install.');
+  Log('Git-backed Update BIM3DNA requires the installed extension to be inside a Git working tree. File-copy installs will report Git-backed update unavailable.');
+  ConfigureQpdf();
 
   if not IsOllamaInstalled() then
   begin

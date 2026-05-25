@@ -1535,6 +1535,33 @@ def load_pdf_config():
     return config
 
 
+def get_external_tools_config_path():
+    appdata = os.getenv("APPDATA") or ""
+    if appdata:
+        return os.path.join(appdata, "BIM3DNA", "external_tools.json")
+    return ""
+
+
+def get_external_tools_qpdf_path():
+    path = get_external_tools_config_path()
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            qpdf_path = data.get("qpdf_path") or ""
+            if (
+                qpdf_path
+                and os.path.exists(qpdf_path)
+                and os.path.basename(qpdf_path).lower() == "qpdf.exe"
+            ):
+                return qpdf_path
+    except Exception as ex:
+        logger.warning("Could not read external tools config {}: {}".format(path, ex))
+    return ""
+
+
 def save_pdf_config(config):
     path = get_pdf_config_path()
     try:
@@ -1603,10 +1630,16 @@ def find_qpdf_exe():
     ):
         return configured
 
-    # TODO: qpdf.exe can be bundled by BIM3DNA installer under:
-    # <extension_root>/bin/qpdf/bin/qpdf.exe
+    external_configured = get_external_tools_qpdf_path()
+    if external_configured:
+        return external_configured
+
     extension_root = get_extension_root()
     candidates = [
+        # qpdf may be bundled by BIM3DNA installer under:
+        # <extension_root>/_runtime/qpdf/bin/qpdf.exe
+        os.path.join(extension_root, "_runtime", "qpdf", "bin", "qpdf.exe"),
+        os.path.join(extension_root, "_runtime", "qpdf", "qpdf.exe"),
         os.path.join(extension_root, "bin", "qpdf", "bin", "qpdf.exe"),
         os.path.join(extension_root, "bin", "qpdf.exe"),
         "C:\\Program Files\\qpdf\\bin\\qpdf.exe",

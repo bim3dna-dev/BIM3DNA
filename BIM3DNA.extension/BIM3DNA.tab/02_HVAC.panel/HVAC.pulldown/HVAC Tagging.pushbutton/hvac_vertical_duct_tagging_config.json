@@ -4,7 +4,7 @@
   "max_skipped_diagnostics_rows": 30, 
   "min_vertical_height_ft": 1.0, 
   "selected_duct_tag_family_name": "M_Vertical_Duct_Tag_MEPcontent", 
-  "selected_duct_tag_symbol_id": "1544724", 
+  "selected_duct_tag_symbol_id": "1544705", 
   "selected_duct_tag_type_name": "Coming Down", 
   "selected_family_api_compatible": true, 
   "selected_family_compatibility_details": {
@@ -37,7 +37,9 @@
   }, 
   "tag_add_leader": false, 
   "tag_offset_x_ft": 0.0, 
+  "tag_offset_x_mm": 0.0, 
   "tag_offset_y_ft": 0.0, 
+  "tag_offset_y_mm": 0.0, 
   "vertical_angle_degrees": 80.0, 
   "xy_tolerance_ft": 0.10000000000000001
 }

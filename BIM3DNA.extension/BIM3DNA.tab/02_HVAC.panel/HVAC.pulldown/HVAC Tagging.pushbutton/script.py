@@ -1172,7 +1172,10 @@ def get_selected_family_symbols(cfg):
     selected_norm = normalize_name(selected_family)
     family_symbols = []
     for symbol in collect_loaded_duct_tag_symbols():
-        if selected_norm and normalize_name(get_family_name_from_symbol(symbol)) != selected_norm:
+        if (
+            selected_norm
+            and normalize_name(get_family_name_from_symbol(symbol)) != selected_norm
+        ):
             continue
         family_symbols.append(symbol)
     return family_symbols
@@ -1231,7 +1234,9 @@ def get_existing_tagged_element_ids_in_view(view):
 def get_vertical_duct_tag_point(row, cfg):
     start_z = row.get("start_z")
     end_z = row.get("end_z")
-    p0, p1, status = get_duct_line_endpoints(doc.GetElement(ElementId(int(row["duct_id"]))))
+    p0, p1, status = get_duct_line_endpoints(
+        doc.GetElement(ElementId(int(row["duct_id"])))
+    )
     if p0 is None or p1 is None:
         return None
     x = (p0.X + p1.X) / 2.0 + get_tag_offset_x_ft(cfg)
@@ -1304,7 +1309,11 @@ def prepare_selected_vertical_duct_tag_candidates():
     view = doc.ActiveView
     active_level = get_active_level(view)
     if active_level is None:
-        return [], [], "HVAC vertical duct tagging works only in floor plan views with a valid level."
+        return (
+            [],
+            [],
+            "HVAC vertical duct tagging works only in floor plan views with a valid level.",
+        )
     levels = collect_project_levels()
     band_bottom, band_top = get_active_level_band(active_level, levels)
     selected_ids = list(uidoc.Selection.GetElementIds())
@@ -1317,9 +1326,13 @@ def prepare_selected_vertical_duct_tag_candidates():
     if not bool(cfg.get("selected_family_api_compatible", False)) or not bool(
         cfg.get("selected_family_vertical_intent_match", False)
     ):
-        return [], [], (
-            "No selected vertical-intent-compatible duct tag family is configured. "
-            "Choose loaded vertical duct tag family first."
+        return (
+            [],
+            [],
+            (
+                "No selected vertical-intent-compatible duct tag family is configured. "
+                "Choose loaded vertical duct tag family first."
+            ),
         )
 
     family_symbols = get_selected_family_symbols(cfg)
@@ -1344,7 +1357,9 @@ def prepare_selected_vertical_duct_tag_candidates():
             skipped.append({"duct_id": elem_id.IntegerValue, "reason": row["status"]})
             continue
         row = apply_system_intent_override(row, cfg)
-        symbol = resolve_symbol_for_final_intent(row.get("final_intent"), family_symbols)
+        symbol = resolve_symbol_for_final_intent(
+            row.get("final_intent"), family_symbols
+        )
         if symbol is None:
             skipped.append(
                 {
@@ -1385,9 +1400,15 @@ def confirm_vertical_duct_tag_placement(candidates):
     output_emit(output, "# Smart HVAC Vertical Duct Tags - Placement Preview")
     output_emit(output, "")
     output_emit(output, "## Placement Settings")
-    output_emit(output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0)))
-    output_emit(output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0)))
-    output_emit(output, "- Add leader: `{}`".format(fmt_bool(cfg.get("tag_add_leader", False))))
+    output_emit(
+        output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0))
+    )
+    output_emit(
+        output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0))
+    )
+    output_emit(
+        output, "- Add leader: `{}`".format(fmt_bool(cfg.get("tag_add_leader", False)))
+    )
     output_emit(output, "")
     headers = [
         "Duct ElementId",
@@ -1419,6 +1440,35 @@ def confirm_vertical_duct_tag_placement(candidates):
     )
 
 
+def is_valid_but_not_taggable_skip(reason):
+    text = str(reason or "")
+    return (
+        text == "SKIPPED_ALREADY_TAGGED"
+        or text.startswith("SKIPPED_NO_MATCHING_TAG_TYPE_FOR_")
+        or text == "SKIPPED_TAG_POINT_UNRESOLVED"
+    )
+
+
+def get_placement_summary_counts(candidates, skipped, failed):
+    skipped_already = [
+        r for r in skipped if r.get("reason") == "SKIPPED_ALREADY_TAGGED"
+    ]
+    valid_skipped = [
+        r for r in skipped if is_valid_but_not_taggable_skip(r.get("reason"))
+    ]
+    invalid_skipped = [
+        r for r in skipped if not is_valid_but_not_taggable_skip(r.get("reason"))
+    ]
+    return {
+        "valid_vertical_candidates": len(candidates) + len(valid_skipped),
+        "taggable_candidates": len(candidates),
+        "skipped_already_tagged": len(skipped_already),
+        "skipped_invalid": len(invalid_skipped),
+        "failed": len(failed),
+        "skipped_already_rows": skipped_already,
+    }
+
+
 def place_vertical_duct_tags_for_selected_candidates():
     cfg = get_config()
     cfg["last_used_action"] = "Place vertical duct tags for selected candidates"
@@ -1428,6 +1478,7 @@ def place_vertical_duct_tags_for_selected_candidates():
         TaskDialog.Show("Place vertical duct tags for selected candidates", error)
         return
     if not candidates:
+        counts = get_placement_summary_counts(candidates, skipped, [])
         output = script.get_output() if script is not None else None
         output_emit(output, "# Smart HVAC Vertical Duct Tags - Placement Report")
         output_emit(output, "")
@@ -1438,9 +1489,27 @@ def place_vertical_duct_tags_for_selected_candidates():
                 len(list(uidoc.Selection.GetElementIds()))
             ),
         )
-        output_emit(output, "- Valid candidates: `0`")
+        output_emit(
+            output,
+            "- Valid vertical candidates: `{}`".format(
+                counts["valid_vertical_candidates"]
+            ),
+        )
+        output_emit(
+            output,
+            "- Taggable candidates: `{}`".format(counts["taggable_candidates"]),
+        )
         output_emit(output, "- Tags created: `0`")
-        output_emit(output, "- Skipped / failed: `{}`".format(len(skipped)))
+        output_emit(
+            output,
+            "- Skipped already tagged: `{}`".format(
+                counts["skipped_already_tagged"]
+            ),
+        )
+        output_emit(
+            output, "- Skipped invalid: `{}`".format(counts["skipped_invalid"])
+        )
+        output_emit(output, "- Failed: `0`")
         output_emit(output, "")
         output_emit(output, "## Skipped / Failed")
         output_emit(output, "|Duct id|Reason|")
@@ -1458,7 +1527,11 @@ def place_vertical_duct_tags_for_selected_candidates():
             "Place vertical duct tags for selected candidates",
             "No selected vertical duct candidates can be tagged. See output report for skipped reasons.",
         )
-        print("PLACE HVAC VERTICAL DUCT TAGS -> valid candidates: 0")
+        print(
+            "PLACE HVAC VERTICAL DUCT TAGS -> valid candidates: {}".format(
+                counts["valid_vertical_candidates"]
+            )
+        )
         return
     print(
         "PLACE HVAC VERTICAL DUCT TAGS -> valid candidates: {}".format(
@@ -1518,7 +1591,8 @@ def place_vertical_duct_tags_for_selected_candidates():
         )
         return
 
-    skipped_already = [r for r in skipped if r.get("reason") == "SKIPPED_ALREADY_TAGGED"]
+    counts = get_placement_summary_counts(candidates, skipped, failed)
+    skipped_already = counts["skipped_already_rows"]
     print(
         "PLACE HVAC VERTICAL DUCT TAGS -> created tags: {}".format(
             [r["tag_id"] for r in created]
@@ -1535,8 +1609,12 @@ def place_vertical_duct_tags_for_selected_candidates():
     output_emit(output, "# Smart HVAC Vertical Duct Tags - Placement Report")
     output_emit(output, "")
     output_emit(output, "## Placement Summary")
-    output_emit(output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0)))
-    output_emit(output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0)))
+    output_emit(
+        output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0))
+    )
+    output_emit(
+        output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0))
+    )
     output_emit(output, "- Add leader: `{}`".format(fmt_bool(add_leader)))
     output_emit(
         output,
@@ -1544,11 +1622,25 @@ def place_vertical_duct_tags_for_selected_candidates():
             len(list(uidoc.Selection.GetElementIds()))
         ),
     )
-    output_emit(output, "- Valid candidates: `{}`".format(len(candidates)))
+    output_emit(
+        output,
+        "- Valid vertical candidates: `{}`".format(
+            counts["valid_vertical_candidates"]
+        ),
+    )
+    output_emit(
+        output,
+        "- Taggable candidates: `{}`".format(counts["taggable_candidates"]),
+    )
     output_emit(output, "- Tags created: `{}`".format(len(created)))
-    output_emit(output, "- Skipped already tagged: `{}`".format(len(skipped_already)))
-    output_emit(output, "- Skipped invalid: `{}`".format(len(skipped) - len(skipped_already)))
-    output_emit(output, "- Failed: `{}`".format(len(failed)))
+    output_emit(
+        output,
+        "- Skipped already tagged: `{}`".format(counts["skipped_already_tagged"]),
+    )
+    output_emit(
+        output, "- Skipped invalid: `{}`".format(counts["skipped_invalid"])
+    )
+    output_emit(output, "- Failed: `{}`".format(counts["failed"]))
 
     output_emit(output, "")
     output_emit(output, "## Created Tags")
@@ -1599,7 +1691,9 @@ def place_vertical_duct_tags_for_selected_candidates():
                 id_list.Add(ElementId(int(row["tag_id"])))
             uidoc.Selection.SetElementIds(id_list)
         except Exception as ex:
-            print("PLACE HVAC VERTICAL DUCT TAGS -> tag selection failed: {}".format(ex))
+            print(
+                "PLACE HVAC VERTICAL DUCT TAGS -> tag selection failed: {}".format(ex)
+            )
     else:
         try:
             id_list = List[ElementId]()
@@ -1619,15 +1713,29 @@ def parse_float_or_keep(value, current_value, label, warnings):
     try:
         return float(text.replace(",", "."))
     except Exception:
-        warnings.append("{} invalid input `{}`; kept current value `{}`.".format(label, text, current_value))
+        warnings.append(
+            "{} invalid input `{}`; kept current value `{}`.".format(
+                label, text, current_value
+            )
+        )
         return current_value
 
 
 def configure_vertical_duct_tag_placement_settings():
     cfg = get_config()
     warnings = []
-    current_x = float(cfg.get("tag_offset_x_mm", mm_from_ft(float(cfg.get("tag_offset_x_ft", 0.0) or 0.0))) or 0.0)
-    current_y = float(cfg.get("tag_offset_y_mm", mm_from_ft(float(cfg.get("tag_offset_y_ft", 0.0) or 0.0))) or 0.0)
+    current_x = float(
+        cfg.get(
+            "tag_offset_x_mm", mm_from_ft(float(cfg.get("tag_offset_x_ft", 0.0) or 0.0))
+        )
+        or 0.0
+    )
+    current_y = float(
+        cfg.get(
+            "tag_offset_y_mm", mm_from_ft(float(cfg.get("tag_offset_y_ft", 0.0) or 0.0))
+        )
+        or 0.0
+    )
     current_leader = bool(cfg.get("tag_add_leader", False))
 
     value_x = prompt_string(
