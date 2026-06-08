@@ -339,6 +339,84 @@ PDF24_PROFILES = {
     PDF24_PROFILE_MAXIMUM: {"dpi": 96, "quality": 45, "color_model": ""},
     PDF24_PROFILE_EXTREME: {"dpi": 72, "quality": 35, "color_model": ""},
 }
+RASTERIZE_PRESET_REVIEW_SMALL = "Review Small JPEG"
+RASTERIZE_PRESET_REVIEW_SHARP = "Review Sharp JPEG"
+RASTERIZE_PRESET_REVIEW_HIGH_DETAIL = "Review High Detail JPEG"
+RASTERIZE_PRESET_LOSSLESS_PNG = "Lossless PNG"
+RASTERIZE_PRESET_INDEXED_PNG = "Indexed PNG"
+RASTERIZE_PRESET_BW_SHARP = "Black/White Sharp"
+RASTERIZE_PRESET_CUSTOM = "Custom"
+RASTERIZE_PRESETS = {
+    RASTERIZE_PRESET_REVIEW_SMALL: {
+        "dpi": 96,
+        "quality": 50,
+        "color_mode": "Color",
+        "image_codec": "JPEG - smallest color PDF",
+        "png_compression_level": 9,
+        "indexed_colors": 128,
+        "threshold": 200,
+    },
+    RASTERIZE_PRESET_REVIEW_SHARP: {
+        "dpi": 150,
+        "quality": 60,
+        "color_mode": "Color",
+        "image_codec": "JPEG - smallest color PDF",
+        "png_compression_level": 9,
+        "indexed_colors": 128,
+        "threshold": 200,
+    },
+    RASTERIZE_PRESET_REVIEW_HIGH_DETAIL: {
+        "dpi": 300,
+        "quality": 50,
+        "color_mode": "Color",
+        "image_codec": "JPEG - smallest color PDF",
+        "png_compression_level": 9,
+        "indexed_colors": 128,
+        "threshold": 200,
+    },
+    RASTERIZE_PRESET_LOSSLESS_PNG: {
+        "dpi": 150,
+        "quality": 50,
+        "color_mode": "Color",
+        "image_codec": "PNG / Flate - lossless sharper lines",
+        "png_compression_level": 9,
+        "indexed_colors": 128,
+        "threshold": 200,
+    },
+    RASTERIZE_PRESET_INDEXED_PNG: {
+        "dpi": 150,
+        "quality": 50,
+        "color_mode": "Color",
+        "image_codec": "PNG Indexed - reduced colors",
+        "png_compression_level": 9,
+        "indexed_colors": 128,
+        "threshold": 200,
+    },
+    RASTERIZE_PRESET_BW_SHARP: {
+        "dpi": 300,
+        "quality": 50,
+        "color_mode": "Black and white",
+        "image_codec": "Black/White CCITT - sharp monochrome, smallest if color not needed",
+        "png_compression_level": 9,
+        "indexed_colors": 128,
+        "threshold": 200,
+    },
+}
+RASTERIZE_COLOR_MODE_MAP = {
+    "Color": "color",
+    "Grayscale": "grayscale",
+    "Black and white": "bw",
+}
+RASTERIZE_CODEC_LABEL_JPEG = "JPEG - smallest color PDF"
+RASTERIZE_CODEC_LABEL_PNG = "PNG / Flate - lossless sharper lines"
+RASTERIZE_CODEC_LABEL_INDEXED = "PNG Indexed - reduced colors"
+RASTERIZE_CODEC_LABEL_BW = "Black/White CCITT - sharp monochrome, smallest if color not needed"
+RASTERIZE_CODEC_MAP = {
+    RASTERIZE_CODEC_LABEL_JPEG: "jpeg",
+    RASTERIZE_CODEC_LABEL_PNG: "png",
+    RASTERIZE_CODEC_LABEL_INDEXED: "png-indexed",
+    RASTERIZE_CODEC_LABEL_BW: "bw",
+}
 
 DEFAULT_PDF_CONFIG = {
     "pdf_optimizer_enabled": False,
@@ -351,6 +429,16 @@ DEFAULT_PDF_CONFIG = {
     "pdf24_image_quality": 75,
     "pdf24_color_model": "",
     "pdf24_exe_path": "",
+    "pdf_rasterizer_enabled": True,
+    "pdf_rasterizer_helper_path": "",
+    "pdf_rasterizer_python_path": "",
+    "pdf_rasterizer_default_dpi": 72,
+    "pdf_rasterizer_default_quality": 45,
+    "pdf_rasterizer_default_color_mode": "Color",
+    "pdf_rasterizer_default_image_codec": RASTERIZE_CODEC_LABEL_JPEG,
+    "pdf_rasterizer_default_png_compression_level": 9,
+    "pdf_rasterizer_default_indexed_colors": 128,
+    "pdf_rasterizer_default_threshold": 200,
     "last_output_folder": "",
     "last_source_mode": "manual",
     "last_export_pdf_enabled": True,
@@ -1749,9 +1837,125 @@ def find_pdf24_doctool_exe():
     return None
 
 
+def find_python_exe_for_rasterizer(config):
+    configured = config.get("pdf_rasterizer_python_path") or ""
+    if configured and os.path.exists(configured):
+        return configured
+    known_working = (
+        "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
+    )
+    if os.path.exists(known_working):
+        config["pdf_rasterizer_python_path"] = known_working
+        try:
+            save_pdf_config(config)
+        except Exception:
+            pass
+        return known_working
+    for exe_name in ["python.exe", "python"]:
+        try:
+            process = subprocess.Popen(
+                ["where", exe_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout_data, stderr_data = process.communicate()
+            if process.returncode == 0 and stdout_data:
+                for line in str(stdout_data).splitlines():
+                    candidate = line.strip()
+                    if os.path.exists(candidate):
+                        return candidate
+        except Exception:
+            pass
+    return ""
+
+
+def find_repo_root_from_extension(extension_root):
+    current = os.path.abspath(extension_root)
+    for _idx in range(8):
+        if os.path.isdir(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return ""
+
+
+def resolve_pdf_rasterizer_helper(config=None):
+    config = config or load_pdf_config()
+    configured = config.get("pdf_rasterizer_helper_path") or ""
+    if configured and os.path.exists(configured):
+        if configured.lower().endswith(".exe"):
+            return {"kind": "exe", "helper": configured, "python": ""}
+        if configured.lower().endswith(".py"):
+            python_exe = find_python_exe_for_rasterizer(config)
+            if python_exe:
+                return {"kind": "script", "helper": configured, "python": python_exe}
+
+    extension_root = get_extension_root()
+    bundled_exe = os.path.join(
+        extension_root, "bin", "pdf_rasterizer", "pdf_rasterize_helper.exe"
+    )
+    if os.path.exists(bundled_exe):
+        return {"kind": "exe", "helper": bundled_exe, "python": ""}
+
+    # Dev mode helper. The installer should later package a compiled helper under
+    # <extension_root>/bin/pdf_rasterizer/pdf_rasterize_helper.exe.
+    script_candidates = [
+        os.path.join(
+            extension_root, "tools", "pdf_rasterize_helper", "rasterize_pdf.py"
+        ),
+    ]
+    repo_root = find_repo_root_from_extension(extension_root)
+    if repo_root:
+        script_candidates.append(
+            os.path.join(repo_root, "tools", "pdf_rasterize_helper", "rasterize_pdf.py")
+        )
+    python_exe = find_python_exe_for_rasterizer(config)
+    if python_exe:
+        for script_path in script_candidates:
+            if os.path.exists(script_path):
+                return {"kind": "script", "helper": script_path, "python": python_exe}
+    return None
+
+
+def get_pdf_rasterizer_status_text(config=None):
+    helper = resolve_pdf_rasterizer_helper(config or load_pdf_config())
+    if not helper:
+        return (
+            "PDF rasterizer helper not found. Configure helper path or install "
+            "BIM3DNA PDF rasterizer component."
+        )
+    if helper.get("kind") == "exe":
+        return "PDF rasterizer helper found - {}".format(helper.get("helper"))
+    return "PDF rasterizer dev helper found - {} via {}".format(
+        helper.get("helper"), helper.get("python")
+    )
+
+
 def get_unique_optimized_pdf_path(input_pdf, suffix="_qpdf"):
     folder = os.path.dirname(input_pdf)
     base = os.path.splitext(os.path.basename(input_pdf))[0]
+    candidate = os.path.join(folder, base + suffix + ".pdf")
+    if not os.path.exists(candidate):
+        return candidate
+    index = 1
+    while index < 1000:
+        candidate = os.path.join(folder, "{}{}_{:03d}.pdf".format(base, suffix, index))
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+    return os.path.join(folder, base + suffix + "_999.pdf")
+
+
+def get_unique_flattened_pdf_path(input_pdf, output_folder, dpi, quality, color_mode):
+    folder = output_folder or os.path.dirname(input_pdf)
+    base = sanitize_filename(os.path.splitext(os.path.basename(input_pdf))[0])
+    suffix = "_flattened_{}dpi_q{}".format(int(dpi), int(quality))
+    if color_mode == "grayscale":
+        suffix += "_gray"
+    elif color_mode == "bw":
+        suffix += "_bw"
     candidate = os.path.join(folder, base + suffix + ".pdf")
     if not os.path.exists(candidate):
         return candidate
@@ -2280,6 +2484,881 @@ def optimize_existing_pdf(configured_qpdf_path=None, profile=None):
     )
 
 
+def decode_process_output(data):
+    if data is None:
+        return ""
+    try:
+        if hasattr(data, "decode"):
+            return data.decode("utf-8", "replace")
+    except Exception:
+        pass
+    return str(data)
+
+
+def tail_lines(text, count):
+    lines = (text or "").splitlines()
+    return "\n".join(lines[-count:])
+
+
+def extract_json_object(text):
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    start = raw.rfind("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except Exception:
+            return None
+    return None
+
+
+def run_process_capture(args):
+    try:
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout_data, stderr_data = process.communicate()
+        return {
+            "exit_code": process.returncode,
+            "stdout": decode_process_output(stdout_data),
+            "stderr": decode_process_output(stderr_data),
+            "start_failed": False,
+        }
+    except Exception as ex:
+        logger.exception("Process failed to start")
+        return {
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "start_failed": True,
+            "error": str(ex),
+        }
+
+
+def build_pdf_rasterizer_command(
+    helper,
+    input_pdf,
+    output_pdf,
+    dpi,
+    quality,
+    color_mode,
+    image_codec,
+    threshold,
+    png_compression_level,
+    indexed_colors,
+):
+    if helper.get("kind") == "exe":
+        args = [helper.get("helper")]
+    else:
+        args = [helper.get("python"), helper.get("helper")]
+    args.extend(
+        [
+            "--input",
+            input_pdf,
+            "--output",
+            output_pdf,
+            "--dpi",
+            str(int(dpi)),
+            "--quality",
+            str(int(quality)),
+            "--color-mode",
+            color_mode,
+            "--image-codec",
+            image_codec,
+            "--png-compression-level",
+            str(int(png_compression_level)),
+            "--indexed-colors",
+            str(int(indexed_colors)),
+            "--threshold",
+            str(int(threshold)),
+        ]
+    )
+    return args
+
+
+def build_pdf_rasterizer_self_test_command(helper):
+    if helper.get("kind") == "exe":
+        return [helper.get("helper"), "--self-test"]
+    return [helper.get("python"), helper.get("helper"), "--self-test"]
+
+
+def run_pdf_rasterizer_self_test():
+    config = load_pdf_config()
+    helper = resolve_pdf_rasterizer_helper(config)
+    if not helper:
+        return {
+            "ok": False,
+            "error": (
+                "PDF rasterizer helper not found. Configure helper path or install "
+                "BIM3DNA PDF rasterizer component."
+            ),
+            "helper": "",
+            "python": "",
+        }
+    args = build_pdf_rasterizer_self_test_command(helper)
+    logger.info(
+        "PDF rasterizer self-test command: {}".format(format_command_args(args))
+    )
+    captured = run_process_capture(args)
+    stdout_text = captured.get("stdout") or ""
+    stderr_text = captured.get("stderr") or ""
+    if stderr_text:
+        for line in stderr_text.splitlines():
+            logger.info(line)
+    result = extract_json_object(stdout_text) or {}
+    result["exit_code"] = captured.get("exit_code")
+    result["stdout"] = stdout_text
+    result["stderr"] = stderr_text
+    result["helper"] = helper.get("helper") or ""
+    result["python"] = helper.get("python") or result.get("python") or ""
+    if captured.get("start_failed"):
+        result["ok"] = False
+        result["error"] = "Could not start PDF rasterizer: {}".format(
+            captured.get("error") or ""
+        )
+    elif captured.get("exit_code") != 0 and result.get("ok") is not False:
+        result["ok"] = False
+        result["error"] = "PDF rasterizer self-test failed."
+    return result
+
+
+def format_rasterizer_self_test_result(result):
+    if result and result.get("ok"):
+        return "Rasterizer OK: Python {}, pypdfium2 {}, Pillow {}, img2pdf {}".format(
+            result.get("python") or "-",
+            result.get("pypdfium2") or "-",
+            result.get("pillow") or "-",
+            result.get("img2pdf") or "-",
+        )
+    install_hint = (result or {}).get("install_hint")
+    if not install_hint:
+        python_path = (result or {}).get("python") or "<python>"
+        install_hint = "{} -m pip install pypdfium2 Pillow img2pdf".format(
+            python_path
+        )
+    return "Rasterizer failed: {}\nRun: {}".format(
+        (result or {}).get("error") or "missing pypdfium2/Pillow",
+        install_hint,
+    )
+
+
+def format_rasterizer_failure(result):
+    result = result or {}
+    return (
+        "Rasterize / Flatten failed.\n\n"
+        "Exit code: {}\n"
+        "Error: {}\n\n"
+        "Python:\n{}\n\n"
+        "Helper:\n{}\n\n"
+        "stderr:\n{}\n\n"
+        "stdout:\n{}"
+    ).format(
+        result.get("exit_code"),
+        result.get("error") or "Unknown error",
+        result.get("python") or "-",
+        result.get("helper") or "-",
+        tail_lines(result.get("stderr") or "", 30),
+        tail_lines(result.get("stdout") or "", 10),
+    )
+
+
+def run_pdf_rasterizer(
+    input_pdf,
+    output_pdf,
+    dpi,
+    quality,
+    color_mode,
+    image_codec,
+    threshold,
+    png_compression_level,
+    indexed_colors,
+    skip_self_test=False,
+):
+    config = load_pdf_config()
+    helper = resolve_pdf_rasterizer_helper(config)
+    if not helper:
+        return {
+            "ok": False,
+            "error": (
+                "PDF rasterizer helper not found. Configure helper path or install "
+                "BIM3DNA PDF rasterizer component."
+            ),
+        }
+    if not input_pdf or not os.path.exists(input_pdf):
+        return {"ok": False, "error": "Input PDF not found: {}".format(input_pdf)}
+    if not skip_self_test:
+        self_test = run_pdf_rasterizer_self_test()
+        if not self_test.get("ok") and not (
+            image_codec == "jpeg" and self_test.get("img2pdf") == "missing"
+        ):
+            return self_test
+    output_folder = os.path.dirname(output_pdf)
+    if not os.path.isdir(output_folder):
+        try:
+            os.makedirs(output_folder)
+        except Exception as ex:
+            return {
+                "ok": False,
+                "error": "Could not create output folder: {}".format(ex),
+            }
+
+    args = build_pdf_rasterizer_command(
+        helper,
+        input_pdf,
+        output_pdf,
+        dpi,
+        quality,
+        color_mode,
+        image_codec,
+        threshold,
+        png_compression_level,
+        indexed_colors,
+    )
+    logger.info(
+        "RASTERIZE_PDF_START | input={} | output={}".format(input_pdf, output_pdf)
+    )
+    logger.info(
+        "PDF rasterizer command arguments: {}".format(format_command_args(args))
+    )
+    start = time.time()
+    captured = run_process_capture(args)
+    stdout_text = captured.get("stdout") or ""
+    stderr_text = captured.get("stderr") or ""
+    if stderr_text:
+        for line in stderr_text.splitlines():
+            logger.info(line)
+    exit_code = captured.get("exit_code")
+    logger.info("PDF rasterizer exit code: {}".format(exit_code))
+    result = extract_json_object(stdout_text)
+    if not result:
+        return {
+            "ok": False,
+            "error": "Could not parse PDF rasterizer JSON output.",
+            "exit_code": exit_code,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "python": helper.get("python") or "",
+            "helper": helper.get("helper") or "",
+        }
+    result["exit_code"] = exit_code
+    result["stdout"] = stdout_text
+    result["stderr"] = stderr_text
+    result["python"] = helper.get("python") or result.get("python") or ""
+    result["helper"] = helper.get("helper") or ""
+    if exit_code != 0:
+        result["ok"] = False
+        if not result.get("error"):
+            result["error"] = "PDF rasterizer failed with exit code {}.".format(
+                exit_code
+            )
+        return result
+    if not result.get("ok"):
+        return result
+    if not os.path.exists(output_pdf) or os.path.getsize(output_pdf) <= 0:
+        result["ok"] = False
+        result["error"] = "Rasterized output PDF was not created."
+        return result
+    result["elapsed_seconds"] = result.get("elapsed_seconds") or (time.time() - start)
+    logger.info(
+        "RASTERIZE_PDF_DONE | input_mb={} | output_mb={} | reduction={} | elapsed={:.2f}".format(
+            format_mb(result.get("input_mb")),
+            format_mb(result.get("output_mb")),
+            format_percent(result.get("reduction_percent")),
+            result.get("elapsed_seconds") or 0.0,
+        )
+    )
+    return result
+
+
+def format_rasterize_result(result):
+    if not result or not result.get("ok"):
+        return format_rasterizer_failure(result)
+    warnings = "; ".join(result.get("warnings") or []) or "-"
+    return (
+        "Rasterize / Flatten completed.\n\n"
+        "Input PDF:\n{} ({})\n\n"
+        "Output PDF:\n{} ({})\n\n"
+        "Pages:\n{}\n\n"
+        "Settings:\nDPI: {}\nJPEG quality: {}%\nColor mode: {}\n\n"
+        "Image compression: {}\nThreshold: {}\n\n"
+        "PNG compression level: {}\nIndexed colors: {}\n\n"
+        "Reduction:\n{}\n\n"
+        "Warnings:\n{}\n\n"
+        "Elapsed:\n{:.2f} seconds\n\n"
+        "Notes:\n"
+        "- Output is image-based review PDF.\n"
+        "- Text/vector content is no longer selectable/searchable.\n"
+        "- Lower DPI/quality reduces file size and detail."
+    ).format(
+        result.get("input"),
+        format_mb(result.get("input_mb")),
+        result.get("output"),
+        format_mb(result.get("output_mb")),
+        result.get("pages"),
+        result.get("dpi"),
+        result.get("quality"),
+        result.get("color_mode"),
+        result.get("image_codec"),
+        result.get("threshold") if result.get("threshold") is not None else "-",
+        result.get("png_compression_level"),
+        result.get("indexed_colors") if result.get("indexed_colors") is not None else "-",
+        format_percent(result.get("reduction_percent")),
+        warnings,
+        result.get("elapsed_seconds") or 0.0,
+    )
+
+
+def run_flatten_matrix(input_pdf, output_folder):
+    if not input_pdf:
+        return
+    self_test = run_pdf_rasterizer_self_test()
+    if not self_test.get("ok"):
+        forms.alert(
+            format_rasterizer_failure(self_test),
+            title="Rasterize / Flatten Existing PDF",
+            exitscript=False,
+        )
+        return
+    profiles = [
+        ("96 dpi / q50 / JPEG / Color", 96, 50, "color", "jpeg", 200, 9, 128, "_flat_96_q50_jpeg_color"),
+        ("150 dpi / q60 / JPEG / Color", 150, 60, "color", "jpeg", 200, 9, 128, "_flat_150_q60_jpeg_color"),
+        ("300 dpi / q50 / JPEG / Color", 300, 50, "color", "jpeg", 200, 9, 128, "_flat_300_q50_jpeg_color"),
+        ("150 dpi / PNG / Color", 150, 50, "color", "png", 200, 9, 128, "_flat_150_png_color"),
+        ("150 dpi / Indexed PNG / Color", 150, 50, "color", "png-indexed", 200, 9, 128, "_flat_150_pngindexed_128c_color"),
+        ("300 dpi / Black/White CCITT", 300, 50, "bw", "bw", 200, 9, 128, "_flat_300_bw_t200"),
+    ]
+    folder = output_folder or os.path.dirname(input_pdf)
+    base = sanitize_filename(os.path.splitext(os.path.basename(input_pdf))[0])
+    rows = [
+        "Profile | DPI | Codec | Quality | Mode | Status | Size MB | Reduction % | Elapsed | Warning"
+    ]
+    for label, dpi, quality, color_mode, image_codec, threshold, png_level, indexed_colors, suffix in profiles:
+        output_pdf = get_unique_optimized_pdf_path(
+            os.path.join(folder, base + ".pdf"), suffix=suffix
+        )
+        result = run_pdf_rasterizer(
+            input_pdf,
+            output_pdf,
+            dpi,
+            quality,
+            color_mode,
+            image_codec,
+            threshold,
+            png_level,
+            indexed_colors,
+            skip_self_test=True,
+        )
+        if result and result.get("ok"):
+            warning_text = "; ".join(result.get("warnings") or []) or "-"
+            rows.append(
+                "{} | {} | {} | {} | {} | OK | {} | {} | {:.2f}s | {}".format(
+                    label,
+                    dpi,
+                    image_codec,
+                    quality,
+                    color_mode,
+                    format_mb(result.get("output_mb")),
+                    format_percent(result.get("reduction_percent")),
+                    result.get("elapsed_seconds") or 0.0,
+                    warning_text,
+                )
+            )
+        else:
+            rows.append(
+                "{} | {} | {} | {} | {} | Failed | - | - | - | {}".format(
+                    label,
+                    dpi,
+                    image_codec,
+                    quality,
+                    color_mode,
+                    (result or {}).get("error") or "unknown",
+                )
+            )
+    forms.alert(
+        "Flatten Matrix completed.\n\n{}".format("\n".join(rows)),
+        title="Rasterize / Flatten Existing PDF",
+        exitscript=False,
+    )
+
+
+def show_rasterize_existing_pdf_dialog():
+    config = load_pdf_config()
+    form = WinForms.Form()
+    form.Text = "Rasterize / Flatten Existing PDF"
+    form.StartPosition = WinForms.FormStartPosition.CenterScreen
+    form.FormBorderStyle = WinForms.FormBorderStyle.FixedDialog
+    form.ClientSize = Drawing.Size(720, 470)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+    form.TopMost = True
+
+    warning = WinForms.Label()
+    warning.Text = (
+        "Rasterize/Flatten converts pages to image-based PDF for review/sharing only. "
+        "Text, linework, and annotations will no longer be vector/searchable/selectable."
+    )
+    warning.Location = Drawing.Point(12, 10)
+    warning.Size = Drawing.Size(650, 38)
+    warning.ForeColor = Drawing.Color.DarkRed
+    form.Controls.Add(warning)
+
+    input_label = WinForms.Label()
+    input_label.Text = "Input PDF:"
+    input_label.Location = Drawing.Point(12, 58)
+    input_label.AutoSize = True
+    form.Controls.Add(input_label)
+    input_box = WinForms.TextBox()
+    input_box.Location = Drawing.Point(112, 55)
+    input_box.Size = Drawing.Size(440, 22)
+    form.Controls.Add(input_box)
+    input_browse = WinForms.Button()
+    input_browse.Text = "Browse..."
+    input_browse.Location = Drawing.Point(560, 53)
+    input_browse.Size = Drawing.Size(95, 26)
+    form.Controls.Add(input_browse)
+
+    output_label = WinForms.Label()
+    output_label.Text = "Output folder:"
+    output_label.Location = Drawing.Point(12, 90)
+    output_label.AutoSize = True
+    form.Controls.Add(output_label)
+    output_box = WinForms.TextBox()
+    output_box.Location = Drawing.Point(112, 87)
+    output_box.Size = Drawing.Size(440, 22)
+    output_box.Text = get_default_output_folder(config)
+    form.Controls.Add(output_box)
+    output_browse = WinForms.Button()
+    output_browse.Text = "Browse..."
+    output_browse.Location = Drawing.Point(560, 85)
+    output_browse.Size = Drawing.Size(95, 26)
+    form.Controls.Add(output_browse)
+
+    name_label = WinForms.Label()
+    name_label.Text = "Output filename:"
+    name_label.Location = Drawing.Point(12, 122)
+    name_label.AutoSize = True
+    form.Controls.Add(name_label)
+    name_box = WinForms.TextBox()
+    name_box.Location = Drawing.Point(112, 119)
+    name_box.Size = Drawing.Size(300, 22)
+    form.Controls.Add(name_box)
+
+    preset_label = WinForms.Label()
+    preset_label.Text = "Preset:"
+    preset_label.Location = Drawing.Point(12, 158)
+    preset_label.AutoSize = True
+    form.Controls.Add(preset_label)
+    preset_combo = WinForms.ComboBox()
+    preset_combo.DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+    preset_combo.Location = Drawing.Point(112, 155)
+    preset_combo.Size = Drawing.Size(220, 22)
+    for preset in [
+        RASTERIZE_PRESET_REVIEW_SMALL,
+        RASTERIZE_PRESET_REVIEW_SHARP,
+        RASTERIZE_PRESET_REVIEW_HIGH_DETAIL,
+        RASTERIZE_PRESET_LOSSLESS_PNG,
+        RASTERIZE_PRESET_INDEXED_PNG,
+        RASTERIZE_PRESET_BW_SHARP,
+        RASTERIZE_PRESET_CUSTOM,
+    ]:
+        preset_combo.Items.Add(preset)
+    choose_combobox_value(preset_combo, RASTERIZE_PRESET_REVIEW_SHARP)
+    form.Controls.Add(preset_combo)
+
+    dpi_label = WinForms.Label()
+    dpi_label.Text = "DPI:"
+    dpi_label.Location = Drawing.Point(12, 195)
+    dpi_label.AutoSize = True
+    form.Controls.Add(dpi_label)
+    dpi_num = WinForms.NumericUpDown()
+    dpi_num.Location = Drawing.Point(112, 191)
+    dpi_num.Size = Drawing.Size(70, 22)
+    dpi_num.Minimum = 36
+    dpi_num.Maximum = 300
+    dpi_num.Value = int(config.get("pdf_rasterizer_default_dpi") or 72)
+    form.Controls.Add(dpi_num)
+
+    quality_label = WinForms.Label()
+    quality_label.Text = "JPEG quality:"
+    quality_label.Location = Drawing.Point(205, 195)
+    quality_label.AutoSize = True
+    form.Controls.Add(quality_label)
+    quality_num = WinForms.NumericUpDown()
+    quality_num.Location = Drawing.Point(295, 191)
+    quality_num.Size = Drawing.Size(70, 22)
+    quality_num.Minimum = 10
+    quality_num.Maximum = 95
+    quality_num.Value = int(config.get("pdf_rasterizer_default_quality") or 45)
+    form.Controls.Add(quality_num)
+
+    mode_label = WinForms.Label()
+    mode_label.Text = "Color mode:"
+    mode_label.Location = Drawing.Point(390, 195)
+    mode_label.AutoSize = True
+    form.Controls.Add(mode_label)
+    mode_combo = WinForms.ComboBox()
+    mode_combo.DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+    mode_combo.Location = Drawing.Point(470, 191)
+    mode_combo.Size = Drawing.Size(135, 22)
+    for mode in ["Color", "Grayscale", "Black and white"]:
+        mode_combo.Items.Add(mode)
+    choose_combobox_value(
+        mode_combo, config.get("pdf_rasterizer_default_color_mode") or "Color"
+    )
+    form.Controls.Add(mode_combo)
+
+    codec_label = WinForms.Label()
+    codec_label.Text = "Image compression:"
+    codec_label.Location = Drawing.Point(12, 225)
+    codec_label.AutoSize = True
+    form.Controls.Add(codec_label)
+    codec_combo = WinForms.ComboBox()
+    codec_combo.DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+    codec_combo.Location = Drawing.Point(112, 222)
+    codec_combo.Size = Drawing.Size(330, 22)
+    for codec_label_text in [
+        RASTERIZE_CODEC_LABEL_JPEG,
+        RASTERIZE_CODEC_LABEL_PNG,
+        RASTERIZE_CODEC_LABEL_INDEXED,
+        RASTERIZE_CODEC_LABEL_BW,
+    ]:
+        codec_combo.Items.Add(codec_label_text)
+    choose_combobox_value(
+        codec_combo,
+        config.get("pdf_rasterizer_default_image_codec") or RASTERIZE_CODEC_LABEL_JPEG,
+    )
+    form.Controls.Add(codec_combo)
+
+    threshold_label = WinForms.Label()
+    threshold_label.Text = "B/W threshold:"
+    threshold_label.Location = Drawing.Point(455, 225)
+    threshold_label.AutoSize = True
+    form.Controls.Add(threshold_label)
+    threshold_num = WinForms.NumericUpDown()
+    threshold_num.Location = Drawing.Point(545, 221)
+    threshold_num.Size = Drawing.Size(65, 22)
+    threshold_num.Minimum = 1
+    threshold_num.Maximum = 255
+    threshold_num.Value = int(config.get("pdf_rasterizer_default_threshold") or 200)
+    form.Controls.Add(threshold_num)
+
+    png_level_label = WinForms.Label()
+    png_level_label.Text = "PNG level:"
+    png_level_label.Location = Drawing.Point(455, 255)
+    png_level_label.AutoSize = True
+    form.Controls.Add(png_level_label)
+    png_level_num = WinForms.NumericUpDown()
+    png_level_num.Location = Drawing.Point(545, 251)
+    png_level_num.Size = Drawing.Size(65, 22)
+    png_level_num.Minimum = 0
+    png_level_num.Maximum = 9
+    png_level_num.Value = int(config.get("pdf_rasterizer_default_png_compression_level") or 9)
+    form.Controls.Add(png_level_num)
+
+    indexed_label = WinForms.Label()
+    indexed_label.Text = "Indexed colors:"
+    indexed_label.Location = Drawing.Point(455, 282)
+    indexed_label.AutoSize = True
+    form.Controls.Add(indexed_label)
+    indexed_combo = WinForms.ComboBox()
+    indexed_combo.DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+    indexed_combo.Location = Drawing.Point(545, 278)
+    indexed_combo.Size = Drawing.Size(75, 22)
+    for item in ["16", "32", "64", "128", "256"]:
+        indexed_combo.Items.Add(item)
+    choose_combobox_value(
+        indexed_combo, str(config.get("pdf_rasterizer_default_indexed_colors") or 128)
+    )
+    form.Controls.Add(indexed_combo)
+
+    page_label = WinForms.Label()
+    page_label.Text = "Page range: All pages only. TODO: custom page ranges."
+    page_label.Location = Drawing.Point(112, 255)
+    page_label.Size = Drawing.Size(400, 22)
+    form.Controls.Add(page_label)
+
+    codec_note = WinForms.Label()
+    codec_note.Text = "Quality % applies only to JPEG."
+    codec_note.Location = Drawing.Point(112, 282)
+    codec_note.Size = Drawing.Size(600, 22)
+    codec_note.ForeColor = Drawing.Color.DarkBlue
+    form.Controls.Add(codec_note)
+
+    status_label = WinForms.Label()
+    status_label.Text = get_pdf_rasterizer_status_text(config)
+    status_label.Location = Drawing.Point(12, 310)
+    status_label.Size = Drawing.Size(650, 48)
+    status_label.ForeColor = Drawing.Color.DarkBlue
+    form.Controls.Add(status_label)
+
+    test_btn = WinForms.Button()
+    test_btn.Text = "Test Rasterizer"
+    test_btn.Location = Drawing.Point(125, 420)
+    test_btn.Size = Drawing.Size(130, 30)
+    form.Controls.Add(test_btn)
+
+    rasterize_btn = WinForms.Button()
+    rasterize_btn.Text = "Rasterize / Flatten"
+    rasterize_btn.Location = Drawing.Point(265, 420)
+    rasterize_btn.Size = Drawing.Size(130, 30)
+    form.Controls.Add(rasterize_btn)
+    matrix_btn = WinForms.Button()
+    matrix_btn.Text = "Run Flatten Matrix"
+    matrix_btn.Location = Drawing.Point(405, 420)
+    matrix_btn.Size = Drawing.Size(130, 30)
+    form.Controls.Add(matrix_btn)
+    cancel_btn = WinForms.Button()
+    cancel_btn.Text = "Cancel"
+    cancel_btn.Location = Drawing.Point(545, 420)
+    cancel_btn.Size = Drawing.Size(95, 30)
+    form.Controls.Add(cancel_btn)
+
+    filename_user_edited = {"value": False}
+    updating_name = {"value": False}
+
+    def update_default_name():
+        path = input_box.Text.strip()
+        if not path or filename_user_edited["value"]:
+            return
+        base = sanitize_filename(os.path.splitext(os.path.basename(path))[0])
+        image_codec = RASTERIZE_CODEC_MAP.get(
+            str(codec_combo.SelectedItem or RASTERIZE_CODEC_LABEL_JPEG), "jpeg"
+        )
+        codec_part = image_codec.replace("-", "")
+        if image_codec == "jpeg":
+            suffix = "_flat_{}dpi_q{}_{}".format(
+                int(dpi_num.Value), int(quality_num.Value), codec_part
+            )
+        elif image_codec == "png-indexed":
+            suffix = "_flat_{}dpi_pngindexed_{}c".format(
+                int(dpi_num.Value), str(indexed_combo.SelectedItem or "128")
+            )
+        elif image_codec == "bw":
+            suffix = "_flat_{}dpi_bw_t{}".format(
+                int(dpi_num.Value), int(threshold_num.Value)
+            )
+        else:
+            suffix = "_flat_{}dpi_{}".format(int(dpi_num.Value), codec_part)
+        filename = "{}{}.pdf".format(base, suffix)
+        updating_name["value"] = True
+        name_box.Text = filename
+        updating_name["value"] = False
+
+    def ensure_output_filename_extension():
+        filename = name_box.Text.strip()
+        if filename and not filename.lower().endswith(".pdf"):
+            updating_name["value"] = True
+            name_box.Text = filename + ".pdf"
+            updating_name["value"] = False
+
+    def on_output_name_changed(sender, args):
+        if not updating_name["value"]:
+            filename_user_edited["value"] = True
+
+    def refresh_codec_state():
+        image_codec = RASTERIZE_CODEC_MAP.get(
+            str(codec_combo.SelectedItem or RASTERIZE_CODEC_LABEL_JPEG), "jpeg"
+        )
+        jpeg_mode = image_codec == "jpeg"
+        bw_mode = image_codec == "bw"
+        png_mode = image_codec in ("png", "png-indexed")
+        indexed_mode = image_codec == "png-indexed"
+        quality_num.Enabled = jpeg_mode
+        quality_label.Enabled = jpeg_mode
+        threshold_num.Visible = bw_mode
+        threshold_label.Visible = bw_mode
+        png_level_num.Visible = png_mode
+        png_level_label.Visible = png_mode
+        indexed_combo.Visible = indexed_mode
+        indexed_label.Visible = indexed_mode
+        if bw_mode:
+            choose_combobox_value(mode_combo, "Black and white")
+            mode_combo.Enabled = False
+            codec_note.Text = "Black/white removes color and uses thresholding."
+        else:
+            mode_combo.Enabled = True
+            if image_codec == "png":
+                codec_note.Text = "PNG is lossless. Quality % does not apply."
+            elif image_codec == "png-indexed":
+                codec_note.Text = "Indexed PNG reduces color count. Useful for drawings."
+            else:
+                codec_note.Text = "JPEG quality controls file size/detail. Lower quality means smaller files."
+        update_default_name()
+
+    def apply_flatten_preset(sender=None, args=None):
+        preset = str(preset_combo.SelectedItem or RASTERIZE_PRESET_REVIEW_SHARP)
+        settings = RASTERIZE_PRESETS.get(preset)
+        if settings:
+            dpi_num.Value = int(settings["dpi"])
+            quality_num.Value = int(settings["quality"])
+            choose_combobox_value(mode_combo, settings["color_mode"])
+            choose_combobox_value(codec_combo, settings["image_codec"])
+            threshold_num.Value = int(settings.get("threshold") or 200)
+            png_level_num.Value = int(settings.get("png_compression_level") or 9)
+            choose_combobox_value(
+                indexed_combo, str(settings.get("indexed_colors") or 128)
+            )
+            refresh_codec_state()
+            update_default_name()
+
+    def on_input_browse(sender, args):
+        selected = choose_existing_pdf_file()
+        if selected:
+            input_box.Text = selected
+            output_box.Text = os.path.dirname(selected)
+            filename_user_edited["value"] = False
+            update_default_name()
+
+    def on_output_browse(sender, args):
+        selected = browse_output_folder(output_box.Text)
+        if selected:
+            output_box.Text = selected
+            update_default_name()
+
+    def validate_dialog_paths():
+        input_pdf = input_box.Text.strip()
+        if not input_pdf or not os.path.exists(input_pdf):
+            forms.alert("Select an existing input PDF.", exitscript=False)
+            return None
+        output_folder = output_box.Text.strip() or os.path.dirname(input_pdf)
+        try:
+            validate_output_folder(output_folder)
+        except Exception as ex:
+            forms.alert(
+                "Output folder is not writable:\n{}".format(ex), exitscript=False
+            )
+            return None
+        filename = name_box.Text.strip()
+        if not filename:
+            filename_user_edited["value"] = False
+            update_default_name()
+            filename = name_box.Text.strip()
+        if not filename.lower().endswith(".pdf"):
+            filename += ".pdf"
+            updating_name["value"] = True
+            name_box.Text = filename
+            updating_name["value"] = False
+        output_pdf = get_unique_pdf_path(os.path.join(output_folder, filename))
+        return input_pdf, output_pdf
+
+    def save_rasterizer_defaults():
+        config["pdf_rasterizer_default_dpi"] = int(dpi_num.Value)
+        config["pdf_rasterizer_default_quality"] = int(quality_num.Value)
+        config["pdf_rasterizer_default_color_mode"] = str(
+            mode_combo.SelectedItem or "Color"
+        )
+        config["pdf_rasterizer_default_image_codec"] = str(
+            codec_combo.SelectedItem or RASTERIZE_CODEC_LABEL_JPEG
+        )
+        config["pdf_rasterizer_default_png_compression_level"] = int(
+            png_level_num.Value
+        )
+        try:
+            config["pdf_rasterizer_default_indexed_colors"] = int(
+                str(indexed_combo.SelectedItem or "128")
+            )
+        except Exception:
+            config["pdf_rasterizer_default_indexed_colors"] = 128
+        config["pdf_rasterizer_default_threshold"] = int(threshold_num.Value)
+        helper = resolve_pdf_rasterizer_helper(config)
+        if helper and helper.get("kind") == "script" and helper.get("python"):
+            config["pdf_rasterizer_python_path"] = helper.get("python")
+        save_pdf_config(config)
+
+    def on_test_rasterizer(sender, args):
+        result = run_pdf_rasterizer_self_test()
+        status_label.Text = format_rasterizer_self_test_result(result)
+        if result.get("ok"):
+            helper_python = result.get("python") or ""
+            if helper_python and os.path.exists(helper_python):
+                config["pdf_rasterizer_python_path"] = helper_python
+                save_pdf_config(config)
+
+    def on_rasterize(sender, args):
+        paths = validate_dialog_paths()
+        if not paths:
+            return
+        save_rasterizer_defaults()
+        input_pdf, output_pdf = paths
+        color_mode = RASTERIZE_COLOR_MODE_MAP.get(
+            str(mode_combo.SelectedItem or "Color"), "color"
+        )
+        image_codec = RASTERIZE_CODEC_MAP.get(
+            str(codec_combo.SelectedItem or RASTERIZE_CODEC_LABEL_JPEG), "jpeg"
+        )
+        old_cursor = form.Cursor
+        form.Cursor = WinForms.Cursors.WaitCursor
+        try:
+            try:
+                indexed_colors = int(str(indexed_combo.SelectedItem or "128"))
+            except Exception:
+                indexed_colors = 128
+            result = run_pdf_rasterizer(
+                input_pdf,
+                output_pdf,
+                int(dpi_num.Value),
+                int(quality_num.Value),
+                color_mode,
+                image_codec,
+                int(threshold_num.Value),
+                int(png_level_num.Value),
+                indexed_colors,
+            )
+        finally:
+            form.Cursor = old_cursor
+        forms.alert(
+            format_rasterize_result(result),
+            title="Rasterize / Flatten Existing PDF",
+            exitscript=False,
+        )
+        status_label.Text = (
+            "Last result: {}".format(format_percent(result.get("reduction_percent")))
+            if result and result.get("ok")
+            else "Last result failed: {}".format((result or {}).get("error") or "")
+        )
+
+    def on_matrix(sender, args):
+        paths = validate_dialog_paths()
+        if not paths:
+            return
+        save_rasterizer_defaults()
+        input_pdf, output_pdf = paths
+        old_cursor = form.Cursor
+        form.Cursor = WinForms.Cursors.WaitCursor
+        try:
+            run_flatten_matrix(input_pdf, os.path.dirname(output_pdf))
+        finally:
+            form.Cursor = old_cursor
+
+    def on_cancel(sender, args):
+        form.DialogResult = WinForms.DialogResult.Cancel
+        form.Close()
+
+    input_browse.Click += on_input_browse
+    output_browse.Click += on_output_browse
+    name_box.TextChanged += on_output_name_changed
+    preset_combo.SelectedIndexChanged += apply_flatten_preset
+    dpi_num.ValueChanged += lambda sender, args: update_default_name()
+    quality_num.ValueChanged += lambda sender, args: update_default_name()
+    mode_combo.SelectedIndexChanged += lambda sender, args: update_default_name()
+    codec_combo.SelectedIndexChanged += lambda sender, args: refresh_codec_state()
+    threshold_num.ValueChanged += lambda sender, args: update_default_name()
+    png_level_num.ValueChanged += lambda sender, args: update_default_name()
+    indexed_combo.SelectedIndexChanged += lambda sender, args: update_default_name()
+    test_btn.Click += on_test_rasterizer
+    rasterize_btn.Click += on_rasterize
+    matrix_btn.Click += on_matrix
+    cancel_btn.Click += on_cancel
+    form.CancelButton = cancel_btn
+
+    apply_flatten_preset()
+    form.ShowDialog()
+
+
 def choose_combobox_value(combo, value):
     try:
         for i in range(combo.Items.Count):
@@ -2802,7 +3881,7 @@ def show_create_print_set_pdf_dialog():
     opt_group = WinForms.GroupBox()
     opt_group.Text = "Post-export compression"
     opt_group.Location = Drawing.Point(630, 320)
-    opt_group.Size = Drawing.Size(330, 300)
+    opt_group.Size = Drawing.Size(330, 334)
     opt_group.Anchor = WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Right
     form.Controls.Add(opt_group)
 
@@ -2931,6 +4010,12 @@ def show_create_print_set_pdf_dialog():
     pdf24_matrix_btn.Location = Drawing.Point(198, 266)
     pdf24_matrix_btn.Size = Drawing.Size(112, 28)
     opt_group.Controls.Add(pdf24_matrix_btn)
+
+    flatten_existing_btn = WinForms.Button()
+    flatten_existing_btn.Text = "Rasterize Existing PDF..."
+    flatten_existing_btn.Location = Drawing.Point(12, 300)
+    flatten_existing_btn.Size = Drawing.Size(178, 28)
+    opt_group.Controls.Add(flatten_existing_btn)
 
     create_btn = WinForms.Button()
     create_btn.Text = "Create / Export"
@@ -3558,6 +4643,17 @@ def show_create_print_set_pdf_dialog():
                         if compression
                         else "PDF24 compression failed."
                     )
+                    if (
+                        compression
+                        and compression.get("success")
+                        and compression.get("reduction_percent") is not None
+                        and compression.get("reduction_percent") < 10.0
+                    ):
+                        result += (
+                            "\n\nReduction is limited. This PDF is likely vector-heavy "
+                            "or already compressed. Use Rasterize / Flatten Existing PDF "
+                            "for a smaller review copy."
+                        )
                 else:
                     result = "PDF24 compressor not found."
         else:
@@ -3572,6 +4668,9 @@ def show_create_print_set_pdf_dialog():
         input_pdf = choose_existing_pdf_file()
         if input_pdf:
             run_pdf24_compression_matrix(input_pdf)
+
+    def on_flatten_existing(sender, args):
+        show_rasterize_existing_pdf_dialog()
 
     def on_advanced(sender, args):
         run_advanced_pdf_options()
@@ -3764,6 +4863,7 @@ def show_create_print_set_pdf_dialog():
     test_gs_btn.Click += on_test_gs
     optimize_existing_btn.Click += on_optimize_existing
     pdf24_matrix_btn.Click += on_pdf24_matrix
+    flatten_existing_btn.Click += on_flatten_existing
     advanced_btn.Click += on_advanced
     raster_matrix_btn.Click += on_raster_matrix
     create_btn.Click += on_create

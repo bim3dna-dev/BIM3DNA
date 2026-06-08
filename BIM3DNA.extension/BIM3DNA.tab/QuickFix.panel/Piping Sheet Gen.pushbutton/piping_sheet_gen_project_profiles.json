@@ -2,9 +2,10 @@
   "C:\\Users\\User\\Downloads\\01B Loading Building\\BUNGE_BvdK_R24_3D_Loading Building.rvt": {
     "fitting_schedule_master_name": "ACO pipe fittings", 
     "pipe_schedule_master_name": "Pipe Schedule", 
-    "regular_tag_family_name": "BvdK_Pipe_Riolering_Afm + spot elev_bb_L", 
+    "regular_tag_family_name": "BvdK_Pipe_Riolering_Afm + spot elev_bb_H", 
     "regular_tag_mode": "CUSTOM", 
     "regular_tag_type_name": "afm. + hoogte bb", 
+    "schedule_mode": "Use selected master as-is", 
     "titleblock_display": "BvdK-Bunge_Kader - BvdK_A0_Horizontaal", 
     "use_selected_schedule_masters": true, 
     "vertical_tag_family_name": "M_Vertical_Pipe_Tag", 
