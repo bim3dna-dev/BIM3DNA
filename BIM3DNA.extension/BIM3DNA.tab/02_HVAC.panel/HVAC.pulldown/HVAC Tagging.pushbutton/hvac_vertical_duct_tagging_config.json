@@ -1,6 +1,9 @@
 {
+  "batch_include_dependent_views": false, 
+  "batch_view_name_exclude_filter": "", 
+  "batch_view_name_include_filter": "", 
   "last_loaded_rfa_path": "C:\\Users\\User\\Downloads\\M_Vertical_Duct_Tag_MEPcontent.rfa", 
-  "last_used_action": "Place vertical duct tags for selected candidates", 
+  "last_used_action": "Place vertical duct tags in all floor plan views", 
   "max_skipped_diagnostics_rows": 30, 
   "min_vertical_height_ft": 1.0, 
   "selected_duct_tag_family_name": "M_Vertical_Duct_Tag_MEPcontent", 
@@ -35,9 +38,9 @@
     "Return Air": "CONTINUOUS_UP", 
     "Supply Air": "CONTINUOUS_DOWN"
   }, 
-  "tag_add_leader": true, 
-  "tag_offset_x_ft": 0.98425196850393692, 
-  "tag_offset_x_mm": 300.0, 
+  "tag_add_leader": false, 
+  "tag_offset_x_ft": 0.0, 
+  "tag_offset_x_mm": 0.0, 
   "tag_offset_y_ft": 0.0, 
   "tag_offset_y_mm": 0.0, 
   "vertical_angle_degrees": 80.0, 

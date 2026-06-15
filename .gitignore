@@ -48,6 +48,7 @@ Thumbs.db
 *.pdf
 *.zip
 *.7z
+*.exe
 
 # Runs
 runs/
@@ -67,3 +68,4 @@ OllamaSetup.exe
 BIM3DNA_Toolbar_Installer.exe
 BIM3DNA_Toolbar_Installer_0.2.0.exe
 BIM3DNA_Toolbar_Installer_0.2.1.exe
+BIM3DNA_Toolbar_Installer_0.2.2.exe

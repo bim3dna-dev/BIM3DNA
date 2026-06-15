@@ -1,9 +1,9 @@
 #define MyAppName "BIM3DNA Toolbar"
-#define MyAppVersion "0.2.1"
+#define MyAppVersion "0.2.2"
 #define MyPublisher "BIM3DNA"
 #define MyPublisherURL "https://bim3dna.nl/"
 #define MyExtensionName "BIM3DNA.extension"
-#define MyOutputBaseFilename "BIM3DNA_Toolbar_Installer_0.2.1"
+#define MyOutputBaseFilename "BIM3DNA_Toolbar_Installer_0.2.2"
 #if DirExists("qpdf")
 #define HasBundledQpdf "1"
 #else
@@ -715,7 +715,7 @@ begin
     exit;
 
   Log('BIM3DNA install mode: standard file-copy install.');
-  Log('Git-backed Update BIM3DNA requires the installed extension to be inside a Git working tree. File-copy installs will report Git-backed update unavailable.');
+  Log('Update BIM3DNA supports Git working-tree mode when installed from a clone, and GitHub Release package mode for standard file-copy installs.');
   ConfigureQpdf();
 
   if not IsOllamaInstalled() then

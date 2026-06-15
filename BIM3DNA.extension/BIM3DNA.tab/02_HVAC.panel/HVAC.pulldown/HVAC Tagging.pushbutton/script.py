@@ -27,6 +27,7 @@ from Autodesk.Revit.DB import (
     TagMode,
     TagOrientation,
     Transaction,
+    TransactionGroup,
     ViewPlan,
     XYZ,
 )
@@ -96,6 +97,8 @@ STATUS_SKIPPED_NOT_VERTICAL = "SKIPPED_NOT_VERTICAL"
 STATUS_SKIPPED_TOO_SHORT = "SKIPPED_TOO_SHORT"
 STATUS_OUTSIDE_ACTIVE_LEVEL_BAND = "SKIPPED_OUTSIDE_ACTIVE_LEVEL_BAND"
 STATUS_SKIPPED_OTHER = "SKIPPED_OTHER"
+STATUS_SKIPPED_UNCONFIGURED_SYSTEM_INTENT = "SKIPPED_UNCONFIGURED_SYSTEM_INTENT"
+STATUS_SKIPPED_ALREADY_TAGGED_IN_VIEW = "SKIPPED_ALREADY_TAGGED_IN_VIEW"
 
 VERTICAL_INTENT_KEYWORDS = [
     "vertical",
@@ -130,6 +133,9 @@ DEFAULT_CONFIG = {
     "tag_offset_x_mm": 0.0,
     "tag_offset_y_mm": 0.0,
     "tag_add_leader": False,
+    "batch_include_dependent_views": False,
+    "batch_view_name_include_filter": "",
+    "batch_view_name_exclude_filter": "",
     "last_used_action": "",
 }
 
@@ -241,6 +247,19 @@ def output_emit(output, text):
         except Exception:
             pass
     print(text)
+
+
+def output_table(output, headers, rows):
+    output_emit(output, "|" + "|".join(headers) + "|")
+    output_emit(output, "|" + "|".join(["---"] * len(headers)) + "|")
+    if not rows:
+        output_emit(output, "|" + "|".join(["-"] * len(headers)) + "|")
+        return
+    for values in rows:
+        output_emit(
+            output,
+            "|" + "|".join([str(value).replace("\n", " ") for value in values]) + "|",
+        )
 
 
 def linkify(output, element_id):
@@ -1170,15 +1189,48 @@ def loose_match_type_for_intent(intent, symbols):
 def get_selected_family_symbols(cfg):
     selected_family = cfg.get("selected_duct_tag_family_name") or ""
     selected_norm = normalize_name(selected_family)
-    family_symbols = []
-    for symbol in collect_loaded_duct_tag_symbols():
-        if (
-            selected_norm
-            and normalize_name(get_family_name_from_symbol(symbol)) != selected_norm
-        ):
-            continue
-        family_symbols.append(symbol)
-    return family_symbols
+    all_symbols = collect_loaded_duct_tag_symbols()
+    if not selected_norm:
+        return []
+
+    exact = [
+        symbol
+        for symbol in all_symbols
+        if normalize_name(get_family_name_from_symbol(symbol)) == selected_norm
+    ]
+    if exact:
+        return exact
+
+    configured_symbol_id = str(cfg.get("selected_duct_tag_symbol_id") or "").strip()
+    if configured_symbol_id:
+        try:
+            configured_symbol = doc.GetElement(ElementId(int(configured_symbol_id)))
+            if is_duct_tag_symbol(configured_symbol):
+                configured_family_norm = normalize_name(
+                    get_family_name_from_symbol(configured_symbol)
+                )
+                by_symbol_family = [
+                    symbol
+                    for symbol in all_symbols
+                    if normalize_name(get_family_name_from_symbol(symbol))
+                    == configured_family_norm
+                ]
+                if by_symbol_family:
+                    return by_symbol_family
+        except Exception:
+            pass
+
+    # Tolerate a legacy/configured display label only when it identifies one family.
+    grouped = group_symbols_by_family(all_symbols)
+    possible_names = [
+        family_name
+        for family_name in grouped.keys()
+        if selected_norm in normalize_name(family_name)
+        or normalize_name(family_name) in selected_norm
+    ]
+    if len(possible_names) == 1:
+        return grouped[possible_names[0]]
+    return []
 
 
 def resolve_symbol_for_final_intent(intent, symbols):
@@ -1201,6 +1253,110 @@ def resolve_symbol_for_final_intent(intent, symbols):
             if normalize_name(get_symbol_type_name(symbol)) == matched_norm:
                 return symbol
     return None
+
+
+def build_vertical_intent_symbol_map(symbols):
+    intent_map = {}
+    intents = [
+        INTENT_CONTINUOUS_DOWN,
+        INTENT_CONTINUOUS_UP,
+        INTENT_GOING_UP,
+        INTENT_GOING_DOWN,
+        INTENT_COMING_UP,
+        INTENT_COMING_DOWN,
+    ]
+    for intent in intents:
+        symbol = resolve_symbol_for_final_intent(intent, symbols)
+        if symbol is not None:
+            intent_map[intent] = symbol
+    return intent_map
+
+
+def try_load_configured_duct_tag_family(cfg):
+    path = str(cfg.get("last_loaded_rfa_path") or "").strip()
+    if not path or not os.path.isfile(path):
+        return False, "Configured family file path is unavailable."
+    transaction = Transaction(
+        doc, "Smart HVAC Vertical Duct Tags - Reload Configured Family"
+    )
+    try:
+        transaction.Start()
+        try:
+            doc.LoadFamily(path, DuctTagFamilyLoadOptions())
+        except Exception:
+            doc.LoadFamily(path)
+        transaction.Commit()
+        print("FAMILY LOAD -> guarded configured family load: {}".format(path))
+        return True, ""
+    except Exception as ex:
+        try:
+            if transaction.HasStarted() and not transaction.HasEnded():
+                transaction.RollBack()
+        except Exception:
+            pass
+        return False, str(ex)
+
+
+def resolve_selected_family_intent_symbols(cfg, allow_guarded_load):
+    selected_family = cfg.get("selected_duct_tag_family_name") or ""
+    symbols = get_selected_family_symbols(cfg)
+    if not symbols and allow_guarded_load:
+        loaded, reason = try_load_configured_duct_tag_family(cfg)
+        print(
+            "BATCH HVAC TAG RESOLVE -> guarded family load success={} reason={}".format(
+                loaded, reason or "-"
+            )
+        )
+        symbols = get_selected_family_symbols(cfg)
+
+    available_type_names = sorted([get_symbol_type_name(symbol) for symbol in symbols])
+    intent_map = build_vertical_intent_symbol_map(symbols)
+    print(
+        "BATCH HVAC TAG RESOLVE -> selected family: {}".format(selected_family or "-")
+    )
+    print(
+        "BATCH HVAC TAG RESOLVE -> available type names: {}".format(
+            available_type_names
+        )
+    )
+    print(
+        "BATCH HVAC TAG RESOLVE -> intent map: {}".format(
+            dict(
+                [
+                    (intent, get_symbol_type_name(symbol))
+                    for intent, symbol in intent_map.items()
+                ]
+            )
+        )
+    )
+    for intent in [
+        INTENT_CONTINUOUS_DOWN,
+        INTENT_CONTINUOUS_UP,
+        INTENT_GOING_UP,
+        INTENT_GOING_DOWN,
+        INTENT_COMING_UP,
+        INTENT_COMING_DOWN,
+    ]:
+        symbol = intent_map.get(intent)
+        if symbol is not None:
+            print(
+                "BATCH HVAC TAG RESOLVE -> {} resolved to {}".format(
+                    intent, get_symbol_type_name(symbol)
+                )
+            )
+        else:
+            print(
+                "BATCH HVAC TAG RESOLVE -> failed intent {}; available types: {}".format(
+                    intent, available_type_names
+                )
+            )
+
+    error = ""
+    if not selected_family:
+        error = "No selected duct tag family is configured."
+    elif not symbols:
+        error = "Selected duct tag family is not loaded."
+    return symbols, intent_map, error
 
 
 def get_existing_tagged_element_ids_in_view(view):
@@ -1231,7 +1387,7 @@ def get_existing_tagged_element_ids_in_view(view):
     return tagged_ids
 
 
-def get_vertical_duct_tag_point(row, cfg):
+def get_vertical_duct_tag_point(row, cfg, view=None):
     start_z = row.get("start_z")
     end_z = row.get("end_z")
     p0, p1, status = get_duct_line_endpoints(
@@ -1243,7 +1399,8 @@ def get_vertical_duct_tag_point(row, cfg):
     y = (p0.Y + p1.Y) / 2.0 + get_tag_offset_y_ft(cfg)
     z = start_z if start_z is not None else p0.Z
     try:
-        active_level = get_active_level(doc.ActiveView)
+        target_view = view if view is not None else doc.ActiveView
+        active_level = get_active_level(target_view)
         if active_level is not None:
             z = active_level.Elevation
     except Exception:
@@ -1338,6 +1495,7 @@ def prepare_selected_vertical_duct_tag_candidates():
     family_symbols = get_selected_family_symbols(cfg)
     if not family_symbols:
         return [], [], "Selected duct tag family was not found in the current document."
+    intent_symbol_map = build_vertical_intent_symbol_map(family_symbols)
 
     already_tagged = get_existing_tagged_element_ids_in_view(view)
     candidates = []
@@ -1357,9 +1515,7 @@ def prepare_selected_vertical_duct_tag_candidates():
             skipped.append({"duct_id": elem_id.IntegerValue, "reason": row["status"]})
             continue
         row = apply_system_intent_override(row, cfg)
-        symbol = resolve_symbol_for_final_intent(
-            row.get("final_intent"), family_symbols
-        )
+        symbol = intent_symbol_map.get(row.get("final_intent"))
         if symbol is None:
             skipped.append(
                 {
@@ -1502,13 +1658,9 @@ def place_vertical_duct_tags_for_selected_candidates():
         output_emit(output, "- Tags created: `0`")
         output_emit(
             output,
-            "- Skipped already tagged: `{}`".format(
-                counts["skipped_already_tagged"]
-            ),
+            "- Skipped already tagged: `{}`".format(counts["skipped_already_tagged"]),
         )
-        output_emit(
-            output, "- Skipped invalid: `{}`".format(counts["skipped_invalid"])
-        )
+        output_emit(output, "- Skipped invalid: `{}`".format(counts["skipped_invalid"]))
         output_emit(output, "- Failed: `0`")
         output_emit(output, "")
         output_emit(output, "## Skipped / Failed")
@@ -1624,9 +1776,7 @@ def place_vertical_duct_tags_for_selected_candidates():
     )
     output_emit(
         output,
-        "- Valid vertical candidates: `{}`".format(
-            counts["valid_vertical_candidates"]
-        ),
+        "- Valid vertical candidates: `{}`".format(counts["valid_vertical_candidates"]),
     )
     output_emit(
         output,
@@ -1637,9 +1787,7 @@ def place_vertical_duct_tags_for_selected_candidates():
         output,
         "- Skipped already tagged: `{}`".format(counts["skipped_already_tagged"]),
     )
-    output_emit(
-        output, "- Skipped invalid: `{}`".format(counts["skipped_invalid"])
-    )
+    output_emit(output, "- Skipped invalid: `{}`".format(counts["skipped_invalid"]))
     output_emit(output, "- Failed: `{}`".format(counts["failed"]))
 
     output_emit(output, "")
@@ -1702,6 +1850,759 @@ def place_vertical_duct_tags_for_selected_candidates():
             uidoc.Selection.SetElementIds(id_list)
         except Exception:
             pass
+
+
+# =========================
+# All floor plan batch workflow
+# =========================
+def is_dependent_plan_view(view):
+    try:
+        primary_id = view.GetPrimaryViewId()
+        return primary_id is not None and primary_id.IntegerValue > 0
+    except Exception:
+        return False
+
+
+def split_filter_terms(value):
+    text = str(value or "").strip()
+    if not text:
+        return []
+    text = text.replace(";", ",")
+    return [item.strip().lower() for item in text.split(",") if item.strip()]
+
+
+def view_name_matches_batch_filters(view, cfg):
+    name = safe_name(view).lower()
+    if "template" in name:
+        return False
+    include_terms = split_filter_terms(cfg.get("batch_view_name_include_filter", ""))
+    exclude_terms = split_filter_terms(cfg.get("batch_view_name_exclude_filter", ""))
+    if include_terms and not any([term in name for term in include_terms]):
+        return False
+    if exclude_terms and any([term in name for term in exclude_terms]):
+        return False
+    return True
+
+
+def collect_batch_floor_plan_views(cfg):
+    views = []
+    include_dependents = bool(cfg.get("batch_include_dependent_views", False))
+    try:
+        collector = FilteredElementCollector(doc).OfClass(ViewPlan)
+        for view in collector:
+            try:
+                if view.IsTemplate or view.GenLevel is None:
+                    continue
+                view_type_name = str(view.ViewType)
+                if view_type_name not in ("FloorPlan", "EngineeringPlan"):
+                    continue
+                if not include_dependents and is_dependent_plan_view(view):
+                    continue
+                if not view_name_matches_batch_filters(view, cfg):
+                    continue
+                views.append(view)
+            except Exception:
+                continue
+    except Exception as ex:
+        print("BATCH HVAC VERTICAL DUCTS -> view discovery failed: {}".format(ex))
+    views.sort(
+        key=lambda view: (
+            view.GenLevel.Elevation if view.GenLevel is not None else 0.0,
+            safe_name(view).lower(),
+            view.Id.IntegerValue,
+        )
+    )
+    print(
+        "BATCH HVAC VERTICAL DUCTS -> eligible views: {}".format(
+            [
+                {
+                    "view_id": view.Id.IntegerValue,
+                    "view_name": safe_name(view),
+                    "level": safe_name(view.GenLevel),
+                }
+                for view in views
+            ]
+        )
+    )
+    return views
+
+
+def get_explicit_batch_system_override(row, cfg):
+    system_key = get_system_summary_key(row)
+    overrides = get_system_intent_overrides(cfg)
+    configured = system_key in overrides
+    override_intent = overrides.get(system_key)
+    if override_intent not in ALLOWED_SYSTEM_INTENT_OVERRIDES:
+        configured = False
+        override_intent = None
+    return system_key, override_intent, configured
+
+
+def scan_batch_view(view, cfg, levels, intent_symbol_map):
+    active_level = get_active_level(view)
+    result = {
+        "view": view,
+        "view_id": view.Id.IntegerValue,
+        "view_name": safe_name(view),
+        "level_name": safe_name(active_level),
+        "ducts_checked": 0,
+        "vertical_candidates": [],
+        "taggable_candidates": [],
+        "unconfigured_candidates": [],
+        "already_tagged_candidates": [],
+        "skipped_rows": [],
+        "failed_rows": [],
+        "created_rows": [],
+    }
+    if active_level is None:
+        result["failed_rows"].append(
+            {"duct_id": "-", "reason": "View has no valid GenLevel."}
+        )
+        return result
+
+    band_bottom, band_top = get_active_level_band(active_level, levels)
+    result["band_bottom"] = band_bottom
+    result["band_top"] = band_top
+    already_tagged = get_existing_tagged_element_ids_in_view(view)
+    try:
+        collector = (
+            FilteredElementCollector(doc, view.Id)
+            .OfCategory(BuiltInCategory.OST_DuctCurves)
+            .WhereElementIsNotElementType()
+        )
+        for duct in collector:
+            if not is_duct_curve(duct):
+                continue
+            result["ducts_checked"] += 1
+            row = classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg)
+            row["view"] = view
+            row["view_id"] = view.Id.IntegerValue
+            row["view_name"] = safe_name(view)
+            row["level_name"] = safe_name(active_level)
+            if row["status"] != STATUS_VERTICAL_CANDIDATE:
+                result["skipped_rows"].append(row)
+                continue
+
+            system_key, override_intent, configured = (
+                get_explicit_batch_system_override(row, cfg)
+            )
+            row["system_key"] = system_key
+            row["geometry_intent"] = row.get("intent") or INTENT_UNKNOWN_VERTICAL_DUCT
+            row["batch_system_configured"] = configured
+            result["vertical_candidates"].append(row)
+
+            if not configured:
+                row["override_intent"] = "-"
+                row["final_intent"] = "-"
+                row["batch_skip_reason"] = STATUS_SKIPPED_UNCONFIGURED_SYSTEM_INTENT
+                result["unconfigured_candidates"].append(row)
+                continue
+
+            row = apply_system_intent_override(row, cfg)
+            symbol = intent_symbol_map.get(row.get("final_intent"))
+            row["tag_symbol"] = symbol
+            row["tag_type"] = (
+                get_symbol_type_name(symbol) if symbol is not None else "-"
+            )
+            row["suggested_tag_type"] = row["tag_type"]
+            row["already_tagged"] = row["duct_id"] in already_tagged
+            if row["already_tagged"]:
+                row["batch_skip_reason"] = STATUS_SKIPPED_ALREADY_TAGGED_IN_VIEW
+                result["already_tagged_candidates"].append(row)
+                continue
+            if symbol is None:
+                row["batch_skip_reason"] = "SKIPPED_NO_MATCHING_TAG_TYPE_FOR_{}".format(
+                    row.get("final_intent") or "-"
+                )
+                result["skipped_rows"].append(row)
+                continue
+            tag_point = get_vertical_duct_tag_point(row, cfg, view)
+            if tag_point is None:
+                row["batch_skip_reason"] = "SKIPPED_TAG_POINT_UNRESOLVED"
+                result["skipped_rows"].append(row)
+                continue
+            row["tag_point"] = tag_point
+            result["taggable_candidates"].append(row)
+    except Exception as ex:
+        result["failed_rows"].append({"duct_id": "-", "reason": str(ex)})
+    print(
+        "BATCH HVAC VERTICAL DUCTS -> checked view: {} | level={} | ducts={} | "
+        "candidates={} | taggable={} | unconfigured={} | already_tagged={}".format(
+            result["view_name"],
+            result["level_name"],
+            result["ducts_checked"],
+            len(result["vertical_candidates"]),
+            len(result["taggable_candidates"]),
+            len(result["unconfigured_candidates"]),
+            len(result["already_tagged_candidates"]),
+        )
+    )
+    return result
+
+
+def run_all_floor_plan_scan(cfg):
+    views = collect_batch_floor_plan_views(cfg)
+    levels = collect_project_levels()
+    family_symbols, intent_symbol_map, family_error = (
+        resolve_selected_family_intent_symbols(cfg, True)
+    )
+    if family_error:
+        print("BATCH HVAC TAG RESOLVE -> error: {}".format(family_error))
+        return views, [], family_error
+    results = []
+    for view in views:
+        results.append(scan_batch_view(view, cfg, levels, intent_symbol_map))
+    total_candidates = sum([len(result["vertical_candidates"]) for result in results])
+    unconfigured_keys = sorted(
+        set(
+            [
+                row.get("system_key") or "-"
+                for result in results
+                for row in result["unconfigured_candidates"]
+            ]
+        )
+    )
+    print("BATCH HVAC VERTICAL DUCTS -> total candidates: {}".format(total_candidates))
+    print(
+        "BATCH HVAC VERTICAL DUCTS -> unconfigured system keys: {}".format(
+            unconfigured_keys
+        )
+    )
+    return views, results, ""
+
+
+def batch_scan_totals(views, results):
+    return {
+        "eligible_views": len(views),
+        "views_checked": len(results),
+        "ducts_checked": sum([r["ducts_checked"] for r in results]),
+        "vertical_candidates": sum([len(r["vertical_candidates"]) for r in results]),
+        "configured_candidates": sum(
+            [
+                len(
+                    [
+                        row
+                        for row in r["vertical_candidates"]
+                        if row.get("batch_system_configured")
+                    ]
+                )
+                for r in results
+            ]
+        ),
+        "taggable_candidates": sum([len(r["taggable_candidates"]) for r in results]),
+        "unconfigured": sum([len(r["unconfigured_candidates"]) for r in results]),
+        "already_tagged": sum([len(r["already_tagged_candidates"]) for r in results]),
+        "failed": sum([len(r["failed_rows"]) for r in results]),
+    }
+
+
+def emit_batch_scope(output, cfg, totals):
+    output_emit(output, "## Batch View Scope")
+    output_emit(
+        output,
+        "- Eligible floor plan views: `{}`".format(totals["eligible_views"]),
+    )
+    output_emit(
+        output,
+        "- Include dependent views: `{}`".format(
+            fmt_bool(cfg.get("batch_include_dependent_views", False))
+        ),
+    )
+    output_emit(
+        output,
+        "- View name include filter: `{}`".format(
+            cfg.get("batch_view_name_include_filter", "") or "-"
+        ),
+    )
+    output_emit(
+        output,
+        "- View name exclude filter: `{}`".format(
+            cfg.get("batch_view_name_exclude_filter", "") or "-"
+        ),
+    )
+
+
+def emit_batch_per_view_summary(output, results, include_created):
+    headers = [
+        "View name",
+        "Level",
+        "Ducts checked",
+        "Vertical candidates",
+        "Taggable candidates",
+        "Tags created",
+        "Skipped already tagged",
+        "Skipped unconfigured system",
+        "Failed",
+    ]
+    rows = []
+    for result in results:
+        rows.append(
+            [
+                result["view_name"],
+                result["level_name"],
+                result["ducts_checked"],
+                len(result["vertical_candidates"]),
+                len(result["taggable_candidates"]),
+                len(result["created_rows"]) if include_created else 0,
+                len(result["already_tagged_candidates"]),
+                len(result["unconfigured_candidates"]),
+                len(result["failed_rows"]),
+            ]
+        )
+    output_table(output, headers, rows)
+
+
+def scan_all_floor_plan_views_for_vertical_ducts():
+    cfg = get_config()
+    cfg["last_used_action"] = "Scan all floor plan views for vertical ducts"
+    write_config(cfg)
+    views, results, error = run_all_floor_plan_scan(cfg)
+    if error:
+        TaskDialog.Show("Scan all floor plan views for vertical ducts", error)
+        return
+    totals = batch_scan_totals(views, results)
+    output = script.get_output() if script is not None else None
+
+    output_emit(output, "# Smart HVAC Vertical Duct Tags - All Floor Plan Scan")
+    output_emit(output, "")
+    emit_batch_scope(output, cfg, totals)
+    output_emit(output, "")
+    output_emit(output, "## Batch Summary")
+    output_emit(output, "- Views checked: `{}`".format(totals["views_checked"]))
+    output_emit(output, "- Total ducts checked: `{}`".format(totals["ducts_checked"]))
+    output_emit(
+        output,
+        "- Total vertical candidates: `{}`".format(totals["vertical_candidates"]),
+    )
+    output_emit(
+        output,
+        "- Candidates with configured system rule: `{}`".format(
+            totals["configured_candidates"]
+        ),
+    )
+    output_emit(
+        output,
+        "- Candidates skipped unconfigured system: `{}`".format(totals["unconfigured"]),
+    )
+    output_emit(
+        output,
+        "- Candidates already tagged in view: `{}`".format(totals["already_tagged"]),
+    )
+    output_emit(
+        output,
+        "- Taggable candidates: `{}`".format(totals["taggable_candidates"]),
+    )
+
+    output_emit(output, "")
+    output_emit(output, "## Per View Summary")
+    emit_batch_per_view_summary(output, results, False)
+
+    output_emit(output, "")
+    output_emit(output, "## Valid Candidates")
+    candidate_rows = []
+    for result in results:
+        for row in result["vertical_candidates"]:
+            candidate_rows.append(
+                [
+                    result["view_name"],
+                    result["level_name"],
+                    linkify(output, row["duct_id"]),
+                    row.get("system_type") or "-",
+                    row.get("system_key") or "-",
+                    row.get("geometry_intent") or row.get("intent") or "-",
+                    row.get("override_intent") or "-",
+                    row.get("final_intent") or "-",
+                    row.get("tag_type") or "-",
+                    row.get("batch_skip_reason") or "TAGGABLE",
+                ]
+            )
+    output_table(
+        output,
+        [
+            "View name",
+            "Level",
+            "Duct id",
+            "System Type",
+            "System key",
+            "Geometry intent",
+            "Override intent",
+            "Final intent",
+            "Tag type",
+            "Status",
+        ],
+        candidate_rows,
+    )
+
+    output_emit(output, "")
+    output_emit(output, "## Unconfigured System Keys")
+    grouped = {}
+    for result in results:
+        for row in result["unconfigured_candidates"]:
+            key = row.get("system_key") or "-"
+            grouped.setdefault(key, []).append(
+                "{}:{}".format(result["view_name"], row["duct_id"])
+            )
+    output_table(
+        output,
+        ["System key", "Candidate count", "View / duct ids"],
+        [
+            [key, len(grouped[key]), ", ".join(grouped[key])]
+            for key in sorted(grouped.keys())
+        ],
+    )
+
+    output_emit(output, "")
+    output_emit(output, "## Skipped / Already Tagged Summary")
+    output_emit(
+        output,
+        "- Already tagged in same view: `{}`".format(totals["already_tagged"]),
+    )
+    output_emit(
+        output,
+        "- Unconfigured system intent: `{}`".format(totals["unconfigured"]),
+    )
+    output_emit(output, "- Scan failures: `{}`".format(totals["failed"]))
+    TaskDialog.Show(
+        "Scan all floor plan views for vertical ducts",
+        (
+            "Batch scan completed.\n\n"
+            "Views checked: {}\n"
+            "Vertical candidates: {}\n"
+            "Taggable candidates: {}\n"
+            "Unconfigured system candidates: {}\n"
+            "Already tagged in view: {}\n\n"
+            "See the pyRevit output report for details."
+        ).format(
+            totals["views_checked"],
+            totals["vertical_candidates"],
+            totals["taggable_candidates"],
+            totals["unconfigured"],
+            totals["already_tagged"],
+        ),
+    )
+
+
+def confirm_all_floor_plan_tag_placement(results):
+    output = script.get_output() if script is not None else None
+    output_emit(output, "# Smart HVAC Vertical Duct Tags - Batch Placement Preview")
+    rows = []
+    for result in results:
+        for row in result["taggable_candidates"]:
+            rows.append(
+                [
+                    result["view_name"],
+                    result["level_name"],
+                    linkify(output, row["duct_id"]),
+                    row.get("system_type") or "-",
+                    row.get("system_key") or "-",
+                    row.get("geometry_intent") or "-",
+                    row.get("override_intent") or "-",
+                    row.get("final_intent") or "-",
+                    row.get("tag_type") or "-",
+                    fmt_bool(row.get("already_tagged", False)),
+                ]
+            )
+    output_table(
+        output,
+        [
+            "View name",
+            "Level",
+            "Duct id",
+            "System Type",
+            "System key",
+            "Geometry intent",
+            "Override intent",
+            "Final intent",
+            "Tag type",
+            "Already tagged",
+        ],
+        rows,
+    )
+    return ask_yes_no(
+        "Place vertical duct tags in all floor plan views",
+        "Place {} vertical duct tag(s) across {} eligible floor plan view(s)?".format(
+            len(rows), len(results)
+        ),
+    )
+
+
+def place_vertical_duct_tags_in_all_floor_plan_views():
+    cfg = get_config()
+    cfg["last_used_action"] = "Place vertical duct tags in all floor plan views"
+    write_config(cfg)
+    if not bool(cfg.get("selected_family_api_compatible", False)) or not bool(
+        cfg.get("selected_family_vertical_intent_match", False)
+    ):
+        TaskDialog.Show(
+            "Place vertical duct tags in all floor plan views",
+            (
+                "No selected vertical-intent-compatible duct tag family is configured. "
+                "Choose loaded vertical duct tag family first."
+            ),
+        )
+        return
+
+    views, results, error = run_all_floor_plan_scan(cfg)
+    if error:
+        TaskDialog.Show("Place vertical duct tags in all floor plan views", error)
+        return
+    totals = batch_scan_totals(views, results)
+    if totals["taggable_candidates"] == 0:
+        output = script.get_output() if script is not None else None
+        output_emit(
+            output,
+            "# Smart HVAC Vertical Duct Tags - All Floor Plan Placement Report",
+        )
+        output_emit(output, "")
+        output_emit(output, "## Batch Summary")
+        output_emit(output, "- Views checked: `{}`".format(totals["views_checked"]))
+        output_emit(
+            output,
+            "- Valid vertical candidates: `{}`".format(totals["vertical_candidates"]),
+        )
+        output_emit(output, "- Taggable candidates: `0`")
+        output_emit(output, "- Tags created: `0`")
+        output_emit(
+            output,
+            "- Skipped already tagged in view: `{}`".format(totals["already_tagged"]),
+        )
+        output_emit(
+            output,
+            "- Skipped unconfigured system: `{}`".format(totals["unconfigured"]),
+        )
+        output_emit(output, "")
+        output_emit(output, "## Per View Placement Summary")
+        emit_batch_per_view_summary(output, results, True)
+        TaskDialog.Show(
+            "Place vertical duct tags in all floor plan views",
+            (
+                "No batch candidates can be tagged.\n\n"
+                "Check unconfigured system keys, duplicate tags, and selected tag types "
+                "in the batch scan report."
+            ),
+        )
+        return
+    if not confirm_all_floor_plan_tag_placement(results):
+        print("BATCH HVAC VERTICAL DUCT TAGS -> user cancelled before transaction")
+        return
+
+    add_leader = bool(cfg.get("tag_add_leader", False))
+    created = []
+    failed = []
+    group = TransactionGroup(doc, "Smart HVAC Vertical Duct Tags - Batch Placement")
+    group_started = False
+    try:
+        group.Start()
+        group_started = True
+        for result in results:
+            candidates = result["taggable_candidates"]
+            if not candidates:
+                continue
+            transaction = Transaction(
+                doc, "Place tags - {}".format(result["view_name"][:80])
+            )
+            view_created = []
+            try:
+                transaction.Start()
+                symbols = []
+                for row in candidates:
+                    symbol = row.get("tag_symbol")
+                    if symbol is not None and symbol not in symbols:
+                        symbols.append(symbol)
+                activate_symbols_in_transaction(symbols)
+                for row in candidates:
+                    try:
+                        duct = doc.GetElement(ElementId(int(row["duct_id"])))
+                        tag = create_duct_tag(
+                            result["view"],
+                            duct,
+                            row.get("tag_symbol"),
+                            row.get("tag_point"),
+                            add_leader,
+                        )
+                        view_created.append(
+                            {
+                                "view_name": result["view_name"],
+                                "duct_id": row["duct_id"],
+                                "tag_id": tag.Id.IntegerValue,
+                                "system_key": row.get("system_key") or "-",
+                                "final_intent": row.get("final_intent") or "-",
+                                "tag_type": row.get("tag_type") or "-",
+                                "tag_point": row.get("tag_point"),
+                            }
+                        )
+                    except Exception as ex:
+                        failure = {
+                            "view_name": result["view_name"],
+                            "duct_id": row["duct_id"],
+                            "reason": str(ex),
+                        }
+                        failed.append(failure)
+                        result["failed_rows"].append(failure)
+                transaction.Commit()
+                result["created_rows"].extend(view_created)
+                created.extend(view_created)
+            except Exception as ex:
+                try:
+                    if transaction.HasStarted() and not transaction.HasEnded():
+                        transaction.RollBack()
+                except Exception:
+                    pass
+                for row in candidates:
+                    failure = {
+                        "view_name": result["view_name"],
+                        "duct_id": row["duct_id"],
+                        "reason": "View transaction rolled back: {}".format(ex),
+                    }
+                    failed.append(failure)
+                    result["failed_rows"].append(failure)
+        group.Assimilate()
+        group_started = False
+    except Exception as ex:
+        if group_started:
+            try:
+                group.RollBack()
+            except Exception:
+                pass
+        TaskDialog.Show(
+            "Place vertical duct tags in all floor plan views",
+            "Batch transaction group failed and was rolled back: {}".format(ex),
+        )
+        return
+
+    print(
+        "BATCH HVAC VERTICAL DUCT TAGS -> created tags: {}".format(
+            [row["tag_id"] for row in created]
+        )
+    )
+    print(
+        "BATCH HVAC VERTICAL DUCT TAGS -> skipped already tagged: {}".format(
+            [
+                {
+                    "view": result["view_name"],
+                    "duct_id": row["duct_id"],
+                }
+                for result in results
+                for row in result["already_tagged_candidates"]
+            ]
+        )
+    )
+    print("BATCH HVAC VERTICAL DUCT TAGS -> failed: {}".format(failed))
+
+    totals = batch_scan_totals(views, results)
+    output = script.get_output() if script is not None else None
+    output_emit(
+        output,
+        "# Smart HVAC Vertical Duct Tags - All Floor Plan Placement Report",
+    )
+    output_emit(output, "")
+    output_emit(output, "## Placement Settings")
+    output_emit(
+        output, "- Tag offset X mm: `{}`".format(cfg.get("tag_offset_x_mm", 0.0))
+    )
+    output_emit(
+        output, "- Tag offset Y mm: `{}`".format(cfg.get("tag_offset_y_mm", 0.0))
+    )
+    output_emit(output, "- Add leader: `{}`".format(fmt_bool(add_leader)))
+    output_emit(output, "")
+    output_emit(output, "## Batch Summary")
+    output_emit(output, "- Views checked: `{}`".format(totals["views_checked"]))
+    output_emit(
+        output,
+        "- Valid vertical candidates: `{}`".format(totals["vertical_candidates"]),
+    )
+    output_emit(
+        output,
+        "- Taggable candidates: `{}`".format(totals["taggable_candidates"]),
+    )
+    output_emit(output, "- Tags created: `{}`".format(len(created)))
+    output_emit(
+        output,
+        "- Skipped already tagged in view: `{}`".format(totals["already_tagged"]),
+    )
+    output_emit(
+        output,
+        "- Skipped unconfigured system: `{}`".format(totals["unconfigured"]),
+    )
+    output_emit(output, "- Failed: `{}`".format(len(failed)))
+
+    output_emit(output, "")
+    output_emit(output, "## Per View Placement Summary")
+    emit_batch_per_view_summary(output, results, True)
+
+    output_emit(output, "")
+    output_emit(output, "## Created Tags")
+    output_table(
+        output,
+        [
+            "View name",
+            "Duct id",
+            "Tag id",
+            "System key",
+            "Final intent",
+            "Tag type",
+            "Placement point",
+        ],
+        [
+            [
+                row["view_name"],
+                linkify(output, row["duct_id"]),
+                linkify(output, row["tag_id"]),
+                row["system_key"],
+                row["final_intent"],
+                row["tag_type"],
+                fmt_xyz_mm(row["tag_point"]),
+            ]
+            for row in created
+        ],
+    )
+
+    output_emit(output, "")
+    output_emit(output, "## Skipped / Failed")
+    skipped_rows = []
+    for result in results:
+        for row in result["already_tagged_candidates"]:
+            skipped_rows.append(
+                [
+                    result["view_name"],
+                    linkify(output, row["duct_id"]),
+                    STATUS_SKIPPED_ALREADY_TAGGED_IN_VIEW,
+                ]
+            )
+        for row in result["unconfigured_candidates"]:
+            skipped_rows.append(
+                [
+                    result["view_name"],
+                    linkify(output, row["duct_id"]),
+                    STATUS_SKIPPED_UNCONFIGURED_SYSTEM_INTENT,
+                ]
+            )
+    for row in failed:
+        skipped_rows.append(
+            [
+                row.get("view_name") or "-",
+                linkify(output, row.get("duct_id")),
+                row.get("reason") or "-",
+            ]
+        )
+    output_table(output, ["View name", "Duct id", "Reason"], skipped_rows)
+
+    TaskDialog.Show(
+        "Place vertical duct tags in all floor plan views",
+        (
+            "Batch placement completed.\n\n"
+            "Tags created: {}\n"
+            "Skipped already tagged: {}\n"
+            "Skipped unconfigured system: {}\n"
+            "Failed: {}\n\n"
+            "See the pyRevit output report for details."
+        ).format(
+            len(created),
+            totals["already_tagged"],
+            totals["unconfigured"],
+            len(failed),
+        ),
+    )
 
 
 def parse_float_or_keep(value, current_value, label, warnings):
@@ -1816,12 +2717,8 @@ def scan_active_view_vertical_ducts():
     band_bottom, band_top = get_active_level_band(active_level, levels)
     symbols = collect_loaded_duct_tag_symbols()
     selected_family = cfg.get("selected_duct_tag_family_name") or ""
-    family_symbols = []
-    for symbol in symbols:
-        if not selected_family or normalize_name(
-            get_family_name_from_symbol(symbol)
-        ) == normalize_name(selected_family):
-            family_symbols.append(symbol)
+    family_symbols = get_selected_family_symbols(cfg) if selected_family else symbols
+    intent_symbol_map = build_vertical_intent_symbol_map(family_symbols)
 
     rows = []
     checked = 0
@@ -1838,8 +2735,13 @@ def scan_active_view_vertical_ducts():
             row = classify_vertical_duct(duct, active_level, band_bottom, band_top, cfg)
             if row["status"] == STATUS_VERTICAL_CANDIDATE:
                 row = apply_system_intent_override(row, cfg)
-            row["suggested_tag_type"] = loose_match_type_for_intent(
-                row.get("final_intent") or row["intent"], family_symbols
+            resolved_symbol = intent_symbol_map.get(
+                row.get("final_intent") or row["intent"]
+            )
+            row["suggested_tag_type"] = (
+                get_symbol_type_name(resolved_symbol)
+                if resolved_symbol is not None
+                else ""
             )
             if (
                 row["status"] == STATUS_VERTICAL_CANDIDATE
@@ -2347,6 +3249,8 @@ def main_menu():
     actions = [
         "Scan active view vertical ducts",
         "Place vertical duct tags for selected candidates",
+        "Scan all floor plan views for vertical ducts",
+        "Place vertical duct tags in all floor plan views",
         "Configure vertical duct tag placement settings",
         "Choose loaded vertical duct tag family",
         "Load vertical duct tag family from .rfa",
@@ -2362,6 +3266,10 @@ def main_menu():
             scan_active_view_vertical_ducts()
         elif choice == "Place vertical duct tags for selected candidates":
             place_vertical_duct_tags_for_selected_candidates()
+        elif choice == "Scan all floor plan views for vertical ducts":
+            scan_all_floor_plan_views_for_vertical_ducts()
+        elif choice == "Place vertical duct tags in all floor plan views":
+            place_vertical_duct_tags_in_all_floor_plan_views()
         elif choice == "Configure vertical duct tag placement settings":
             configure_vertical_duct_tag_placement_settings()
         elif choice == "Choose loaded vertical duct tag family":

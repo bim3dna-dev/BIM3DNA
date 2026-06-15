@@ -1,10 +1,7 @@
 {
   "mode": "github_release",
-  "owner": "BIM3DNA",
+  "owner": "bim3dna-dev",
   "repo": "BIM3DNA-Toolbar-Releases",
-  "asset_names": [
-    "BIM3DNA.extension.zip",
-    "BIM3DNA_Toolbar_Update.zip"
-  ],
+  "asset_names": ["BIM3DNA.extension.zip", "BIM3DNA_Toolbar_Update.zip"],
   "channel": "stable"
 }

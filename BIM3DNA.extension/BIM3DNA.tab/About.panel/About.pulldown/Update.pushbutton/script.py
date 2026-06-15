@@ -40,8 +40,8 @@ except Exception:
 
 
 VERSION_FILE_NAME = "BIM3DNA.version.json"
-GITHUB_OWNER = "BIM3DNA"
-GITHUB_REPO = "BIM3DNARevitAPI"
+GITHUB_OWNER = "bim3dna-dev"
+GITHUB_REPO = "BIM3DNA-Toolbar-Releases"
 RELEASE_ASSET_NAMES = [
     "BIM3DNA.extension.zip",
     "BIM3DNA_Toolbar_Update.zip",
@@ -333,7 +333,10 @@ def compare_versions(local_version, remote_version):
 
 def confirm_yes_no(title, message):
     if forms is None:
-        return False, "pyRevit forms are unavailable; aborting instead of updating silently."
+        return (
+            False,
+            "pyRevit forms are unavailable; aborting instead of updating silently.",
+        )
     try:
         result = forms.alert(message, yes=True, no=True, title=title)
         return bool(result), ""
@@ -424,7 +427,9 @@ def select_release_asset(release_data, asset_names):
 
 
 def get_temp_update_root(version):
-    return os.path.join(tempfile.gettempdir(), "BIM3DNA_Update", normalize_version(version) or "unknown")
+    return os.path.join(
+        tempfile.gettempdir(), "BIM3DNA_Update", normalize_version(version) or "unknown"
+    )
 
 
 def safe_makedirs(path):
@@ -458,7 +463,9 @@ def looks_like_extension_content(path):
         return False
     try:
         for name in os.listdir(tab):
-            if name.lower().endswith(".panel") and os.path.isdir(os.path.join(tab, name)):
+            if name.lower().endswith(".panel") and os.path.isdir(
+                os.path.join(tab, name)
+            ):
                 return True
     except Exception:
         pass
@@ -483,7 +490,11 @@ def validate_staged_extension(staging_root):
     elif looks_like_extension_content(staging_root):
         source = staging_root
     else:
-        return None, ["No BIM3DNA.extension folder or extension content root found."], []
+        return (
+            None,
+            ["No BIM3DNA.extension folder or extension content root found."],
+            [],
+        )
 
     errors = []
     warnings = []
@@ -492,7 +503,9 @@ def validate_staged_extension(staging_root):
     if not looks_like_extension_content(source):
         errors.append("No .panel folder found under BIM3DNA.tab.")
     if not os.path.exists(os.path.join(source, VERSION_FILE_NAME)):
-        warnings.append("BIM3DNA.version.json is missing; updater can create/update it.")
+        warnings.append(
+            "BIM3DNA.version.json is missing; updater can create/update it."
+        )
     if not find_update_button(source):
         errors.append("Update.pushbutton was not found under BIM3DNA.tab.")
     return source, errors, warnings
@@ -500,6 +513,10 @@ def validate_staged_extension(staging_root):
 
 def should_preserve_file(name):
     lower = name.lower()
+    # update_config.json is deployment/update infrastructure configuration.
+    # It must come from the new package, not be preserved as user-local config.
+    if lower == UPDATE_CONFIG_FILE_NAME.lower():
+        return False
     return (
         lower == "create_print_set_pdf_config.json"
         or lower == "hvac_vertical_duct_tagging_config.json"
@@ -541,7 +558,9 @@ def preserve_local_configs(extension_root, preserve_root, new_source):
                 preserved.append(rel)
 
     runtime_qpdf = os.path.join(extension_root, "_runtime", "qpdf")
-    new_runtime_qpdf = os.path.join(new_source, "_runtime", "qpdf") if new_source else ""
+    new_runtime_qpdf = (
+        os.path.join(new_source, "_runtime", "qpdf") if new_source else ""
+    )
     if os.path.isdir(runtime_qpdf) and not os.path.isdir(new_runtime_qpdf):
         dst = os.path.join(preserve_root, "_runtime", "qpdf")
         safe_makedirs(os.path.dirname(dst))
@@ -561,7 +580,10 @@ def restore_preserved_configs(preserve_root, extension_root):
         for dirname in dirs:
             src_dir = os.path.join(current, dirname)
             rel = os.path.join(rel_dir, dirname)
-            if should_preserve_dir(dirname) or rel.lower() == os.path.join("_runtime", "qpdf").lower():
+            if (
+                should_preserve_dir(dirname)
+                or rel.lower() == os.path.join("_runtime", "qpdf").lower()
+            ):
                 dst_dir = os.path.join(extension_root, rel)
                 if os.path.isdir(dst_dir):
                     continue
@@ -613,7 +635,10 @@ def run_github_release_update(output, extension_root):
     emit(output, "## Update Mode")
     emit(output, "GitHub Release package mode")
     emit(output, "")
-    emit(output, "This install is not inside a Git working tree. Switching to GitHub Release package update mode.")
+    emit(
+        output,
+        "This install is not inside a Git working tree. Switching to GitHub Release package update mode.",
+    )
     emit(output, "")
 
     source_config, config_path = read_update_source_config(extension_root)
@@ -656,14 +681,25 @@ def run_github_release_update(output, extension_root):
     emit(output, "- Release tag: `{}`".format(release_data.get("tag_name", "")))
     emit(output, "- Release name: `{}`".format(release_data.get("name", "")))
     emit(output, "- Published: `{}`".format(release_data.get("published_at", "")))
-    emit(output, "- Assets found: `{}`".format(", ".join([a.get("name", "") for a in assets]) or "-"))
+    emit(
+        output,
+        "- Assets found: `{}`".format(
+            ", ".join([a.get("name", "") for a in assets]) or "-"
+        ),
+    )
     if release_data.get("body"):
         emit(output, "")
         emit(output, "### Release Notes")
-        emit(output, "```text\n{}\n```".format(release_data.get("body", "").strip()[:4000]))
+        emit(
+            output,
+            "```text\n{}\n```".format(release_data.get("body", "").strip()[:4000]),
+        )
     if not asset:
         emit(output, "")
-        emit(output, "Latest release exists, but no BIM3DNA extension update ZIP asset was found.")
+        emit(
+            output,
+            "Latest release exists, but no BIM3DNA extension update ZIP asset was found.",
+        )
         return
 
     remote_tag = release_data.get("tag_name", "")
@@ -672,8 +708,15 @@ def run_github_release_update(output, extension_root):
     emit(output, "")
     emit(output, "- Selected asset: `{}`".format(asset.get("name", "")))
     emit(output, "- Asset size bytes: `{}`".format(asset.get("size", "")))
-    emit(output, "- Local version normalized: `{}`".format(normalize_version(local_version) or "unknown"))
-    emit(output, "- Remote version normalized: `{}`".format(remote_version or "unknown"))
+    emit(
+        output,
+        "- Local version normalized: `{}`".format(
+            normalize_version(local_version) or "unknown"
+        ),
+    )
+    emit(
+        output, "- Remote version normalized: `{}`".format(remote_version or "unknown")
+    )
     if comparison == 0:
         confirmed, reason = confirm_yes_no(
             "Update BIM3DNA",
@@ -684,7 +727,10 @@ def run_github_release_update(output, extension_root):
         if not confirmed:
             emit(output, "")
             emit(output, "## Install Result")
-            emit(output, "BIM3DNA toolbar is already up to date. Reinstall was not performed.")
+            emit(
+                output,
+                "BIM3DNA toolbar is already up to date. Reinstall was not performed.",
+            )
             if reason:
                 emit(output, reason)
             return
@@ -698,7 +744,11 @@ def run_github_release_update(output, extension_root):
         "Release: {}\n\n"
         "The current extension folder will be backed up before replacement.\n"
         "Revit may need to be restarted after update."
-    ).format(local_version or "unknown", remote_tag or "unknown", release_data.get("name") or remote_tag)
+    ).format(
+        local_version or "unknown",
+        remote_tag or "unknown",
+        release_data.get("name") or remote_tag,
+    )
     confirmed, reason = confirm_yes_no("Update BIM3DNA", message)
     if not confirmed:
         emit(output, "")
@@ -740,7 +790,9 @@ def run_github_release_update(output, extension_root):
     except Exception as ex:
         emit(output, "- ZIP extraction failed: `{}`".format(ex))
         return
-    new_source, validation_errors, validation_warnings = validate_staged_extension(staging)
+    new_source, validation_errors, validation_warnings = validate_staged_extension(
+        staging
+    )
     if validation_errors or validation_warnings:
         for item in validation_errors:
             emit(output, "- {}".format(item))
@@ -760,15 +812,22 @@ def run_github_release_update(output, extension_root):
         emit(output, "```text\n{}\n```".format("\n".join(preserved)))
     else:
         emit(output, "No matching local config files found.")
-    emit(output, "- Sidecar external tools config is not modified: `%APPDATA%\\BIM3DNA\\external_tools.json`")
+    emit(
+        output,
+        "- Sidecar external tools config is not modified: `%APPDATA%\\BIM3DNA\\external_tools.json`",
+    )
 
     emit(output, "")
     emit(output, "## Backup")
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_dir = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(), "BIM3DNA", "Backups")
+    backup_dir = os.path.join(
+        os.environ.get("APPDATA") or tempfile.gettempdir(), "BIM3DNA", "Backups"
+    )
     backup_zip = os.path.join(
         backup_dir,
-        "BIM3DNA.extension_{}_{}.zip".format(normalize_version(local_version) or "unknown", timestamp),
+        "BIM3DNA.extension_{}_{}.zip".format(
+            normalize_version(local_version) or "unknown", timestamp
+        ),
     )
     try:
         zip_directory(extension_root, backup_zip)
@@ -789,10 +848,15 @@ def run_github_release_update(output, extension_root):
         restored = restore_preserved_configs(preserved_root, extension_root)
         version_file = update_version_file(extension_root, release_data, source_config)
         emit(output, "- Replacement completed.")
-        emit(output, "- Temporary install backup folder: `{}`".format(installing_backup))
+        emit(
+            output, "- Temporary install backup folder: `{}`".format(installing_backup)
+        )
         emit(output, "- Version file updated: `{}`".format(version_file))
         if restored:
-            emit(output, "- Restored preserved config entries: `{}`".format(len(restored)))
+            emit(
+                output,
+                "- Restored preserved config entries: `{}`".format(len(restored)),
+            )
     except Exception as ex:
         emit(output, "- Install failed: `{}`".format(ex))
         rollback_ok = False
@@ -813,7 +877,9 @@ def run_github_release_update(output, extension_root):
     reload_pyrevit_after_update(output)
     emit(output, "")
     emit(output, "## Next Action")
-    emit(output, "For safest behavior, restart Revit before using updated BIM3DNA tools.")
+    emit(
+        output, "For safest behavior, restart Revit before using updated BIM3DNA tools."
+    )
 
 
 def main():
@@ -832,7 +898,10 @@ def main():
         extension_root = find_installed_extension_root(script_dir)
         if not extension_root:
             emit(output, "## Update Result")
-            emit(output, "Could not resolve BIM3DNA.extension root for package update mode.")
+            emit(
+                output,
+                "Could not resolve BIM3DNA.extension root for package update mode.",
+            )
             return
         run_github_release_update(output, extension_root)
         return
