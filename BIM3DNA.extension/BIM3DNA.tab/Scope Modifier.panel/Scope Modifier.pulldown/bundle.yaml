@@ -1,0 +1,7 @@
+title: Scope Modifier
+layout:
+  - Region Scanner
+  - Element Collector
+  - Mirror Handler
+  - Slope Solver
+  - Transform Engine

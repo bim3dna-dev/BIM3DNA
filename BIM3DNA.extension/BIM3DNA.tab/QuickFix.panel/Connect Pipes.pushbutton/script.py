@@ -1,6 +1,26 @@
 # -*- coding: utf-8 -*-
 __title__ = "Connect\nPipes"
-__doc__ = """Connect Pipes - generate routed pipe connections without moving selected pipe networks."""
+__version__ = "1.0-opening-route-v1"
+__doc__ = """
+Connect Pipes creates routed pipe connections without moving selected pipes or
+their connected networks.
+
+Generate Routed Connection creates a validated route between selected pipe-end
+connectors. Generate Routed Connection Through Selected Opening(s) additionally
+routes through ordered host or linked opening waypoints, with configurable
+waypoint resolution, shaft alignment, shaft XY location, and route shape.
+
+When source and target diameters differ, the user can cancel or choose which
+diameter the generated route uses. Flat routes warn before creation when the
+endpoint elevation difference exceeds the configured tolerance.
+
+Opening waypoint modes include exact picked points, opening centers, or picked
+XY with opening-center Z. Grouped shaft XY can use the average, first, last,
+source-nearest, or target-nearest opening location.
+
+Known limitation: Connector.ConnectTo may complete successfully without Revit
+creating explicit pipe fitting elements, so created fitting IDs can be empty.
+"""
 
 import os
 import sys
@@ -2528,6 +2548,8 @@ def _print_opening_debug(
         )
 
 
+# Opening route v1 accepted after Revit runtime tests.
+# Do not modify routing geometry without new regression testing.
 def run_generate_routed_connection_through_openings():
     doc = revit.doc
     command_title = "Generate Routed Connection Through Selected Opening(s)"
