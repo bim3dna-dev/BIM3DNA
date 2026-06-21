@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = "mirror_handler"
+__title__ = "Mirror Handler"
 __doc__ = """Version = 1.0
 Date    = 12.28.2025
 ________________________________________________________________
@@ -85,9 +85,7 @@ import subprocess
 import datetime
 import tempfile
 import json
-import imp
 from collections import defaultdict
-
 
 clr.AddReference("System")
 clr.AddReference("System.Windows.Forms")
@@ -128,6 +126,7 @@ from pyrevit import script
 from System import Array
 import math, re, sys
 
+
 def _find_extension_root(start_dir):
     cur = start_dir
     while cur and cur != os.path.dirname(cur):
@@ -140,14 +139,11 @@ def _find_extension_root(start_dir):
 _THIS_DIR = os.path.dirname(__file__)
 _EXT_DIR = _find_extension_root(_THIS_DIR)
 _LIB_DIR = os.path.join(_EXT_DIR, "lib") if _EXT_DIR else None
-_MODULE_STATE_PATH = (
-    os.path.join(_LIB_DIR, "module_state.py") if _LIB_DIR else None
-)
+if _LIB_DIR and os.path.isdir(_LIB_DIR) and _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
 
 try:
-    module_state = imp.load_source(
-        "bim3dna_scope_modifier_module_state", _MODULE_STATE_PATH
-    )
+    import module_state
 except Exception as ex:
     print("SCOPE MODIFIER IMPORT ERROR -> module_state could not be imported")
     print("script dir:", _THIS_DIR)
@@ -162,12 +158,6 @@ except Exception as ex:
 app = __revit__.Application
 uidoc = __revit__.ActiveUIDocument
 doc = uidoc.Document
-MIRROR_INPUT_INFO = {
-    "source_payload": None,
-    "raw_loaded_count": 0,
-    "skipped": [],
-    "skipped_by_reason_category": {},
-}
 
 # VERBOSE = False
 
@@ -196,7 +186,6 @@ HOST_AWARE_CATEGORIES = set(
         "Roof Drain Plate",
     ]
 )
-COPYABLE_PAYLOAD_ONLY = True
 
 
 class ScopeBoxSelectionFilter(ISelectionFilter):
@@ -213,34 +202,8 @@ class ScopeBoxSelectionFilter(ISelectionFilter):
 
 
 def load_collected_ids():
-    """Load copyable ids, classifying collected ids only as a fallback."""
+    """Load ids from collected_latest.json."""
     try:
-        copyable_path = module_state.get_latest_copyable_payload_path()
-        if not copyable_path:
-            for directory in module_state._candidate_dirs(doc):
-                candidate = os.path.join(directory, "copyable_latest.json")
-                if os.path.isfile(candidate):
-                    copyable_path = candidate
-                    break
-        if copyable_path and os.path.isfile(copyable_path):
-            with open(copyable_path, "r") as stream:
-                data = json.load(stream)
-            ids = data.get("copyable_ids", [])
-            MIRROR_INPUT_INFO["source_payload"] = copyable_path
-            MIRROR_INPUT_INFO["raw_loaded_count"] = data.get(
-                "valid_count", len(ids)
-            )
-            MIRROR_INPUT_INFO["skipped"] = data.get("skipped", [])
-            MIRROR_INPUT_INFO["skipped_by_reason_category"] = data.get(
-                "skipped_by_reason_category", {}
-            )
-            elems = [
-                doc.GetElement(ElementId(int(value)))
-                for value in ids
-                if value is not None
-            ]
-            return [element.Id for element in elems if element and element.IsValidObject]
-
         collected_path = None
         for d in module_state._candidate_dirs(doc):
             p = os.path.join(d, "collected_latest.json")
@@ -261,22 +224,9 @@ def load_collected_ids():
                 .get("elements", {})
                 .get("ids", [])
             )
-        classification = module_state.classify_copyable_elements(doc, ids)
-        MIRROR_INPUT_INFO["source_payload"] = collected_path
-        MIRROR_INPUT_INFO["raw_loaded_count"] = len(ids)
-        MIRROR_INPUT_INFO["skipped"] = classification["skipped"]
-        MIRROR_INPUT_INFO["skipped_by_reason_category"] = classification[
-            "skipped_by_reason_category"
-        ]
-        print(
-            "MIRROR HANDLER -> no copyable payload found; "
-            "classified collected payload at runtime."
-        )
-        return [
-            ElementId(int(value)) for value in classification["copyable_ids"]
-        ]
-    except Exception as ex:
-        print("MIRROR HANDLER -> input load failed: {}".format(ex))
+        elems = [doc.GetElement(ElementId(int(i))) for i in ids if i is not None]
+        return [e.Id for e in elems if e and e.IsValidObject]
+    except Exception:
         return []
 
 
@@ -875,6 +825,26 @@ def filter_ids(ids):
         e = doc.GetElement(eid)
         if not e or not e.IsValidObject:
             continue
+        try:
+            gid = getattr(e, "GroupId", ElementId.InvalidElementId)
+            if gid and gid != ElementId.InvalidElementId:
+                # element is a group member > mirror the group instance instead
+                if gid.IntegerValue not in seen:
+                    ids_ok.Add(gid)
+                    seen.add(gid.IntegerValue)
+                skipped_group_members += 1
+                continue
+            # if this is an assembly instance, expand to members
+            if isinstance(e, AssemblyInstance):
+                for mid in e.GetMemberIds():
+                    if mid.IntegerValue not in seen:
+                        ids_ok.Add(mid)
+                        seen.add(mid.IntegerValue)
+                expanded_assembly += 1
+                continue
+            # if element belongs to an assembly, still include it
+        except Exception:
+            pass
         if eid.IntegerValue in seen:
             continue
         ids_ok.Add(eid)
@@ -1012,29 +982,6 @@ def main():
         )
         return
 
-    classification = module_state.classify_copyable_elements(doc, ids)
-    ids = [ElementId(int(value)) for value in classification["copyable_ids"]]
-    combined_skipped = list(MIRROR_INPUT_INFO.get("skipped", []))
-    combined_skipped.extend(classification["skipped"])
-    combined_breakdown = dict(
-        MIRROR_INPUT_INFO.get("skipped_by_reason_category", {})
-    )
-    for key, count in classification["skipped_by_reason_category"].items():
-        combined_breakdown[key] = combined_breakdown.get(key, 0) + count
-    print("MIRROR HANDLER INPUT ->")
-    print(
-        "loaded ids: {}".format(
-            MIRROR_INPUT_INFO.get("raw_loaded_count") or len(ids)
-        )
-    )
-    print("copyable ids: {}".format(len(ids)))
-    print("skipped non-copyable: {}".format(len(combined_skipped)))
-    print("source payload: {}".format(MIRROR_INPUT_INFO.get("source_payload")))
-    for key, count in sorted(
-        combined_breakdown.items(), key=lambda item: item[1], reverse=True
-    )[:20]:
-        print(" - {} : {}".format(key, count))
-
     ids_clr, skipped_group_members, expanded_assembly = filter_ids(ids)
     ids_in_src = list(filter_ids_by_scopebox(ids_clr, src_sb))
 
@@ -1054,13 +1001,12 @@ def main():
             grp_ids_all.append(gid)
             seen_gid.add(gid.IntegerValue)
 
-    # Safe mode does not introduce group IDs that were absent from copyable input.
-    if not COPYABLE_PAYLOAD_ONLY:
-        seen = set([x.IntegerValue for x in ids_in_src])
-        for gid in grp_ids_all:
-            if gid.IntegerValue not in seen:
-                ids_in_src.append(gid)
-                seen.add(gid.IntegerValue)
+    # Merge groups into ids_in_src
+    seen = set([x.IntegerValue for x in ids_in_src])
+    for gid in grp_ids_all:
+        if gid.IntegerValue not in seen:
+            ids_in_src.append(gid)
+            seen.add(gid.IntegerValue)
 
     groups_found_loc = len(grp_ids_loc)
     groups_found_mem = len(grp_ids_mem)
@@ -1076,7 +1022,6 @@ def main():
     hard_skipped = []
     created_ids = []
     failures = 0
-    failed_element_ids = []
     pinned_reset = []
     created_bbox = None  # optional
 
@@ -1252,7 +1197,6 @@ def main():
 
             except Exception as ex:
                 failures += 1
-                failed_element_ids.append(eid.IntegerValue)
                 el = doc.GetElement(eid)
                 per_cat_fail[_cat_name(el)] += 1
                 host_id, host_cat = _host_info(el)
@@ -1280,11 +1224,7 @@ def main():
 
         try:
             # 1. Collect candidate sections intersecting SOURCE scobe box
-            all_secs = (
-                []
-                if COPYABLE_PAYLOAD_ONLY
-                else FilteredElementCollector(doc).OfClass(ViewSection).ToElements()
-            )
+            all_secs = FilteredElementCollector(doc).OfClass(ViewSection).ToElements()
             sec_candidates = []
 
             for vs in all_secs:
@@ -1399,30 +1339,6 @@ def main():
     if example_failures:
         ex_lines = "\n- " + "\n- ".join(example_failures[:10])
 
-    result_payload = {
-        "doc_identity": module_state.get_doc_identity(doc),
-        "source_payload": MIRROR_INPUT_INFO.get("source_payload"),
-        "created_ids": [element_id.IntegerValue for element_id in created_ids],
-        "failed_ids": failed_element_ids,
-        "skipped": combined_skipped,
-        "command_mode": "create copy" if do_copy else "in-place mirror",
-        "mirror_plane": {
-            "origin": [plane.Origin.X, plane.Origin.Y, plane.Origin.Z],
-            "normal": [plane.Normal.X, plane.Normal.Y, plane.Normal.Z],
-            "mode": mode,
-        },
-        "category_counts": combined_breakdown,
-    }
-    result_path = module_state.save_named_payload(
-        doc, result_payload, "mirror_created_latest.json"
-    )
-    print("MIRROR HANDLER RESULT ->")
-    print("copyable input: {}".format(len(ids_in_src)))
-    print("created: {}".format(len(created_ids)))
-    print("failed: {}".format(len(failed_element_ids)))
-    print("skipped: {}".format(len(combined_skipped)))
-    print("created payload: {}".format(result_path))
-
     msg = (
         "Mode: {0}\nCopy mode: {1}\n"
         "Created: {2}\n"
@@ -1447,7 +1363,7 @@ def main():
         failures,
         skipped_group_members,
         expanded_assembly,
-        len(combined_skipped),
+        len(hard_skipped),
         plane.Normal.X,
         plane.Normal.Y,
         plane.Normal.Z,
