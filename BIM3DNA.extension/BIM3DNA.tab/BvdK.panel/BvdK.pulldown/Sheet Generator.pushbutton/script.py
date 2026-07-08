@@ -1,29 +1,49 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 __title__ = "Sheet\nGenerator"
-__doc__ = """Version = 1.0
-Date    = 12.04.2025
+__doc__ = """Version = 1.1  (safe-mode)
+Date    = 21.07.2025
 ________________________________________________________________
 Description:
-
-This integrated script lets you:
-  1. Select boundary detail lines that form a closed loop.
-  2. Gather all elements in the active view whose bounding-box center is inside the boundary.
-  3. Filter the gathered elements to only those in the categories of interest 
-     (Pipes, Pipe Fittings, Pipe Tags, Text Notes).
-  4. Display an editable grid so you can adjust the associated prefab (Comments) codes.
-  5. Use the Text Note code as the base number.
-       • For Pipes and Pipe Tags, the NewCode becomes: [Base].1, [Base].2, … (sorted left-to-right, bottom-to-up).
-       • For Pipe Fittings, the NewCode is simply [Base].
-
-If a Text Note is missing from the selected region, you have the option to place one.
+Creates a cropped prefab plan from a user-drawn boundary, numbers
+Pipes/Fittings 'Comments', auto-tags pipes (no leaders), and places
+the view on a new sheet (safe defaults to avoid regen thrash).
 ________________________________________________________________
 How-To:
-
-1. [Hold ALT + CLICK] on the button to open its source folder.
-2. Create your boundary (with detail lines) in the view.
-3. Click the button and follow the prompts.
+1. Draw a closed loop with Detail Lines around the region.
+2. Run the tool, edit/confirm codes, press OK.
+3. Pick a title block, done.
 ________________________________________________________________
-Author: Emin Avdovic"""
+Author: Emin Avdovic (safe-mode refactor)
+"""
+
+# =========================
+# SAFE MODE SWITCHES
+# =========================
+SAFE_CFG = {
+    "duplicate_with_detailing": False,  # False => minimal duplication (safer)
+    "place_text_note": True,  # place tiny text note inside crop
+    "autotag_pipes": True,  # create tags for untagged pipes
+    "tag_use_leader": True,
+    "tag_offset_mm": 250,
+    "create_3d_view": False,  # disabled for stability
+    "place_schedule": False,  # disabled for stability
+    "hide_crop_region_controls": True,  # keep the crop visible OFF
+    "annotation_crop_on": False,  # annotation crop OFF for stability
+    "view_scale": 50,  # plan scale
+    "view_discipline": "Coordination",  # Coordination is stable
+    "write_comments_codes": False,  # keep tags independent from prefab text for now
+    "use_active_view_on_sheet": True,
+    "create_duplicate_plan_view": False,
+    "exclude_nlrs_pipes": True,
+    "tag_type_map": {
+        "ACO_PIPE": ("RSen_GA_tag pipe_ACO", "RED TypeMark + DN + \u00f8"),
+        "VERT_ARROW": ("BvdK_Verdiepingspijl", "Van boven"),
+        "SYS_AFM_CL": (
+            "BvdK_Pipe_Riolering_Afm + spot elev_bb_H",
+            "sys + afm. + hoogte cl",
+        ),
+    },
+}
 
 # ==================================================
 # Imports
@@ -36,43 +56,34 @@ from Autodesk.Revit.DB import (
     FamilySymbol,
     FamilyInstance,
     FilteredElementCollector,
-    FormatOptions,
-    FilterStringRule,
-    FilterStringRuleEvaluator,
-    FilterStringBeginsWith,
-    FilterStringContains,
-    FilterStringEquals,
     XYZ,
     Transaction,
     TextNote,
     TextNoteType,
     TextNoteOptions,
     IndependentTag,
-    UV,
     UnitTypeId,
     Reference,
     TagMode,
     TagOrientation,
-    ViewSchedule,
     ViewSheet,
+    ViewSchedule,
     ViewDuplicateOption,
     ViewDiscipline,
     Viewport,
-    ParameterValueProvider,
-    ParameterFilterElement,
+    ViewPlan,
+    FormatOptions,
     ScheduleSheetInstance,
     ScheduleFilter,
     ScheduleFilterType,
     ScheduleSortGroupField,
     ScheduleSortOrder,
-    StorageType,
     SectionType,
+    StorageType,
     Category,
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.UI import *
-from Autodesk.Revit.UI import TaskDialog
-from Autodesk.Revit.UI import UIDocument
 from Autodesk.Revit.DB.Structure import *
 from Autodesk.Revit.Exceptions import *
 from Autodesk.Revit.Attributes import *
@@ -83,6 +94,15 @@ import clr
 import System
 import System.IO
 
+_SCRIPT_PATH_ABS = System.IO.Path.GetFullPath(__file__)
+try:
+    _SCRIPT_LAST_WRITE = str(System.IO.File.GetLastWriteTime(_SCRIPT_PATH_ABS))
+except Exception as _script_ts_ex:
+    _SCRIPT_LAST_WRITE = "UNAVAILABLE: {}".format(_script_ts_ex)
+print("SCRIPT PATH -> {}".format(_SCRIPT_PATH_ABS))
+print("SCRIPT LAST MODIFIED -> {}".format(_SCRIPT_LAST_WRITE))
+print("BUILD STAMP -> BVDK_SHEET_GENERATOR_RESTORE_2026_05_16_A")
+
 clr.AddReference("System")
 clr.AddReference("System.Windows.Forms")
 clr.AddReference("System.Drawing")
@@ -92,14 +112,8 @@ clr.AddReference("RevitAPIUI")
 clr.AddReference("WindowsBase")
 from RevitServices.Persistence import DocumentManager
 from System.Windows.Forms import (
-    FormBorderStyle,
-    AnchorStyles,
-    AutoScaleMode,
     Form,
-    ComboBox,
     ListBox,
-    PictureBox,
-    PictureBoxSizeMode,
     DataGridView,
     DataGridViewTextBoxColumn,
     DataGridViewButtonColumn,
@@ -111,15 +125,25 @@ from System.Windows.Forms import (
     MessageBox,
     DialogResult,
     Label,
-    ScrollBars,
     Application,
+    FlowLayoutPanel,
+    FlowDirection,
+    RadioButton,
+    ComboBox,
+    ComboBoxStyle,
+    CheckBox,
+    GroupBox,
+    OpenFileDialog,
+    FormBorderStyle,
+    FormStartPosition,
+    MessageBoxButtons,
+    MessageBoxIcon,
 )
-from System.Drawing import Image, Point, Color, Rectangle, Size
-from System.IO import MemoryStream
-from System.Windows.Forms import DataGridViewButtonColumn
-
+from System.Drawing import Point, Color, Rectangle, Size
 from System import Array
-import math, re, sys
+import math, re, sys, json
+
+print("BUTTON TITLE DEBUG -> __title__ = {}".format(__title__))
 
 # ==================================================
 # Revit Document Setup
@@ -129,10 +153,14 @@ uidoc = __revit__.ActiveUIDocument
 doc = __revit__.ActiveUIDocument.Document
 
 VERBOSE = False
-ANNOTATE_3D = True
-ANNOTATE_3D_MODE = "TEXT"
-DUPLICATE_ONLY_RELEVANT_SCHEDULES = True
-SKIP_EMPTY_SCHEDULES = True
+_PIPE_TAG_LOOKUP_DIAG_SHOWN = False
+_MISSING_TAG_TYPES_DIALOG_SHOWN = False
+_RESOLVED_TAG_SYMBOLS = {
+    "PIPE_DEFAULT": None,
+    "PIPE_VERTICAL": None,
+    "PIPE_EXTRA_HORIZONTAL": None,
+}
+_EXPLODED_VIEW_VECTORS = {}
 
 
 def debug(*args):
@@ -141,842 +169,88 @@ def debug(*args):
 
 
 # ==================================================
-# Helper Functions
+# Utilities
 # ==================================================
-
-
-def normalize_code(raw):
-    if raw is None:
-        return ""
-    s = str(raw).strip()
-    s = s.lower().replace("prefab", "").strip()
-    for ch in [":", "-", "_"]:
-        if s.startswith(ch):
-            s = s[1:].strip()
-    s = " ".join(s.split())
-    m = re.search(r"(\d+(?:\.\d+)*)", s)
-    return m.group(1) if m else ""
-
-
-def rollback_transaction(tx):
-    if not tx:
-        return
+def get_runtime_window_title():
     try:
-        tx.RollBack()
+        title = str(__title__).replace("\n", " ").strip()
+        return title or "Sheet Generator"
     except Exception:
-        pass
+        return "Sheet Generator"
 
 
-class Tx(object):
-    def __init__(self, doc, name):
-        self.doc = doc
-        self.name = name
-        self.t = None
-
-    def __enter__(self):
-        self.t = Transaction(self.doc, self.name)
-        self.t.Start()
-        return self.t
-
-    def __exit__(self, exc_type, exc, tb):
-        if exc_type:
-            try:
-                if self.t.HasStarted():
-                    self.t.RollBack()
-            except Exception:
-                pass
-            return False
-        else:
-            try:
-                self.t.Commit()
-            except Exception:
-                try:
-                    self.t.RollBack()
-                except Exception:
-                    pass
-                raise
-            return True
-
-
-def require_modifiable(doc, where):
-    if doc.IsReadOnly:
-        raise Exception("DOC READONLY at: {}".format(where))
-    if not doc.IsModifiable:
-        raise Exception(
-            "DOC NOT MODIFIABLE at: {} (no open transaction)".format(where)
-        )
-
-
-def _assert_doc_not_readonly(doc, where="unknown"):
-    if doc.IsReadOnly:
-        raise Exception("DOC READONLY at: {}".format(where))
-
-
-def _assert_doc_modifiable(doc, where="unknown"):
-    require_modifiable(doc, where)
-
-
-def set_instance_comment(elem, prefab_code):
-    p = elem.LookupParameter("Comments")
-    if p and not p.IsReadOnly:
-        p.Set(prefab_code)
-
-
-def get_type_param(elem, name):
+def safe_int(value, default=0):
     try:
-        t = elem.Document.GetElement(elem.GetTypeId())
-        if not t:
-            return None
-        p = t.LookupParameter(name)
-        return p.AsString() if p else None
-    except Exception:
-        return None
-
-
-def get_inst_param(elem, name):
-    try:
-        p = elem.LookupParameter(name)
-        return p.AsString() if p else None
-    except Exception:
-        return None
-
-
-def is_view3d_perspective(v):
-    return isinstance(v, View3D) and v.IsPerspective
-
-
-def _activate_view(uidoc, view):
-    """Force Revit to lock ownerDBViewId context for view-owned element creation (tags, detail items, etc.)."""
-    try:
-        uidoc.ActiveView = view
-        return True
-    except Exception:
-        pass
-
-    try:
-        uidoc.RequestViewChange(view)
-        return True
-    except Exception:
-        return False
-
-
-def ui_yield(ms=150):
-    """Let Revit process UI messages so RequestViewChange/ActiveView actually takes effect."""
-    try:
-        import System
-        from System.Windows.Forms import Application
-
-        Application.DoEvents()
-        System.Threading.Thread.Sleep(ms)
-        Application.DoEvents()
-    except Exception:
-        pass
-
-
-def ensure_view_is_active(uidoc, doc, view, retries=5, delay_ms=120):
-    try:
-        from System.Windows.Forms import Application as WinFormsApplication
-    except Exception:
-        WinFormsApplication = None
-
-    for _ in range(retries):
-        if _activate_view(uidoc, view):
-            try:
-                if WinFormsApplication:
-                    WinFormsApplication.DoEvents()
-            except Exception:
-                pass
-            try:
-                doc.Regenerate()
-            except Exception:
-                pass
-            try:
-                System.Threading.Thread.Sleep(delay_ms)
-            except Exception:
-                pass
-            try:
-                if uidoc.ActiveView and uidoc.ActiveView.Id == view.Id:
-                    return True
-            except Exception:
-                pass
-    return False
-
-
-def get_element_annotation_point(elem, view=None):
-    try:
-        loc = elem.Location
-        if hasattr(loc, "Curve") and loc.Curve:
-            return loc.Curve.Evaluate(0.5, True)
-        if hasattr(loc, "Point") and loc.Point:
-            return loc.Point
-    except Exception:
-        pass
-    try:
-        bbox = elem.get_BoundingBox(view) if view else elem.get_BoundingBox(None)
-        if bbox:
-            return XYZ(
-                (bbox.Min.X + bbox.Max.X) / 2.0,
-                (bbox.Min.Y + bbox.Max.Y) / 2.0,
-                (bbox.Min.Z + bbox.Max.Z) / 2.0,
-            )
-    except Exception:
-        pass
-    return XYZ(0, 0, 0)
-
-
-def get_element_type_name(elem):
-    try:
-        elem_type = elem.Document.GetElement(elem.GetTypeId())
-        if elem_type and hasattr(elem_type, "Name"):
-            return elem_type.Name or ""
-    except Exception:
-        pass
-    return ""
-
-
-def get_element_comment_code(elem):
-    return normalize_code(get_inst_param(elem, "Comments") or "")
-
-
-def ensure_orthographic_3d_view(doc, view3d):
-    if not isinstance(view3d, View3D):
-        return view3d
-    try:
-        if not view3d.IsPerspective:
-            return view3d
-    except Exception:
-        return view3d
-
-    vft = None
-    for candidate in FilteredElementCollector(doc).OfClass(ViewFamilyType):
-        if candidate.ViewFamily == ViewFamily.ThreeDimensional:
-            vft = candidate
-            break
-    if not vft:
-        raise Exception("No 3D ViewFamilyType found")
-
-    new3d = View3D.CreateIsometric(doc, vft.Id)
-    try:
-        new3d.Name = view3d.Name + " - ORTHO"
-    except Exception:
-        pass
-    return new3d
-
-
-def get_existing_plan_tag_type_ids(doc, source_view):
-    tag_type_ids = {}
-    tag_category_map = {
-        int(BuiltInCategory.OST_PipeTags): "pipe",
-    }
-    fitting_tag_bic = getattr(BuiltInCategory, "OST_PipeFittingTags", None)
-    if fitting_tag_bic is not None:
-        tag_category_map[int(fitting_tag_bic)] = "fitting"
-    accessory_tag_bic = getattr(BuiltInCategory, "OST_PipeAccessoryTags", None)
-    if accessory_tag_bic is not None:
-        tag_category_map[int(accessory_tag_bic)] = "accessory"
-
-    for tag in FilteredElementCollector(
-        doc, source_view.Id
-    ).WhereElementIsNotElementType():
-        try:
-            if not tag.Category:
-                continue
-            role = tag_category_map.get(tag.Category.Id.IntegerValue)
-            if not role or role in tag_type_ids:
-                continue
-            tag_type_ids[role] = tag.GetTypeId()
-        except Exception:
-            continue
-    return tag_type_ids
-
-
-def get_loaded_tag_type_ids(doc, existing_type_ids):
-    tag_type_ids = dict(existing_type_ids)
-    family_symbols = FilteredElementCollector(doc).OfClass(FamilySymbol).ToElements()
-    category_role_map = {
-        int(BuiltInCategory.OST_PipeTags): "pipe",
-    }
-    fitting_tag_bic = getattr(BuiltInCategory, "OST_PipeFittingTags", None)
-    if fitting_tag_bic is not None:
-        category_role_map[int(fitting_tag_bic)] = "fitting"
-    accessory_tag_bic = getattr(BuiltInCategory, "OST_PipeAccessoryTags", None)
-    if accessory_tag_bic is not None:
-        category_role_map[int(accessory_tag_bic)] = "accessory"
-
-    for symbol in family_symbols:
-        try:
-            if not symbol.Category:
-                continue
-            role = category_role_map.get(symbol.Category.Id.IntegerValue)
-            if role and role not in tag_type_ids:
-                tag_type_ids[role] = symbol.Id
-        except Exception:
-            continue
-    return tag_type_ids
-
-
-def get_3d_tag_type_ids(doc, source_view):
-    return get_loaded_tag_type_ids(
-        doc, get_existing_plan_tag_type_ids(doc, source_view)
-    )
-
-
-def get_tag_role_for_element(elem):
-    if not elem or not elem.Category:
-        return None
-    cat_id = elem.Category.Id.IntegerValue
-    if cat_id == int(BuiltInCategory.OST_PipeCurves):
-        return "pipe"
-    # disable 3D tagging for fittings/accessories and all other categories
-    return None
-
-
-def create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str):
-    text_type = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
-    if not text_type:
-        return
-    role = get_tag_role_for_element(elem)
-    type_name = get_element_type_name(elem)
-    if role == "pipe":
-        d = (
-            get_param_display(elem, "Outside Diameter")
-            or get_param_display(elem, "Diameter")
-            or "-"
-        )
-        l = get_param_display(elem, "Length") or "-"
-        label = u"\u00D8{} / L={} | {}".format(d, l, prefab_code_str)
-    elif role == "fitting":
-        s = (
-            get_param_display(elem, "Size")
-            or get_param_display(elem, "Outside Diameter")
-            or get_param_display(elem, "Diameter")
-            or "-"
-        )
-        label = "Fitting {} | {}".format(s, prefab_code_str)
-    elif role == "accessory":
-        desc = get_param_display(elem, "Description") or type_name or "Accessory"
-        s = (
-            get_param_display(elem, "Size")
-            or get_param_display(elem, "Diameter")
-            or "-"
-        )
-        label = "Acc {} {} | {}".format(s, desc or "", prefab_code_str)
-    else:
-        label = "{} | {}".format(type_name, prefab_code_str)
-    opts = TextNoteOptions(text_type.Id)
-    TextNote.Create(doc, view3d.Id, point, label, opts)
-
-
-def annotate_3d_view(doc, view3d, scanned_elems, prefab_code_str, source_view):
-    if not ANNOTATE_3D:
-        return 0
-
-    x_step = 0.08
-    y_step = 0.04
-    created_3d = 0
-    text_mode = str(ANNOTATE_3D_MODE or "").upper() == "TEXT"
-
-    if text_mode:
-        for idx, elem in enumerate(scanned_elems):
-            role = get_tag_role_for_element(elem)
-            if role is None:
-                continue
-            if get_element_comment_code(elem) != prefab_code_str:
-                continue
-
-            point = get_element_annotation_point(elem, view3d)
-            point = XYZ(
-                point.X + ((idx % 4) * x_step),
-                point.Y + ((idx % 3) * y_step),
-                point.Z,
-            )
-            try:
-                require_modifiable(doc, "annotate_3d_view.TextNote")
-                create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str)
-                created_3d += 1
-            except Exception as ex:
-                print(
-                    "3D text skipped for element {}: {} ({})".format(
-                        elem.Id.IntegerValue, ex, ex.__class__.__name__
-                    )
-                )
-        print("3D tags created: {}".format(created_3d))
-        return created_3d
-
-    tag_type_ids = get_3d_tag_type_ids(doc, source_view)
-
-    for idx, elem in enumerate(scanned_elems):
-        role = get_tag_role_for_element(elem)
-        if role is None:
-            continue
-        if get_element_comment_code(elem) != prefab_code_str:
-            continue
-
-        tag_type_id = tag_type_ids.get("pipe")
-        if tag_type_id is None:
-            continue
-
-        point = get_element_annotation_point(elem, view3d)
-        point = XYZ(
-            point.X + ((idx % 4) * x_step),
-            point.Y + ((idx % 3) * y_step),
-            point.Z,
-        )
-        try:
-            _assert_doc_modifiable(doc)
-            ref = Reference(elem)
-            tag = IndependentTag.Create(
-                doc,
-                view3d.Id,
-                ref,
-                False,
-                TagMode.TM_ADDBY_CATEGORY,
-                TagOrientation.Horizontal,
-                point,
-            )
-            try:
-                _assert_doc_modifiable(doc)
-                tag.ChangeTypeId(tag_type_id)
-            except Exception:
-                pass
-            created_3d += 1
-        except Exception as ex:
-            print(
-                "3D tag skipped for element {}: {} ({})".format(
-                    elem.Id.IntegerValue, ex, ex.__class__.__name__
-                )
-            )
-            if ANNOTATE_3D_MODE == "TEXT":
-                try:
-                    require_modifiable(doc, "annotate_3d_view.TextFallback")
-                    create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str)
-                except Exception as fallback_ex:
-                    print(
-                        "3D text fallback skipped for element {}: {} ({})".format(
-                            elem.Id.IntegerValue,
-                            fallback_ex,
-                            fallback_ex.__class__.__name__,
-                        )
-                    )
-
-    print("3D tags created: {}".format(created_3d))
-    return created_3d
-
-
-def safe_duplicate_view(doc, view, opt, label="About to duplicate view"):
-    primary_view_id = "n/a"
-    if hasattr(view, "PrimaryViewId"):
-        try:
-            primary_view_id = view.PrimaryViewId.IntegerValue
-        except Exception:
-            primary_view_id = "n/a"
-    is_temp = False
-    try:
-        is_temp = view.IsTemplate
-    except Exception:
-        pass
-    msg = "DUPLICATE VIEW REQUEST: name='{}' id={} type={} isTemplate={}".format(
-        view.Name, view.Id.IntegerValue, view.ViewType, is_temp
-    )
-    if isinstance(view, View3D):
-        try:
-            msg += " isPerspective={}".format(view.IsPerspective)
-        except Exception:
-            pass
-    print(msg)
-    TaskDialog.Show(
-        "SheetGen Debug",
-        "{}\nId: {}\nName: {}\nViewType: {}\nIsTemplate: {}\nPrimaryViewId: {}".format(
-            label,
-            view.Id.IntegerValue,
-            view.Name,
-            view.ViewType,
-            is_temp,
-            primary_view_id,
-        ),
-    )
-
-    if is_temp:
-        raise Exception("Refusing to duplicate a template view: {}".format(view.Name))
-
-    if is_view3d_perspective(view):
-        vft = None
-        for x in FilteredElementCollector(doc).OfClass(ViewFamilyType):
-            if x.ViewFamily == ViewFamily.ThreeDimensional:
-                vft = x
-                break
-        if not vft:
-            raise Exception("No 3D ViewFamilyType found")
-        new3d = View3D.CreateIsometric(doc, vft.Id)
-        new3d.Name = view.Name + " - ISO"
-        return new3d.Id
-
-    can = True
-    try:
-        can = view.CanViewBeDuplicated(opt)
-    except Exception:
-        pass
-    if not can:
-        raise Exception(
-            "View cannot be duplicated (CanViewBeDuplicated=False): {}".format(
-                view.Name
-            )
-        )
-
-    require_modifiable(doc, "safe_duplicate_view.Duplicate")
-    return view.Duplicate(opt)
-
-
-def resolve_dup_source_plan_view(doc, candidate_view, preferred_name_contains=None):
-    def get_primary_view(view):
-        if view is None:
-            return None
-        if hasattr(view, "GetPrimaryViewId"):
-            try:
-                pid = view.GetPrimaryViewId()
-                if pid and pid != ElementId.InvalidElementId:
-                    view = doc.GetElement(pid)
-            except Exception:
-                pass
-        return view
-
-    def is_primary_view_plan(view):
-        if not isinstance(view, ViewPlan):
-            return False
-        if view.IsTemplate:
-            return False
-        if hasattr(view, "GetPrimaryViewId"):
-            try:
-                return view.GetPrimaryViewId() == ElementId.InvalidElementId
-            except Exception:
-                return True
-        return True
-
-    candidate = get_primary_view(candidate_view)
-    if is_primary_view_plan(candidate):
-        return candidate
-
-    all_view_plans = list(FilteredElementCollector(doc).OfClass(ViewPlan).ToElements())
-
-    if preferred_name_contains:
-        preferred_name_contains_lc = preferred_name_contains.lower()
-        for v in all_view_plans:
-            if preferred_name_contains_lc not in v.Name.lower():
-                continue
-            if is_primary_view_plan(v):
-                return v
-
-    for v in all_view_plans:
-        if is_primary_view_plan(v):
-            return v
-
-    return None
-
-
-def duplicate_or_recreate_plan_view(
-    doc, source_view, dup_option_preferred, desired_name
-):
-    source_name = source_view.Name if source_view else "<None>"
-    if not isinstance(source_view, ViewPlan) or source_view.IsTemplate:
-        raise Exception(
-            "Invalid source view for plan duplication: {}".format(source_name)
-        )
-
-    options = [
-        ViewDuplicateOption.WithDetailing,
-        ViewDuplicateOption.Duplicate,
-        ViewDuplicateOption.AsDependent,
-    ]
-    if dup_option_preferred in options:
-        options = [dup_option_preferred] + [
-            o for o in options if o != dup_option_preferred
-        ]
-
-    for opt in options:
-        try:
-            new_id = safe_duplicate_view(
-                doc,
-                source_view,
-                opt,
-                "About to duplicate: plan source ({})".format(opt),
-            )
-            v = doc.GetElement(new_id)
-            try:
-                v.Name = desired_name
-            except Exception:
-                pass
-            return v, opt
-        except InvalidOperationException:
-            continue
-
-    vfts = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
-    floor_vft = next(vft for vft in vfts if vft.ViewFamily == ViewFamily.FloorPlan)
-
-    level_id = source_view.GenLevel.Id
-    new_plan = ViewPlan.Create(doc, floor_vft.Id, level_id)
-    try:
-        new_plan.Name = desired_name
-    except Exception:
-        pass
-
-    new_plan.Scale = source_view.Scale
-    new_plan.Discipline = source_view.Discipline
-
-    ids_to_copy = List[ElementId]()
-    for el in (
-        FilteredElementCollector(doc, source_view.Id)
-        .WhereElementIsNotElementType()
-        .ToElements()
-    ):
-        if el.Category and el.Category.CategoryType == CategoryType.Annotation:
-            ids_to_copy.Add(el.Id)
-
-    if ids_to_copy.Count > 0:
-        ElementTransformUtils.CopyElements(
-            source_view,
-            ids_to_copy,
-            new_plan,
-            Transform.Identity,
-            CopyPasteOptions(),
-        )
-
-    return new_plan, "Created"
-
-
-SCHEDULE_TEMPLATES = {
-    "GEBERIT_PE_PIPES": ["Geberit PE leidingen - PREFAB -1"],
-    "GEBERIT_PE_FITTINGS": ["Geberit PE fittingen - PREFAB -1"],
-    "GEBERIT_SILENT_PIPES": ["Geberit PE Silent leidingen - PREFAB -1"],
-    "GEBERIT_SILENT_FITTINGS": ["Geberit PE Silent fittingen - PREFAB -1"],
-    "WAVIN_TIGRIS_PIPES": ["Wavin Tigris Pipe Schedule -1"],
-    "WAVIN_TIGRIS_FITTINGS": ["Wavin Tigris Pipe Fitting Schedule"],
-    "WAVIN_TIGRIS_FLEX": ["Wavin Tigris Flexible Pipe Schedule -2"],
-    "WAVIN_WAFIX_PP_PIPES": ["Wavin Wafix PP Pipes"],
-    "WAVIN_WAFIX_PP_FITTINGS": ["Wavin Wafix PP Pipe Fittings BOM -1"],
-    "PIPE_ACCESSORIES": ["Pipe Accessory Schedule - PREFAB -1"],
-    "PLUMBING_FIXTURES": ["Plumbing Fixture Schedule - PREFAB -2"],
-}
-
-
-def normalize_schedule_name(name):
-    return " ".join(name.lower().replace("_", " ").replace("-", " ").split())
-
-
-def find_schedule_view_by_name(doc, name):
-    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
-        if vs.Name == name:
-            return vs
-    target = normalize_schedule_name(name)
-    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
-        if normalize_schedule_name(vs.Name) == target:
-            return vs
-    return None
-
-
-def get_param_str(elem, name):
-    return get_inst_param(elem, name) or get_type_param(elem, name) or ""
-
-
-def get_param_display(elem, param_name, fallback=""):
-    """Return human-readable parameter value. Works for doubles using AsValueString()."""
-    if not elem:
-        return fallback
-    p = elem.LookupParameter(param_name)
-    if not p:
-        try:
-            t = elem.Document.GetElement(elem.GetTypeId())
-            if t:
-                p = t.LookupParameter(param_name)
-        except Exception:
-            p = None
-
-    if not p:
-        return fallback
-
-    try:
-        s = p.AsValueString()
-        if s:
-            return s
-    except Exception:
-        pass
-
-    try:
-        if p.StorageType == StorageType.Double:
-            mm = p.AsDouble() * 304.8
-            return "{} mm".format(int(round(mm)))
-        if p.StorageType == StorageType.Integer:
-            return str(p.AsInteger())
-        if p.StorageType == StorageType.String:
-            return p.AsString() or fallback
-    except Exception:
-        pass
-
-    return fallback
-
-
-def detect_systems(doc, element_ids):
-    detected = set()
-    for item in element_ids:
-        elem = doc.GetElement(item) if isinstance(item, ElementId) else item
-        if not elem or not elem.Category:
-            continue
-
-        cat_id = elem.Category.Id.IntegerValue
-        manufacturer = get_param_str(elem, "Manufacturer").strip().lower()
-        product_series = get_param_str(elem, "product_series").strip().lower()
-        description = get_param_str(elem, "Description").strip().lower()
-        model = get_param_str(elem, "Model").strip().lower()
-        signals = " ".join([product_series, description, model])
-
-        if cat_id == int(BuiltInCategory.OST_PipeCurves):
-            if "wavin" in manufacturer and "tigris" in product_series:
-                detected.add("WAVIN_TIGRIS_PIPES")
-            if "wavin" in manufacturer and (
-                "wafix" in product_series or "wafix pp" in product_series
-            ):
-                detected.add("WAVIN_WAFIX_PP_PIPES")
-            if "geberit" in manufacturer and ("silent" in signals or "db20" in signals):
-                detected.add("GEBERIT_SILENT_PIPES")
-            elif "geberit" in manufacturer and "pe" in signals:
-                detected.add("GEBERIT_PE_PIPES")
-
-        elif cat_id == int(BuiltInCategory.OST_PipeFitting):
-            if "wavin" in manufacturer and "tigris" in product_series:
-                detected.add("WAVIN_TIGRIS_FITTINGS")
-            if "wavin" in manufacturer and (
-                "wafix" in product_series or "wafix pp" in product_series
-            ):
-                detected.add("WAVIN_WAFIX_PP_FITTINGS")
-            if "geberit" in manufacturer and ("silent" in signals or "db20" in signals):
-                detected.add("GEBERIT_SILENT_FITTINGS")
-            elif "geberit" in manufacturer and "pe" in signals:
-                detected.add("GEBERIT_PE_FITTINGS")
-
-        elif cat_id == int(BuiltInCategory.OST_FlexPipeCurves):
-            if "wavin" in manufacturer and "tigris" in product_series:
-                detected.add("WAVIN_TIGRIS_FLEX")
-
-        elif cat_id == int(BuiltInCategory.OST_PipeAccessory):
-            detected.add("PIPE_ACCESSORIES")
-
-        elif cat_id == int(BuiltInCategory.OST_PlumbingFixtures):
-            detected.add("PLUMBING_FIXTURES")
-
-    return detected
-
-
-def apply_prefab_filter_to_schedule(vs, prefab_code):
-    try:
-        sd = vs.Definition
-    except Exception as ex:
-        print("Cannot access schedule definition '{}': {}".format(vs.Name, ex))
-        return
-
-    comments_param = ElementId(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-    comment_field = None
-    for f_id in sd.GetFieldOrder():
-        sf = sd.GetField(f_id)
-        if sf.ParameterId == comments_param:
-            comment_field = sf
-            break
-
-    if comment_field is None:
-        try:
-            cm_sched_field = next(
-                f for f in sd.GetSchedulableFields() if f.ParameterId == comments_param
-            )
-            comment_field = sd.AddField(cm_sched_field)
-        except Exception as ex:
-            print("Comments field missing for schedule '{}': {}".format(vs.Name, ex))
-            return
-
-    comment_field_id = comment_field.FieldId
-    for i in reversed(range(sd.GetFilterCount())):
-        f = sd.GetFilter(i)
-        if f.FieldId == comment_field_id:
-            sd.RemoveFilter(i)
-    sd.AddFilter(
-        ScheduleFilter(comment_field_id, ScheduleFilterType.Equal, prefab_code)
-    )
-
-
-def get_schedule_body_row_count(vs):
-    try:
-        table_data = vs.GetTableData()
-        body = table_data.GetSectionData(SectionType.Body)
-        return body.NumberOfRows
-    except Exception as ex:
-        print("Schedule row count failed for '{}': {}".format(vs.Name, ex))
-        return None
-
-
-def duplicate_schedules_for_systems(doc, detected_systems, prefab_code):
-    created = []
-    required_templates = []
-    seen_templates = set()
-    for syskey in sorted(detected_systems):
-        template_names = SCHEDULE_TEMPLATES.get(syskey)
-        if not template_names:
-            print("No schedule template mapping for {}".format(syskey))
-            continue
-        for sched_name in template_names:
-            if sched_name in seen_templates:
-                continue
-            seen_templates.add(sched_name)
-            required_templates.append(sched_name)
-
-    target_schedule_names = set(required_templates)
-    for sched_name in sorted(target_schedule_names):
-        src = find_schedule_view_by_name(doc, sched_name)
-        if not src:
-            print("Schedule template not found: '{}'".format(sched_name))
-            continue
-
-        try:
-            require_modifiable(doc, "duplicate_schedules_for_systems.start")
-            print("About to duplicate schedule: {}".format(sched_name))
-            require_modifiable(doc, "duplicate_schedules_for_systems.Duplicate")
-            new_id = src.Duplicate(ViewDuplicateOption.Duplicate)
-            new_vs = doc.GetElement(new_id)
-            target_name = "{} {}".format(sched_name, prefab_code)
-            final_name = target_name
-            suffix = 2
-            while find_schedule_view_by_name(doc, final_name):
-                final_name = "{} ({})".format(target_name, suffix)
-                suffix += 1
-            require_modifiable(doc, "duplicate_schedules_for_systems.Name")
-            new_vs.Name = final_name
-            apply_prefab_filter_to_schedule(new_vs, prefab_code)
-
-            if SKIP_EMPTY_SCHEDULES:
-                doc.Regenerate()
-                row_count = get_schedule_body_row_count(new_vs)
-                if row_count == 0:
-                    require_modifiable(
-                        doc, "duplicate_schedules_for_systems.DeleteEmpty"
-                    )
-                    doc.Delete(new_vs.Id)
-                    print("Skipped empty schedule: '{}'".format(final_name))
-                    continue
-
-            created.append(new_vs.Id)
-        except Exception as ex:
-            print("Schedule duplication failed for '{}': {}".format(sched_name, ex))
-            continue
-    return created
-
-
-# --- Boundary Selection Functions ---
-class DetailLineSelectionFilter(ISelectionFilter):
-    def AllowElement(self, elem):
-        if elem.Category and elem.Category.Id.IntegerValue == int(
-            BuiltInCategory.OST_Lines
-        ):
-            return True
-        return False
-
-    def AllowReference(self, ref, point):
-        return False
+        return int(str(value))
+    except:
+        return default
+
+
+def mm_to_ft(mm):
+    return UnitUtils.ConvertToInternalUnits(mm, UnitTypeId.Millimeters)
+
+
+Z_BAND = mm_to_ft(1500.0)
+XY_PAD = mm_to_ft(50.0)
+INSET = mm_to_ft(15.0)  # tiny inset to avoid grazing zeros
+MIN_STOREY_HEIGHT = mm_to_ft(500.0)
+
+PIPE_TAG_DEFAULT = (
+    "RSen_GA_tag pipe_ACO",
+    "RED TypeMark + DN + \u00f8",
+    BuiltInCategory.OST_PipeTags,
+)
+PIPE_TAG_VERTICAL = (
+    "BvdK_Verdiepingspijl",
+    "Van boven",
+    BuiltInCategory.OST_PipeTags,
+)
+PIPE_TAG_SPOT_ELEV = (
+    "BvdK_Pipe_Riolering_Afm + spot elev_bb_H",
+    "sys + afm. + hoogte cl",
+    BuiltInCategory.OST_PipeTags,
+)
+TAG_CFG = SAFE_CFG["tag_type_map"]
+TAGCFG_ACO = dict(
+    family="RSen_GA_tag pipe_ACO",
+    type="RED TypeMark + DN + \u2300",
+    leader=True,
+    offset_mm=500,
+)
+TAGCFG_VERD = dict(
+    family="BvdK_Verdiepingspijl",
+    type="Van boven",
+    leader=False,
+    offset_mm=0,
+)
+TAGCFG_EXTRA_H = dict(
+    family="BvdK_Pipe_Riolering_Afm + spot elev_bb_L RED",
+    type="RED sys + afm. + hoogte cl",
+    leader=True,
+    offset_mm=350,
+)
+
+REGULAR_PIPE_TAG_MODE_OPTIONS = [
+    dict(
+        key="DIAMETER_LENGTH",
+        label="Diameter + pipe length",
+        family="RSen_GA_tag pipe_ACO",
+        type="RED TypeMark + DN + \u00f8",
+        leader=True,
+        offset_mm=500,
+    ),
+    dict(
+        key="DIAMETER_HEIGHT",
+        label="Diameter + height",
+        family="BvdK_Pipe_Riolering_Afm + spot elev_bb_L RED",
+        type="RED sys + afm. + hoogte cl",
+        leader=True,
+        offset_mm=350,
+    ),
+]
+REGULAR_PIPE_TAG_MODE_DEFAULT_KEY = "DIAMETER_LENGTH"
+SELECTED_REGULAR_PIPE_TAG_MODE = None
+RUN_PROFILE_FILE = "sheet_generator_project_profiles.json"
 
 
 def points_are_close(pt1, pt2, tol=1e-6):
@@ -1011,21 +285,17 @@ def order_segments_to_polygon(segments):
     if polygon and points_are_close(polygon[0], polygon[-1]):
         polygon.pop()
         return polygon
-    else:
-        return None
+    return None
 
 
 def is_point_inside_polygon(point, polygon):
-    x = point.X
-    y = point.Y
+    x, y = point.X, point.Y
     inside = False
     n = len(polygon)
     j = n - 1
     for i in range(n):
-        xi = polygon[i].X
-        yi = polygon[i].Y
-        xj = polygon[j].X
-        yj = polygon[j].Y
+        xi, yi = polygon[i].X, polygon[i].Y
+        xj, yj = polygon[j].X, polygon[j].Y
         if ((yi > y) != (yj > y)) and (
             x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
         ):
@@ -1034,1355 +304,3394 @@ def is_point_inside_polygon(point, polygon):
     return inside
 
 
+def polygon_bounds_xy(poly):
+    minx = min(p.X for p in poly)
+    maxx = max(p.X for p in poly)
+    miny = min(p.Y for p in poly)
+    maxy = max(p.Y for p in poly)
+    spanx = maxx - minx
+    spany = maxy - miny
+
+    inset_x = min(INSET, spanx * 0.1, spanx * 0.49) if spanx > 0 else 0.0
+    inset_y = min(INSET, spany * 0.1, spany * 0.49) if spany > 0 else 0.0
+
+    pminx = minx + inset_x
+    pmaxx = maxx - inset_x
+    pminy = miny + inset_y
+    pmaxy = maxy - inset_y
+
+    if pminx >= pmaxx:
+        pminx, pmaxx = minx, maxx
+    if pminy >= pmaxy:
+        pminy, pmaxy = miny, maxy
+
+    return (pminx, pminy, pmaxx, pmaxy)
+
+
+def get_scan_levels(active_plan):
+    if not isinstance(active_plan, ViewPlan):
+        return None, None
+    levels = list(FilteredElementCollector(doc).OfClass(Level).ToElements())
+    levels = sorted(levels, key=lambda l: l.Elevation)
+    if not levels:
+        return None, None
+
+    base = active_plan.GenLevel
+    if base is None:
+        return None, None
+    next_above = None
+    for lv in levels:
+        delta = lv.Elevation - base.Elevation
+        if delta < MIN_STOREY_HEIGHT:
+            continue
+        if delta > 1e-6:
+            next_above = lv
+            break
+    return base, next_above
+
+
+def normalize_tag_text(s):
+    if s is None:
+        return ""
+    s = unicode(s) if "unicode" in globals() else str(s)
+    s = s.strip().lower()
+    s = (
+        s.replace("\u00d8", "ø")
+        .replace("\u00f8", "ø")
+        .replace("\u2300", "ø")
+        .replace("\u03c6", "ø")
+        .replace("Ã˜", "ø")
+        .replace("Ã¸", "ø")
+        .replace("diameter", "ø")
+    )
+    for ch in [
+        "_",
+        "-",
+        "\u2013",
+        "\u2014",
+        "+",
+        ".",
+        ",",
+        ":",
+        ";",
+        "(",
+        ")",
+        "[",
+        "]",
+    ]:
+        s = s.replace(ch, " ")
+    s = " ".join(s.split())
+    return s
+
+
+def _norm(s):
+    return normalize_tag_text(s)
+
+
+def get_symbol_type_name(sym):
+    try:
+        p = sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+        if p:
+            sval = p.AsString()
+            if sval:
+                return sval
+    except Exception:
+        pass
+    try:
+        return sym.Name or ""
+    except Exception:
+        return ""
+
+
+def discover_pipe_tag_symbol_candidates(doc, family_hints=None):
+    candidates = []
+    hints = [_norm(x) for x in (family_hints or [])]
+    for sym in FilteredElementCollector(doc).OfClass(FamilySymbol):
+        try:
+            fam = sym.Family.Name if sym.Family else getattr(sym, "FamilyName", "")
+            typ = get_symbol_type_name(sym)
+            cat_name = sym.Category.Name if sym.Category else ""
+            fam_n = _norm(fam)
+            typ_n = _norm(typ)
+            cat_n = _norm(cat_name)
+            is_pipe_tag_like = (
+                "pipe tag" in cat_n
+                or "tag pipe" in cat_n
+                or "tag" in cat_n
+                or "tag" in fam_n
+                or any(h in fam_n for h in hints)
+            )
+            if is_pipe_tag_like:
+                candidates.append(
+                    {
+                        "symbol": sym,
+                        "family": fam,
+                        "type": typ,
+                        "family_n": fam_n,
+                        "type_n": typ_n,
+                        "category": cat_name,
+                    }
+                )
+        except Exception:
+            continue
+    return candidates
+
+
+def find_family_symbol_by_family_and_type(doc, family_name, type_name):
+    fam_lc = _norm(family_name)
+    typ_lc = _norm(type_name)
+    for item in discover_pipe_tag_symbol_candidates(doc, [family_name]):
+        if item["family_n"] == fam_lc and item["type_n"] == typ_lc:
+            return item["symbol"]
+    return None
+
+
+def choose_best_symbol_for_family(doc, family_name, preferred_types):
+    fam_lc = _norm(family_name)
+    family_candidates = [
+        item
+        for item in discover_pipe_tag_symbol_candidates(doc, [family_name])
+        if item["family_n"] == fam_lc
+    ]
+    if family_candidates:
+        print("TAG RESOLVE -> family candidates for", family_name)
+        for item in family_candidates:
+            print(
+                "  candidate:",
+                item["family"],
+                "|",
+                item["type"],
+                "| normalized={}".format(item["type_n"]),
+                "| category={}".format(item["category"]),
+                "| id={}".format(item["symbol"].Id.IntegerValue),
+            )
+    for pref in preferred_types:
+        pref_n = _norm(pref)
+        for item in family_candidates:
+            if item["type_n"] == pref_n:
+                print(
+                    "TAG RESOLVE -> exact normalized match:",
+                    item["family"],
+                    "|",
+                    item["type"],
+                    "| id={}".format(item["symbol"].Id.IntegerValue),
+                )
+                return item["symbol"]
+    for pref in preferred_types:
+        pref_n = _norm(pref)
+        for item in family_candidates:
+            if (
+                item["type_n"].startswith(pref_n)
+                or pref_n.startswith(item["type_n"])
+                or pref_n in item["type_n"]
+                or item["type_n"] in pref_n
+            ):
+                print(
+                    "TAG RESOLVE -> fallback normalized match:",
+                    item["family"],
+                    "|",
+                    item["type"],
+                    "| id={}".format(item["symbol"].Id.IntegerValue),
+                )
+                return item["symbol"]
+    return family_candidates[0]["symbol"] if family_candidates else None
+
+
+def find_tag_symbol_id(doc, family_name, type_name):
+    fam_lc = _norm(family_name)
+    typ_lc = _norm(type_name)
+    family_candidates = []
+    for item in discover_pipe_tag_symbol_candidates(doc, [family_name]):
+        try:
+            sym = item["symbol"]
+            fam = item["family"]
+            typ = item["type"]
+            fam_n = item["family_n"]
+            typ_n = item["type_n"]
+            if fam_n == fam_lc:
+                family_candidates.append((sym, fam, typ, typ_n, item["category"]))
+            if fam_n == fam_lc and typ_n == typ_lc:
+                print(
+                    "TAG RESOLVE -> exact match:",
+                    fam,
+                    "|",
+                    typ,
+                    "| category={}".format(item["category"]),
+                    "| id={}".format(sym.Id.IntegerValue),
+                )
+                return sym.Id
+        except Exception:
+            continue
+    for sym, fam, typ, typ_n, cat_name in family_candidates:
+        if typ_n.startswith(typ_lc) or typ_lc.startswith(typ_n) or typ_lc in typ_n:
+            print(
+                "TAG RESOLVE -> fallback match:",
+                fam,
+                "|",
+                typ,
+                "| category={}".format(cat_name),
+                "| id={}".format(sym.Id.IntegerValue),
+            )
+            return sym.Id
+    if family_candidates:
+        print("TAG RESOLVE -> family candidates for", family_name)
+        for sym, fam, typ, _, cat_name in family_candidates:
+            print(
+                "  candidate:",
+                fam,
+                "|",
+                typ,
+                "| category={}".format(cat_name),
+                "| id={}".format(sym.Id.IntegerValue),
+            )
+    return None
+
+
+def find_tag_symbol(doc, family_name, type_name, bic=BuiltInCategory.OST_PipeTags):
+    fam_tgt = _norm(family_name)
+    typ_tgt = _norm(type_name)
+    syms = (
+        FilteredElementCollector(doc).OfClass(FamilySymbol).OfCategory(bic).ToElements()
+    )
+
+    for s in syms:
+        try:
+            fam = _norm(s.Family.Name if s.Family else getattr(s, "FamilyName", ""))
+            p = s.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+            typ = _norm(p.AsString() if p else s.Name)
+            if fam == fam_tgt and typ == typ_tgt:
+                return s
+        except Exception:
+            pass
+
+    for s in syms:
+        try:
+            fam = _norm(s.Family.Name if s.Family else getattr(s, "FamilyName", ""))
+            p = s.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+            typ = _norm(p.AsString() if p else s.Name)
+            if fam == fam_tgt and (typ_tgt in typ or typ in typ_tgt):
+                return s
+        except Exception:
+            pass
+
+    return None
+
+
+def list_pipe_tag_symbols(doc):
+    lines = []
+    for item in discover_pipe_tag_symbol_candidates(
+        doc, [TAGCFG_ACO["family"], TAGCFG_VERD["family"]]
+    ):
+        sym = item["symbol"]
+        sid = sym.Id.IntegerValue
+        is_active = getattr(sym, "IsActive", False)
+        lines.append(
+            "{} | {} | category={} | id={} | active={}".format(
+                item["family"], item["type"], item["category"], sid, is_active
+            )
+        )
+
+    lines = sorted(lines)
+    for ln in lines:
+        print(ln)
+
+    if lines:
+        preview = lines[:80]
+        msg = "Pipe tag symbols (showing {} of {}):\n{}".format(
+            len(preview), len(lines), "\n".join(preview)
+        )
+    else:
+        msg = "No pipe tag symbols found."
+    TaskDialog.Show(get_runtime_window_title(), msg[:3800])
+    return lines
+
+
+def ensure_symbol_active(doc, sym_or_id):
+    if sym_or_id is None:
+        return False
+    if hasattr(sym_or_id, "Id"):
+        sym = sym_or_id
+    else:
+        if sym_or_id == ElementId.InvalidElementId:
+            return False
+        sym = doc.GetElement(sym_or_id)
+    if sym is None:
+        return False
+    if not hasattr(sym, "IsActive") or sym.IsActive:
+        return True
+    if doc.IsModifiable:
+        sym.Activate()
+        doc.Regenerate()
+        return True
+    with Transaction(doc, "Activate tag symbol") as t:
+        t.Start()
+        sym.Activate()
+        doc.Regenerate()
+        t.Commit()
+    return True
+
+
+def clone_regular_pipe_tag_mode(option, fallback_used=False, symbol=None):
+    return dict(
+        key=option.get("key"),
+        label=option.get("label"),
+        family=option.get("family"),
+        type=option.get("type"),
+        leader=option.get("leader", True),
+        offset_mm=option.get("offset_mm", SAFE_CFG.get("tag_offset_mm", 250)),
+        fallback_used=bool(fallback_used),
+        symbol=symbol,
+    )
+
+
+def get_regular_pipe_tag_mode_option(key):
+    for option in REGULAR_PIPE_TAG_MODE_OPTIONS:
+        if option.get("key") == key:
+            return option
+    return REGULAR_PIPE_TAG_MODE_OPTIONS[0]
+
+
+def find_regular_pipe_tag_symbol(mode):
+    if mode is None:
+        return None
+    sym = find_family_symbol_by_family_and_type(
+        doc, mode.get("family"), mode.get("type")
+    )
+    if sym is None:
+        sym = find_tag_symbol(doc, mode.get("family"), mode.get("type"))
+    if sym is not None:
+        ensure_symbol_active(doc, sym)
+    return sym
+
+
+def apply_regular_pipe_tag_mode(mode):
+    global SELECTED_REGULAR_PIPE_TAG_MODE
+    global TAGCFG_ACO
+    SELECTED_REGULAR_PIPE_TAG_MODE = mode
+    TAGCFG_ACO["family"] = mode.get("family")
+    TAGCFG_ACO["type"] = mode.get("type")
+    TAGCFG_ACO["leader"] = mode.get("leader", True)
+    TAGCFG_ACO["offset_mm"] = mode.get("offset_mm", SAFE_CFG.get("tag_offset_mm", 250))
+    TAG_CFG["ACO_PIPE"] = (mode.get("family"), mode.get("type"))
+    _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = mode.get("symbol")
+
+
+def get_current_regular_pipe_tag_mode():
+    if SELECTED_REGULAR_PIPE_TAG_MODE is not None:
+        return SELECTED_REGULAR_PIPE_TAG_MODE
+    option = get_regular_pipe_tag_mode_option(REGULAR_PIPE_TAG_MODE_DEFAULT_KEY)
+    sym = find_regular_pipe_tag_symbol(option)
+    mode = clone_regular_pipe_tag_mode(option, False, sym)
+    apply_regular_pipe_tag_mode(mode)
+    return mode
+
+
+def get_regular_pipe_tag_symbol(doc):
+    mode = get_current_regular_pipe_tag_mode()
+    sym = mode.get("symbol")
+    if sym is None:
+        sym = find_regular_pipe_tag_symbol(mode)
+        mode["symbol"] = sym
+        _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = sym
+    return sym
+
+
+def get_script_dir():
+    try:
+        return System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(__file__))
+    except Exception:
+        return "."
+
+
+def get_run_profile_path():
+    return System.IO.Path.Combine(get_script_dir(), RUN_PROFILE_FILE)
+
+
+def get_project_profile_key(doc):
+    try:
+        central = doc.GetWorksharingCentralModelPath()
+        if central:
+            central_path = ModelPathUtils.ConvertModelPathToUserVisiblePath(central)
+            if central_path:
+                return central_path
+    except Exception:
+        pass
+    try:
+        if doc.PathName:
+            return doc.PathName
+    except Exception:
+        pass
+    try:
+        return doc.Title
+    except Exception:
+        return "UNTITLED_PROJECT"
+
+
+def load_project_profile(doc):
+    path = get_run_profile_path()
+    key = get_project_profile_key(doc)
+    try:
+        if not System.IO.File.Exists(path):
+            print("PROFILE -> loaded project config from {}: none".format(path))
+            print("PROFILE -> loaded values: {}")
+            return {}
+        raw = System.IO.File.ReadAllText(path)
+        data = json.loads(raw) if raw else {}
+        profile = data.get(key, {})
+        print("PROFILE -> loaded project config from {}".format(path))
+        print("PROFILE -> loaded values: {}".format(profile or {}))
+        return profile or {}
+    except Exception as ex:
+        print("PROFILE -> loaded project config from {} failed: {}".format(path, ex))
+        return {}
+
+
+def save_project_profile(doc, runtime_config):
+    path = get_run_profile_path()
+    key = get_project_profile_key(doc)
+    profile = {
+        "regular_tag_mode": runtime_config.get("regular_tag_mode"),
+        "regular_tag_family_name": runtime_config.get("regular_tag_family_name"),
+        "regular_tag_type_name": runtime_config.get("regular_tag_type_name"),
+        "vertical_tag_override_enabled": runtime_config.get(
+            "vertical_tag_override_enabled"
+        ),
+        "vertical_tag_family_name": runtime_config.get("vertical_tag_family_name"),
+        "vertical_tag_type_name": runtime_config.get("vertical_tag_type_name"),
+        "titleblock_display": runtime_config.get("titleblock_display"),
+        "schedule_mode": runtime_config.get("schedule_mode"),
+        "use_selected_schedule_masters": runtime_config.get(
+            "use_selected_schedule_masters"
+        ),
+        "pipe_schedule_master_name": runtime_config.get("pipe_schedule_master_name"),
+        "fitting_schedule_master_name": runtime_config.get(
+            "fitting_schedule_master_name"
+        ),
+    }
+    try:
+        data = {}
+        if System.IO.File.Exists(path):
+            raw = System.IO.File.ReadAllText(path)
+            data = json.loads(raw) if raw else {}
+        data[key] = profile
+        System.IO.File.WriteAllText(path, json.dumps(data, indent=2, sort_keys=True))
+        print("PROFILE -> saved project config to {}".format(path))
+        print("PROFILE -> saved values: {}".format(profile))
+    except Exception as ex:
+        print("PROFILE -> saved project config to {} failed: {}".format(path, ex))
+
+
+def is_pipe_tag_symbol(sym):
+    try:
+        return sym.Category is not None and sym.Category.Id.IntegerValue == int(
+            BuiltInCategory.OST_PipeTags
+        )
+    except Exception:
+        return False
+
+
+def collect_loaded_pipe_tag_options(doc):
+    rows = []
+    seen = set()
+    try:
+        symbols = (
+            FilteredElementCollector(doc)
+            .OfClass(FamilySymbol)
+            .OfCategory(BuiltInCategory.OST_PipeTags)
+            .ToElements()
+        )
+    except Exception:
+        symbols = []
+    for sym in symbols:
+        try:
+            fam = sym.Family.Name if sym.Family else getattr(sym, "FamilyName", "")
+            typ = get_symbol_type_name(sym)
+            if not fam or not typ:
+                continue
+            key = (_norm(fam), _norm(typ))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"family": fam, "type": typ, "symbol": sym})
+        except Exception:
+            continue
+    rows.sort(key=lambda x: (x.get("family", ""), x.get("type", "")))
+    return rows
+
+
+def describe_pipe_tag_option(family_name, type_name):
+    sym = find_tag_symbol(doc, family_name, type_name)
+    if sym is None:
+        return "unresolved"
+    try:
+        cat = sym.Category.Name if sym.Category else ""
+        return "{} / {} / {} / {}".format(
+            family_name, type_name, cat, sym.Id.IntegerValue
+        )
+    except Exception:
+        return "{} / {} / Pipe Tags / {}".format(
+            family_name, type_name, sym.Id.IntegerValue
+        )
+
+
+def pipe_tag_family_names(tag_options):
+    names = []
+    seen = set()
+    for item in tag_options:
+        fam = item.get("family")
+        key = _norm(fam)
+        if fam and key not in seen:
+            seen.add(key)
+            names.append(fam)
+    return names
+
+
+def pipe_tag_type_names(tag_options, family_name):
+    names = []
+    fam_n = _norm(family_name)
+    for item in tag_options:
+        if _norm(item.get("family")) == fam_n:
+            names.append(item.get("type"))
+    return sorted([x for x in names if x])
+
+
+def get_symbol_display(sym):
+    try:
+        fam = sym.Family.Name if sym.Family else ""
+        typ = get_symbol_type_name(sym)
+        return "{} - {}".format(fam, typ)
+    except Exception:
+        return ""
+
+
+def collect_titleblock_options(doc):
+    rows = []
+    try:
+        symbols = (
+            FilteredElementCollector(doc)
+            .OfCategory(BuiltInCategory.OST_TitleBlocks)
+            .OfClass(FamilySymbol)
+            .ToElements()
+        )
+    except Exception:
+        symbols = []
+    for sym in symbols:
+        try:
+            display = get_symbol_display(sym)
+            if display:
+                rows.append({"display": display, "symbol": sym})
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x.get("display", ""))
+    return rows
+
+
+def get_schedule_category_text(schedule):
+    try:
+        cat_id = schedule.Definition.CategoryId
+        if cat_id and cat_id != ElementId.InvalidElementId:
+            cat = Category.GetCategory(doc, cat_id)
+            if cat:
+                return cat.Name or ""
+    except Exception:
+        pass
+    try:
+        if schedule.Definition.IsMultiCategory:
+            return "Multi-Category"
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def is_irrelevant_schedule_name(name_value):
+    name_lc = (name_value or "").lower()
+    reject_tokens = [
+        "revision",
+        "keynote",
+        "material",
+        "takeoff",
+        "sheet list",
+        "view list",
+        "internal",
+        "helper",
+        "working",
+    ]
+    return any(token in name_lc for token in reject_tokens)
+
+
+def schedule_matches_kind(schedule, kind):
+    name_lc = (schedule.Name or "").lower()
+    cat_lc = (get_schedule_category_text(schedule) or "").lower()
+    if kind == "pipe":
+        if "fitting" in name_lc or "fitting" in cat_lc:
+            return False
+        return (
+            "pipe" in cat_lc
+            or "pipes" in cat_lc
+            or ("pipe" in name_lc and "fitting" not in name_lc)
+        )
+    if kind == "fitting":
+        return (
+            "pipe fitting" in cat_lc
+            or "fitting" in cat_lc
+            or "multi-category" in cat_lc
+            or "multi category" in cat_lc
+            or "fitting" in name_lc
+        )
+    return True
+
+
+def collect_schedule_master_options(doc, kind=None):
+    rows = []
+    kind_lc = (kind or "").lower()
+    try:
+        schedules = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
+    except Exception:
+        schedules = []
+    for sched in schedules:
+        try:
+            if sched.IsTemplate:
+                continue
+            name_value = sched.Name or ""
+            if is_irrelevant_schedule_name(name_value):
+                continue
+            if kind_lc and not schedule_matches_kind(sched, kind_lc):
+                continue
+            name_lc = name_value.lower()
+            cat_text = get_schedule_category_text(sched)
+            score = 0
+            if kind_lc == "pipe":
+                if "pipe" in name_lc or "pipe" in cat_text.lower():
+                    score += 5
+                if "fitting" in name_lc:
+                    score -= 10
+            elif kind_lc == "fitting":
+                if "fitting" in name_lc or "fitting" in cat_text.lower():
+                    score += 5
+                if "multi" in cat_text.lower():
+                    score += 2
+                if "pipe" in name_lc:
+                    score += 1
+            if "master" in name_lc:
+                score += 2
+            if "template" in name_lc:
+                score += 1
+            rows.append(
+                {
+                    "name": name_value,
+                    "schedule": sched,
+                    "score": score,
+                    "category": cat_text,
+                }
+            )
+        except Exception:
+            continue
+    rows.sort(key=lambda x: (-x.get("score", 0), x.get("name", "")))
+    return rows
+
+
+def load_tag_family_from_file(doc):
+    before_options = collect_loaded_pipe_tag_options(doc)
+    before_count = len(before_options)
+    dlg = OpenFileDialog()
+    dlg.Title = "Load tag family from file"
+    dlg.Filter = "Revit Family (*.rfa)|*.rfa"
+    dlg.Multiselect = False
+    if dlg.ShowDialog() != DialogResult.OK:
+        return False
+    path = dlg.FileName
+    if not path or not path.lower().endswith(".rfa"):
+        TaskDialog.Show(get_runtime_window_title(), "Select a Revit family (*.rfa).")
+        return False
+    try:
+        loaded = False
+        with Transaction(doc, "Sheet Generator - Load Tag Family") as t:
+            t.Start()
+            loaded = bool(doc.LoadFamily(path))
+            t.Commit()
+        if not loaded:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Family load did not report success:\n{}".format(path),
+            )
+            return False
+        after_options = collect_loaded_pipe_tag_options(doc)
+        file_family_hint = _norm(System.IO.Path.GetFileNameWithoutExtension(path))
+        matching_loaded_pipe_tags = [
+            item
+            for item in after_options
+            if _norm(item.get("family")) == file_family_hint
+        ]
+        if len(after_options) <= before_count and not matching_loaded_pipe_tags:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Loaded family is not a usable pipe tag family:\n{}".format(path),
+            )
+            print(
+                "CONFIG -> loaded tag family rejected as non-pipe-tag: {}".format(path)
+            )
+            return False
+        print("CONFIG -> loaded tag family from file: {}".format(path))
+        return True
+    except Exception as ex:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Could not load tag family:\n{}\n\n{}".format(path, ex),
+        )
+        return False
+
+
+def get_pipe_tag_type_from_existing_tags(doc, view):
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    if tags and len(tags) > 0:
+        try:
+            tid = tags[0].GetTypeId()
+            ensure_symbol_active(doc, tid)
+            return tid
+        except Exception:
+            return None
+    return None
+
+
+def get_first_pipe_tag_symbol_id(doc):
+    pipe_tag_cat = Category.GetCategory(doc, BuiltInCategory.OST_PipeTags)
+    if pipe_tag_cat is None:
+        return None
+    syms = FilteredElementCollector(doc).OfClass(FamilySymbol).ToElements()
+    for sym in syms:
+        try:
+            if (
+                sym.Category
+                and sym.Category.Id.IntegerValue == pipe_tag_cat.Id.IntegerValue
+            ):
+                ensure_symbol_active(doc, sym.Id)
+                return sym.Id
+        except Exception:
+            continue
+    return None
+
+
+def resolve_required_tag_symbols(doc):
+    global _PIPE_TAG_LOOKUP_DIAG_SHOWN
+    global _MISSING_TAG_TYPES_DIALOG_SHOWN
+    global _RESOLVED_TAG_SYMBOLS
+
+    resolved = {}
+    missing = []
+    required = {
+        "ACO_PIPE": (
+            TAGCFG_ACO["family"],
+            [
+                TAGCFG_ACO["type"],
+                "TypeMark + DN + ø",
+                "DN + Length",
+            ],
+        ),
+        "VERT_ARROW": (TAGCFG_VERD["family"], [TAGCFG_VERD["type"]]),
+        "EXTRA_HORIZONTAL": (TAGCFG_EXTRA_H["family"], [TAGCFG_EXTRA_H["type"]]),
+    }
+    for key, (fam, preferred_types) in required.items():
+        sym = choose_best_symbol_for_family(doc, fam, preferred_types)
+        if sym is None:
+            sym_id = find_tag_symbol_id(doc, fam, preferred_types[0])
+            sym = doc.GetElement(sym_id) if sym_id else None
+        if sym is None:
+            sym = find_family_symbol_by_family_and_type(doc, fam, preferred_types[0])
+        if sym is None:
+            sym = find_tag_symbol(doc, fam, preferred_types[0])
+        if sym:
+            ensure_symbol_active(doc, sym)
+            resolved[key] = sym
+            try:
+                print(
+                    "TAG RESOLVE -> resolved:",
+                    sym.Family.Name if sym.Family else "",
+                    "|",
+                    sym.Name,
+                    "| id={}".format(sym.Id.IntegerValue),
+                )
+            except Exception:
+                pass
+        else:
+            missing.append("{} - {}".format(fam, preferred_types[0]))
+
+    _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = resolved.get("ACO_PIPE")
+    _RESOLVED_TAG_SYMBOLS["PIPE_VERTICAL"] = resolved.get("VERT_ARROW")
+    _RESOLVED_TAG_SYMBOLS["PIPE_EXTRA_HORIZONTAL"] = resolved.get("EXTRA_HORIZONTAL")
+    print(
+        "TAG RESOLVE -> extra horizontal tag:",
+        (
+            resolved.get("EXTRA_HORIZONTAL").Id.IntegerValue
+            if resolved.get("EXTRA_HORIZONTAL")
+            else None
+        ),
+    )
+
+    if missing:
+        if not _PIPE_TAG_LOOKUP_DIAG_SHOWN:
+            _PIPE_TAG_LOOKUP_DIAG_SHOWN = True
+            list_pipe_tag_symbols(doc)
+        if not _MISSING_TAG_TYPES_DIALOG_SHOWN:
+            _MISSING_TAG_TYPES_DIALOG_SHOWN = True
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Could not find required tag types:\n- " + "\n- ".join(missing),
+            )
+
+    return resolved, missing
+
+
+def get_pipe_direction(elem):
+    try:
+        curve = elem.Location.Curve
+        d = (curve.GetEndPoint(1) - curve.GetEndPoint(0)).Normalize()
+        return XYZ(d.X, d.Y, d.Z)
+    except Exception:
+        return XYZ(0, 0, 0)
+
+
+def is_vertical_pipe(elem):
+    try:
+        crv = elem.Location.Curve
+        d = crv.Direction.Normalize()
+        return abs(d.Z) > 0.9
+    except Exception:
+        d = get_pipe_direction(elem)
+        return abs(d.Z) > 0.9
+
+
+def is_horizontal_pipe(elem):
+    try:
+        crv = elem.Location.Curve
+        d = crv.Direction.Normalize()
+        return abs(d.Z) < 0.15
+    except Exception:
+        d = get_pipe_direction(elem)
+        return abs(d.Z) < 0.15
+
+
+def get_elem_type_name(elem):
+    try:
+        tid = elem.GetTypeId()
+        if tid and tid.IntegerValue > 0:
+            t = doc.GetElement(tid)
+            if t:
+                try:
+                    return Element.Name.GetValue(t) or ""
+                except Exception:
+                    try:
+                        return t.Name or ""
+                    except Exception:
+                        return ""
+    except Exception:
+        pass
+    return ""
+
+
+def get_elem_family_name(elem):
+    try:
+        tid = elem.GetTypeId()
+        if tid and tid.IntegerValue > 0:
+            t = doc.GetElement(tid)
+            if t:
+                try:
+                    return t.FamilyName or ""
+                except Exception:
+                    try:
+                        if hasattr(t, "Family") and t.Family:
+                            return t.Family.Name or ""
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return ""
+
+
+def normalize_token(s):
+    try:
+        return (s or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def is_excluded_nlrs_pipe(elem):
+    try:
+        if not elem or not elem.Category:
+            return False
+        if elem.Category.Id.IntegerValue != int(BuiltInCategory.OST_PipeCurves):
+            return False
+        type_name = normalize_token(get_elem_type_name(elem))
+        fam_name = normalize_token(get_elem_family_name(elem))
+        if type_name == normalize_token("NLRS_50_PI_Mapress Koper buis (OD)_geb"):
+            return True
+        if "nlrs_50_pi_mapress koper buis" in type_name:
+            return True
+        if "nlrs_50_pi_mapress koper buis" in fam_name:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_horizontal_connected_to_vertical(pipe):
+    if is_vertical_pipe(pipe):
+        return False
+    try:
+        cm = pipe.ConnectorManager if hasattr(pipe, "ConnectorManager") else None
+        if not cm:
+            return False
+        for c in cm.Connectors:
+            for r in c.AllRefs:
+                owner = r.Owner
+                if owner and owner.Id.IntegerValue != pipe.Id.IntegerValue:
+                    if owner.Category and owner.Category.Id.IntegerValue == int(
+                        BuiltInCategory.OST_PipeCurves
+                    ):
+                        if is_vertical_pipe(owner):
+                            return True
+    except Exception:
+        pass
+    return False
+
+
+def get_pipe_connectors(pipe):
+    try:
+        cm = pipe.ConnectorManager
+    except Exception:
+        try:
+            cm = pipe.MEPModel.ConnectorManager
+        except Exception:
+            cm = None
+    if not cm:
+        return []
+    try:
+        return [c for c in cm.Connectors]
+    except Exception:
+        return []
+
+
+def get_connected_pipe_ids(pipe, scanned_pipe_id_set):
+    out = set()
+    for c in get_pipe_connectors(pipe):
+        try:
+            for ref in c.AllRefs:
+                owner = ref.Owner
+                if not owner:
+                    continue
+                if owner.Id.IntegerValue == pipe.Id.IntegerValue:
+                    continue
+                if owner.Id.IntegerValue in scanned_pipe_id_set:
+                    if owner.Category and owner.Category.Id.IntegerValue == int(
+                        BuiltInCategory.OST_PipeCurves
+                    ):
+                        out.add(owner.Id.IntegerValue)
+        except Exception:
+            pass
+    return out
+
+
+def find_extra_horizontal_targets(scanned_pipes):
+    scanned_pipe_id_set = set(p.Id.IntegerValue for p in scanned_pipes if p is not None)
+    by_id = {p.Id.IntegerValue: p for p in scanned_pipes if p is not None}
+    targets = set()
+    verticals = [p for p in scanned_pipes if p is not None and is_vertical_pipe(p)]
+    for vp in verticals:
+        connected_ids = get_connected_pipe_ids(vp, scanned_pipe_id_set)
+        horiz = []
+        vp_connectors = get_pipe_connectors(vp)
+        for cid in connected_ids:
+            cp = by_id.get(cid)
+            if not cp or not is_horizontal_pipe(cp) or is_excluded_nlrs_pipe(cp):
+                continue
+            best_dist = 1e18
+            try:
+                cp_connectors = get_pipe_connectors(cp)
+                for vc in vp_connectors:
+                    for cc in cp_connectors:
+                        try:
+                            d = vc.Origin.DistanceTo(cc.Origin)
+                        except Exception:
+                            dx = vc.Origin.X - cc.Origin.X
+                            dy = vc.Origin.Y - cc.Origin.Y
+                            dz = vc.Origin.Z - cc.Origin.Z
+                            d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                        if d < best_dist:
+                            best_dist = d
+            except Exception:
+                best_dist = 1e18
+            horiz.append((best_dist, cp.Id.IntegerValue, cp))
+        horiz = sorted(horiz, key=lambda x: (x[0], x[1]))
+        if horiz:
+            targets.add(horiz[0][2].Id.IntegerValue)
+    return targets, verticals
+
+
+def decide_pipe_tag_symbol_id(pipe, view):
+    resolved, _ = resolve_required_tag_symbols(doc)
+    pipe_tag_sym = resolved.get("ACO_PIPE")
+    vert_tag_sym = resolved.get("VERT_ARROW")
+    if is_vertical_pipe(pipe):
+        if vert_tag_sym:
+            ensure_symbol_active(doc, vert_tag_sym.Id)
+            return vert_tag_sym.Id
+    else:
+        if pipe_tag_sym:
+            ensure_symbol_active(doc, pipe_tag_sym.Id)
+            return pipe_tag_sym.Id
+
+    return None
+
+
+def find_pipe_tags_for_host_in_view(doc, view_id, host_id):
+    hits = []
+    tags = (
+        FilteredElementCollector(doc, view_id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for t in tags:
+        try:
+            if hasattr(t, "GetTaggedElementIds"):
+                ids = t.GetTaggedElementIds()
+                for rid in ids:
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue == host_id.IntegerValue:
+                        hits.append(t)
+                        break
+            elif hasattr(t, "TaggedElementId") and t.TaggedElementId:
+                if t.TaggedElementId.IntegerValue == host_id.IntegerValue:
+                    hits.append(t)
+        except Exception:
+            pass
+    return hits
+
+
+def find_pipe_tag_in_view(view, host_id):
+    tags = find_pipe_tags_for_host_in_view(doc, view.Id, host_id)
+    return tags[0] if tags else None
+
+
+class DetailLineSelectionFilter(ISelectionFilter):
+    def AllowElement(self, elem):
+        return bool(
+            elem.Category
+            and elem.Category.Id.IntegerValue == int(BuiltInCategory.OST_Lines)
+        )
+
+    def AllowReference(self, ref, point):
+        return False
+
+
+def convert_param_to_string(param_obj):
+    if not param_obj:
+        return ""
+    try:
+        s = param_obj.AsValueString()
+        if s and s.strip():
+            return s
+    except:
+        pass
+    try:
+        val_mm = param_obj.AsDouble() * 304.8
+        return str(int(round(val_mm))) + " mm"
+    except:
+        return ""
+
+
+def is_nlrs_element(elem):
+    try:
+        t = doc.GetElement(elem.GetTypeId())
+        tn = (t.Name or "").lower() if t else ""
+        fn = ""
+        if isinstance(elem, FamilyInstance) and elem.Symbol and elem.Symbol.Family:
+            fn = (elem.Symbol.Family.Name or "").lower()
+        en = (elem.Name or "").lower()
+        blob = " ".join([tn, fn, en])
+        return ("nlrs_" in blob) or blob.startswith("nlrs")
+    except Exception:
+        return False
+
+
+def is_nested_familyinstance(elem):
+    try:
+        return isinstance(elem, FamilyInstance) and elem.SuperComponent is not None
+    except Exception:
+        return False
+
+
 def select_boundary_and_gather():
+    if not isinstance(uidoc.ActiveView, ViewPlan):
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Run this tool from a Floor Plan/Callout (ViewPlan) for reliable prefab scanning.",
+        )
+        return None, None
+
     try:
         selection_refs = uidoc.Selection.PickObjects(
             ObjectType.Element,
             DetailLineSelectionFilter(),
-            "Select boundary detail lines (click on the lines that form a closed loop)",
+            "Select boundary detail lines (closed loop)",
         )
     except Exception:
-        return None
+        return None, None
     if not selection_refs:
-        return None
+        return None, None
 
     segments = []
-    for ref in selection_refs:
-        elem = doc.GetElement(ref)
+    for r in selection_refs:
+        el = doc.GetElement(r)
         try:
-            curve = elem.GeometryCurve
-            start = curve.GetEndPoint(0)
-            end = curve.GetEndPoint(1)
-            segments.append((start, end))
-        except Exception:
-            continue
+            crv = el.GeometryCurve
+            segments.append((crv.GetEndPoint(0), crv.GetEndPoint(1)))
+        except:
+            pass
 
     polygon = order_segments_to_polygon(segments[:])
     if polygon is None:
         MessageBox.Show(
-            "The selected detail lines do not form a closed boundary.", "Error"
+            "The selected lines do not form a closed loop.", get_runtime_window_title()
         )
-        return None
+        return None, None
 
+    active_plan = uidoc.ActiveView
+    ground, first = get_scan_levels(active_plan)
+    if ground is None:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Could not determine base level from active plan.",
+        )
+        return None, None
+    z_min = ground.Elevation - mm_to_ft(500.0)
+    z_max = (
+        first.Elevation + mm_to_ft(500.0)
+        if first is not None
+        else (ground.Elevation + mm_to_ft(4000.0) + mm_to_ft(500.0))
+    )
+    if abs(z_max - z_min) < 1e-6:
+        z_max = z_min + Z_BAND
+
+    pminx, pminy, pmaxx, pmaxy = polygon_bounds_xy(polygon)
+    dz_mm = (z_max - z_min) * 304.8
+    print(
+        "Scan bounds XY=({:.4f}, {:.4f})-({:.4f}, {:.4f}) Z=({:.4f}, {:.4f}) dz_mm={:.1f}".format(
+            pminx, pminy, pmaxx, pmaxy, z_min, z_max, dz_mm
+        )
+    )
+    allowed_cat_ids = {
+        int(BuiltInCategory.OST_PipeCurves),
+        int(BuiltInCategory.OST_PipeFitting),
+        int(BuiltInCategory.OST_PipeAccessory),
+        int(BuiltInCategory.OST_PlumbingFixtures),
+    }
     collector = (
         FilteredElementCollector(doc, uidoc.ActiveView.Id)
         .WhereElementIsNotElementType()
         .ToElements()
     )
     elements_inside = []
+    excluded_scan_nlrs = 0
+
     for elem in collector:
-        bbox = elem.get_BoundingBox(uidoc.ActiveView)
-        if bbox:
-            center = XYZ(
-                (bbox.Min.X + bbox.Max.X) / 2.0,
-                (bbox.Min.Y + bbox.Max.Y) / 2.0,
-                (bbox.Min.Z + bbox.Max.Z) / 2.0,
-            )
-            if is_point_inside_polygon(center, polygon):
-                elements_inside.append(elem)
-
-    MessageBox.Show(
-        "Found {0} element(s) inside the selected boundary.".format(
-            len(elements_inside)
-        ),
-        "Boundary Selection",
-    )
-    return elements_inside
-
-
-# --- Parameter and Region Helpers ---
-def convert_param_to_string(param_obj):
-    if not param_obj:
-        return ""
-    try:
-        val_str = param_obj.AsValueString()
-        if val_str and val_str.strip() != "":
-            return val_str
-    except Exception:
-        pass
-    try:
-        val_double = param_obj.AsDouble()
-        val_mm = val_double * 304.8
-        return str(int(round(val_mm))) + " mm"
-    except Exception:
-        return ""
-
-
-def get_region_bounding_box(elements):
-    valid_found = False
-    overall_min_x = float("inf")
-    overall_min_y = float("inf")
-    overall_min_z = float("inf")
-    overall_max_x = float("-inf")
-    overall_max_y = float("-inf")
-    overall_max_z = float("-inf")
-
-    for el in elements:
-        try:
-            bbox = el.get_BoundingBox(uidoc.ActiveView)
-        except:
-            continue  # skip if element was just deleted
-        if not bbox:
+        if not elem.Category:
             continue
-        if bbox is None:
+        if elem.Category.Id.IntegerValue not in allowed_cat_ids:
             continue
-        if (
-            bbox.Min.X == float("inf")
-            or bbox.Min.Y == float("inf")
-            or bbox.Min.Z == float("inf")
+        if SAFE_CFG.get("exclude_nlrs_pipes", True) and (
+            is_nlrs_element(elem) or is_excluded_nlrs_pipe(elem)
         ):
+            if elem.Category.Id.IntegerValue == int(BuiltInCategory.OST_PipeCurves):
+                excluded_scan_nlrs += 1
             continue
-        valid_found = True
-        overall_min_x = min(overall_min_x, bbox.Min.X)
-        overall_min_y = min(overall_min_y, bbox.Min.Y)
-        overall_min_z = min(overall_min_z, bbox.Min.Z)
-        overall_max_x = max(overall_max_x, bbox.Max.X)
-        overall_max_y = max(overall_max_y, bbox.Max.Y)
-        overall_max_z = max(overall_max_z, bbox.Max.Z)
-
-    if not valid_found:
-        return XYZ(0, 0, 0), XYZ(0, 0, 0)
-
-    overall_min = XYZ(overall_min_x, overall_min_y, overall_min_z)
-    overall_max = XYZ(overall_max_x, overall_max_y, overall_max_z)
-    return overall_min, overall_max
-
-
-def create_pipe_tags_for_untagged_pipes(doc, pipes, view):
-    t = Transaction(doc, "Add Missing Pipe Tags")
-    t.Start()
-    for pipe in pipes:
-        bbox = pipe.get_BoundingBox(view)
-        if not bbox:
+        if elem.Category.Id.IntegerValue == int(
+            BuiltInCategory.OST_PipeFitting
+        ) and is_nested_familyinstance(elem):
+            continue
+        bb = elem.get_BoundingBox(uidoc.ActiveView)
+        if not bb:
             continue
         center = XYZ(
-            (bbox.Min.X + bbox.Max.X) / 2.0,
-            (bbox.Min.Y + bbox.Max.Y) / 2.0,
-            (bbox.Min.Z + bbox.Max.Z) / 2.0,
+            (bb.Min.X + bb.Max.X) * 0.5,
+            (bb.Min.Y + bb.Max.Y) * 0.5,
+            (bb.Min.Z + bb.Max.Z) * 0.5,
         )
-        pipe_ref = Reference(pipe)
-        IndependentTag.Create(
-            doc,
-            view.Id,
-            pipe_ref,
-            True,
-            TagMode.TM_ADDBY_CATEGORY,
-            TagOrientation.Horizontal,
-            UV(center.X, center.Y),
-        )
-    t.Commit()
+        if not (z_min <= center.Z <= z_max):
+            continue
+        if is_point_inside_polygon(XYZ(center.X, center.Y, 0), polygon):
+            elements_inside.append(elem)
+
+    print("SCAN -> excluded NLRS pipes:", excluded_scan_nlrs)
+    MessageBox.Show(
+        "Found {0} element(s) in region.".format(len(elements_inside)),
+        get_runtime_window_title(),
+    )
+    return elements_inside, polygon
 
 
 # ==================================================
-# UI Class: ElementEditorForm
+# Data grid UI (unchanged core behavior; cleaned a bit)
 # ==================================================
+from System.Windows.Forms import (
+    Panel,
+    DataGridViewTextBoxColumn,
+    DataGridViewButtonColumn,
+    DataGridViewAutoSizeColumnsMode,
+)
+
+
 class ElementEditorForm(Form):
     def __init__(self, elements_data, region_elements=None):
-        self.Text = "Edit Element Codes"
-        self.Width = 1050
+        self.Text = "{} - Edit Element Codes".format(get_runtime_window_title())
+        self.Width = 1400
         self.Height = 500
-        self.MinimumSize = Size(700, 400)
+        self.MinimumSize = Size(1100, 400)
         self.SuspendLayout()
         self.regionElements = region_elements
+        self.regionPolygon = None
 
-        # --- 1. Bottom Buttons Panel FIRST
-        self.buttonPanel = System.Windows.Forms.Panel()
-        self.buttonPanel.Height = 50
+        self.buttonPanel = Panel()
+        self.buttonPanel.Height = 48
         self.buttonPanel.Dock = DockStyle.Bottom
         self.Controls.Add(self.buttonPanel)
-
-        # --- 2. Panel for the DataGridView SECOND
-        self.gridPanel = System.Windows.Forms.Panel()
+        self.rightPanel = Panel()
+        self.rightPanel.Dock = DockStyle.Right
+        self.rightPanel.Width = 320
+        self.buttonPanel.Controls.Add(self.rightPanel)
+        self.leftPanel = Panel()
+        self.leftPanel.Dock = DockStyle.Fill
+        self.buttonPanel.Controls.Add(self.leftPanel)
+        self.leftFlow = FlowLayoutPanel()
+        self.leftFlow.Dock = DockStyle.Fill
+        self.leftFlow.WrapContents = False
+        self.leftFlow.AutoSize = False
+        self.leftPanel.Controls.Add(self.leftFlow)
+        self.rightFlow = FlowLayoutPanel()
+        self.rightFlow.Dock = DockStyle.Fill
+        self.rightFlow.WrapContents = False
+        self.rightFlow.FlowDirection = FlowDirection.RightToLeft
+        self.rightFlow.AutoSize = False
+        self.rightPanel.Controls.Add(self.rightFlow)
+        self.gridPanel = Panel()
         self.gridPanel.Dock = DockStyle.Fill
         self.Controls.Add(self.gridPanel)
 
         self.dataGrid = DataGridView()
-        self.dataGrid.SelectionChanged += self.on_row_selected
         self.dataGrid.Dock = DockStyle.Fill
         self.dataGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
-        self.dataGrid.CellContentClick += self.dataGrid_CellContentClick
         self.dataGrid.MultiSelect = True
         self.dataGrid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        self.dataGrid.SelectionChanged += self.on_row_selected
         self.gridPanel.Controls.Add(self.dataGrid)
 
-        # --- 3. Columns
-        self.colId = DataGridViewTextBoxColumn()
-        self.colId.Name = "Id"
-        self.colId.HeaderText = "Element Id"
-        self.colId.ReadOnly = True
+        # columns
+        cols = []
 
-        self.colCategory = DataGridViewTextBoxColumn()
-        self.colCategory.Name = "Category"
-        self.colCategory.HeaderText = "Category"
-        self.colCategory.ReadOnly = True
+        def add_col(name, header, ro=True):
+            c = DataGridViewTextBoxColumn()
+            c.Name = name
+            c.HeaderText = header
+            c.ReadOnly = ro
+            cols.append(c)
 
-        self.category_headers = {}
-        self.collapsed_categories = set()
-
-        self.colName = DataGridViewTextBoxColumn()
-        self.colName.Name = "Name"
-        self.colName.HeaderText = "Name"
-        self.colName.ReadOnly = True
-
-        self.colWarning = DataGridViewTextBoxColumn()
-        self.colWarning.Name = "Warning"
-        self.colWarning.HeaderText = "Warning"
-        self.colWarning.ReadOnly = True
-
-        self.colBend45 = DataGridViewTextBoxColumn()
-        self.colBend45.Name = "Bend45"
-        self.colBend45.HeaderText = "2x45°"
-        self.colBend45.ReadOnly = True
-
-        self.colDefaultCode = DataGridViewTextBoxColumn()
-        self.colDefaultCode.Name = "DefaultCode"
-        self.colDefaultCode.HeaderText = "Default Code"
-        self.colDefaultCode.ReadOnly = True
-
-        self.colNewCode = DataGridViewTextBoxColumn()
-        self.colNewCode.Name = "NewCode"
-        self.colNewCode.HeaderText = "New Code"
-        self.colNewCode.ReadOnly = False
-
-        self.colOD = DataGridViewTextBoxColumn()
-        self.colOD.Name = "OutsideDiameter"
-        self.colOD.HeaderText = "Outside Diameter"
-        self.colOD.ReadOnly = True
-
-        self.colLength = DataGridViewTextBoxColumn()
-        self.colLength.Name = "Length"
-        self.colLength.HeaderText = "Length"
-        self.colLength.ReadOnly = True
-
-        self.colSize = DataGridViewTextBoxColumn()
-        self.colSize.Name = "Size"
-        self.colSize.HeaderText = "Size"
-        self.colSize.ReadOnly = True
-
-        self.colArticle = DataGridViewTextBoxColumn()
-        self.colArticle.Name = "GEB_Article_Number"
-        self.colArticle.HeaderText = "GEB Article No."
-        self.colArticle.ReadOnly = True
+        add_col("Id", "Element Id")
+        add_col("Category", "Category")
+        add_col("Name", "Name")
+        add_col("Warning", "Warning")
+        add_col("Bend45", "2x45\u00b0")
+        add_col("DefaultCode", "Default Code")
+        add_col("NewCode", "New Code", ro=False)
+        add_col("OutsideDiameter", "Outside Diameter")
+        add_col("Length", "Length")
+        add_col("Size", "Size")
+        add_col("GEB_Article_Number", "GEB Article No.")
 
         self.colTagStatus = DataGridViewButtonColumn()
         self.colTagStatus.Name = "TagStatus"
         self.colTagStatus.HeaderText = "Tags"
         self.colTagStatus.UseColumnTextForButtonValue = False
 
-        self.dataGrid.Columns.AddRange(
-            Array[DataGridViewTextBoxColumn](
-                [
-                    self.colId,
-                    self.colCategory,
-                    self.colName,
-                    self.colWarning,
-                    self.colBend45,
-                    self.colDefaultCode,
-                    self.colNewCode,
-                    self.colOD,
-                    self.colLength,
-                    self.colSize,
-                ]
-            )
-        )
-        self.dataGrid.Columns.Add(self.colArticle)
-        self.dataGrid.Columns.Add(self.colTagStatus)
+        self.colFlipTstuk = DataGridViewButtonColumn()
+        self.colFlipTstuk.Name = "FlipTstuk"
+        self.colFlipTstuk.HeaderText = "Flip T-stuk"
+        self.colFlipTstuk.UseColumnTextForButtonValue = False
+        self.colFlipTstuk.DefaultCellStyle.NullValue = ""
 
-        # 1. Text Note Code Input with Example Text
+        self.dataGrid.Columns.AddRange(Array[DataGridViewTextBoxColumn](cols))
+        self.dataGrid.Columns.Add(self.colTagStatus)
+        self.dataGrid.Columns.Add(self.colFlipTstuk)
+        self.dataGrid.CellContentClick += self.dataGrid_CellContentClick
+        self.dataGrid.CellClick += self.dataGrid_CellClick
+
+        # text note input
         self.txtTextNoteCode = TextBox()
-        self.txtTextNoteCode.Width = 150
+        self.txtTextNoteCode.Width = 160
         self.txtTextNoteCode.ForeColor = Color.Gray
         self.txtTextNoteCode.Text = "prefab 5.5.5"
-        self.txtTextNoteCode.GotFocus += self.clear_placeholder
-        self.txtTextNoteCode.LostFocus += self.restore_placeholder
-        self.buttonPanel.Controls.Add(self.txtTextNoteCode)
+        self.txtTextNoteCode.GotFocus += self._clear_placeholder
+        self.txtTextNoteCode.LostFocus += self._restore_placeholder
+        self.leftFlow.Controls.Add(self.txtTextNoteCode)
 
-        # --- 4. Buttons inside buttonPanel
-        self.btnPlaceTextNote = Button()
-        self.btnPlaceTextNote.Text = "Place Text Note"
-        self.btnPlaceTextNote.Width = 150
-        self.btnPlaceTextNote.Click += self.btnPlaceTextNote_Click
-        self.buttonPanel.Controls.Add(self.btnPlaceTextNote)
+        # buttons
+        def add_btn(text, handler, w=150):
+            b = Button()
+            b.Text = text
+            b.Width = w
+            b.Click += handler
+            self.leftFlow.Controls.Add(b)
+            return b
 
-        self.btnFixReducers = Button()
-        self.btnFixReducers.Text = "Fix Reducers"
-        self.btnFixReducers.Width = 150
-        self.btnFixReducers.Click += self.btnFixReducers_Click
-        self.buttonPanel.Controls.Add(self.btnFixReducers)
+        self.btnPlacePrefabNote = add_btn(
+            "Place Prefab Text Note", self.placePrefabTextNote, 180
+        )
+        self.btnAutoFill = add_btn("Auto-Fill Tag Codes", self.autoFillPipeTagCodes)
+        self.btnBulkTags = add_btn("Bulk Add/Remove Tags", self.bulkAddRemoveTags, 180)
+        self.btnFlipReducer = add_btn("Flip Reducer", self.flipSelectedReducer, 140)
+        self.btnOK = add_btn("OK", self.okButton_Click, 80)
+        self.btnCancel = add_btn("Cancel", self._cancel, 80)
 
-        self.btnBulkTags = Button()
-        self.btnBulkTags.Text = "Add/Remove Tags"
-        self.btnBulkTags.Width = 150
-        self.btnBulkTags.Click += self.bulkAddRemoveTags_Click
-        self.buttonPanel.Controls.Add(self.btnBulkTags)
+        self.lblPipes = Label()
+        self.lblPipes.Width = 160
+        self.rightFlow.Controls.Add(self.lblPipes)
+        self.lblFittings = Label()
+        self.lblFittings.Width = 130
+        self.rightFlow.Controls.Add(self.lblFittings)
+        self.lblAccessories = Label()
+        self.lblAccessories.Width = 130
+        self.rightFlow.Controls.Add(self.lblAccessories)
 
-        self.btnAutoFill = Button()
-        self.btnAutoFill.Text = "Auto-Fill Tag Codes"
-        self.btnAutoFill.Width = 150
-        self.btnAutoFill.Click += self.autoFillPipeTagCodes
-        self.buttonPanel.Controls.Add(self.btnAutoFill)
-
-        self.btnOK = Button()
-        self.btnOK.Text = "OK"
-        self.btnOK.Width = 80
-        self.btnOK.DialogResult = DialogResult.OK
-        self.btnOK.Click += self.okButton_Click
-        self.buttonPanel.Controls.Add(self.btnOK)
-
-        self.btnCancel = Button()
-        self.btnCancel.Text = "Cancel"
-        self.btnCancel.Width = 80
-        self.btnCancel.DialogResult = DialogResult.Cancel
-        self.buttonPanel.Controls.Add(self.btnCancel)
-
-        # --- 5. Smart Button Alignment
-        self.buttonPanel.Resize += self.rearrange_buttons
-
-        self.ResumeLayout(False)
-        self.PerformLayout()
-        self.buttonPanel.PerformLayout()
-        self.gridPanel.PerformLayout()
-        self.dataGrid.PerformLayout()
-
-        # --- 6. State
         self.textNotePlaced = False
         self.Result = None
 
-        # --- 7. Populate Rows
+        # populate
+        tstuk_candidate_ids = []
+        tstuk_check_only_ids = []
+        fitting_row_count = 0
+        fitting_debug_count = 0
         for ed in elements_data:
-            row_idx = self.dataGrid.Rows.Add()
-            row = self.dataGrid.Rows[row_idx]
+            ridx = self.dataGrid.Rows.Add()
+            row = self.dataGrid.Rows[ridx]
             row.Cells["Id"].Value = ed["Id"]
             row.Cells["Category"].Value = ed["Category"]
             row.Cells["Name"].Value = ed["Name"]
             row.Cells["Warning"].Value = ed.get("Warning", "")
             row.Cells["Bend45"].Value = ed.get("Bend45", "")
-            row.Cells["GEB_Article_Number"].Value = ed.get("GEB_Article_Number", "")
             row.Cells["DefaultCode"].Value = ed["DefaultCode"]
             row.Cells["NewCode"].Value = ed["NewCode"]
             row.Cells["OutsideDiameter"].Value = ed["OutsideDiameter"]
             row.Cells["Length"].Value = ed["Length"]
             row.Cells["Size"].Value = ed.get("Size", "")
+            row.Cells["GEB_Article_Number"].Value = ed.get("GEB_Article_Number", "")
+            row.Cells["FlipTstuk"].Value = ""
+            row.Cells["FlipTstuk"].ReadOnly = True
+            row.Cells["FlipTstuk"].ToolTipText = "Not a T-stuk flip candidate"
 
-            # TagStatus logic
             cat = ed["Category"]
-            name = ed["Name"]
-            name_lc = name.lower()
-            warning_val = row.Cells["Warning"].Value or ""
-            debug(">> Pipe Fitting Name:", name)
-
             if cat == "Pipes":
-                if ed["TagStatus"] == "Yes":
-                    row.Cells["TagStatus"].Value = "Remove Tag"
-                else:
-                    row.Cells["TagStatus"].Value = "Add/Place Tag"
+                row.Cells["TagStatus"].Value = (
+                    "Remove Tag" if ed["TagStatus"] == "Yes" else "Add/Place Tag"
+                )
                 row.DefaultCellStyle.BackColor = Color.LightBlue
-
-            elif cat == "Pipe Tags":
-                row.Cells["TagStatus"].Value = "Remove Tag"
-                row.DefaultCellStyle.BackColor = Color.LightGreen
-
-            elif cat == "Text Notes":
+            elif cat == "Pipe Fittings":
+                row.Cells["TagStatus"].Value = ""
+                row.Cells["TagStatus"].ReadOnly = True
+                fitting_row_count += 1
+                element_id_value = safe_int(ed.get("Id", -1), -1)
+                element = None
+                if element_id_value > 0:
+                    element = doc.GetElement(ElementId(element_id_value))
+                is_tstuk = self.configure_tstuk_flip_cell(row, element)
+                if is_tstuk:
+                    tstuk_candidate_ids.append(element_id_value)
+                else:
+                    tstuk_check_only_ids.append(element_id_value)
+                if fitting_debug_count < 80:
+                    self.print_tstuk_element_debug(element)
+                    fitting_debug_count += 1
+                row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
+            elif cat == "Pipe Accessories":
+                row.Cells["TagStatus"].Value = ""
+                row.Cells["TagStatus"].ReadOnly = True
+                row.DefaultCellStyle.BackColor = Color.LightYellow
+            else:
                 row.Cells["TagStatus"].Value = ""
                 row.DefaultCellStyle.BackColor = Color.LightGray
 
-            elif cat == "Pipe Fittings":
-                elem = doc.GetElement(ElementId(int(ed["Id"])))
-                family_name = ""
-                if isinstance(elem, FamilyInstance):
-                    symbol = elem.Symbol
-                    if symbol and symbol.Family:
-                        family_name = symbol.Family.Name.lower()
+        print("TSTUK UI -> candidate rows: {}".format(len(tstuk_candidate_ids)))
+        print("TSTUK UI -> total fitting rows: {}".format(fitting_row_count))
+        print("TSTUK UI -> check-only rows: {}".format(len(tstuk_check_only_ids)))
+        print("TSTUK UI -> candidate element ids: {}".format(tstuk_candidate_ids[:20]))
+        self.update_counters()
+        self.ResumeLayout(False)
 
-                row.Cells["TagStatus"].Value = ""
-                row.Cells["TagStatus"].ReadOnly = True
+    def _layout_buttons(self, sender, e):
+        pass
 
-                if "var. dn/od" in name_lc:
-                    if "multibocht" in name_lc or "multibocht" in family_name:
-                        row.Cells["TagStatus"].Value = "Flip 2x45°"
-                        row.Cells["TagStatus"].ReadOnly = False
-                    elif "liggend" in name_lc or "liggend" in family_name:
-                        row.Cells["TagStatus"].Value = "Flip T-stuk"
-                        row.Cells["TagStatus"].ReadOnly = False
-                        # row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
-                    elif "multireducer" in name_lc or "multireducer_geb" in family_name:
-                        row.Cells["TagStatus"].Value = "Flip Reducer"
-                        row.Cells["TagStatus"].ReadOnly = False
-
-                row.DefaultCellStyle.BackColor = Color.LightGoldenrodYellow
-
-    def auto_fix_inline(self):
-        updated = 0
-        skipped = 0
-
-        for row in self.dataGrid.Rows:
-            try:
-                cat = row.Cells["Category"].Value
-                if cat != "Pipe Fittings":
-                    continue
-
-                eid = int(str(row.Cells["Id"].Value))
-                elem = doc.GetElement(ElementId(eid))
-                if not elem or not elem.IsValidObject:
-                    continue
-
-                name = elem.Name
-                debug("Checking:", elem.Id, "| Name:", name)
-
-                # 1. Fix concentric reducers
-                reducer_fixed = False
-                p_warn = elem.LookupParameter("waarschuwing")
-                warning = p_warn.AsString() if p_warn else ""
-                debug(" -> Warning:", warning)
-
-                has_concentric_warning = warning and "concentric" in warning.lower()
-
-                has_reducer_params = any(
-                    elem.LookupParameter(pn)
-                    for pn in [
-                        "kort_verloop (kleinste)",
-                        "kort_verloop (grootste)",
-                        "reducer_eccentric",
-                        "switch_excentriciteit",
-                    ]
-                )
-                if has_concentric_warning and has_reducer_params:
-                    param_map = {
-                        "kort_verloop (kleinste)": True,
-                        "kort_verloop (grootste)": True,
-                        "reducer_eccentric": True,
-                        "switch_excentriciteit": False,
-                    }
-                    t = Transaction(doc, "Fix Reducer")
-                    t.Start()
-                    for pname, value in param_map.items():
-                        p = elem.LookupParameter(pname)
-                        if p and p.StorageType == StorageType.Integer:
-                            p.Set(1 if value else 0)
-                    t.Commit()
-                    debug(" -> Reducer fixed.")
-                    updated += 1
-                    reducer_fixed = True
-
-                # 2. Turn OFF 2x45°
-                p_bend = elem.LookupParameter("2x45°")
-                if p_bend and p_bend.StorageType == StorageType.Integer:
-                    if p_bend.AsInteger() == 1:
-                        debug(" -> Turning OFF 2x45°")
-                        t = Transaction(doc, "Turn off 2x45°")
-                        t.Start()
-                        p_bend.Set(0)
-                        t.Commit()
-                        updated += 1
-                    elif not reducer_fixed:
-                        debug(" -> 2x45° already OFF")
-                        skipped += 1
-                elif not reducer_fixed:
-                    skipped += 1
-
-                # Auto toggle 2x45 degree for elbows based on vertical pipe diameter
-                if isinstance(elem, FamilyInstance):
-                    fam_name = elem.Symbol.Family.Name.lower()
-                    if "bocht_sh_geb" in fam_name or "bocht" in fam_name:
-                        connector_mgr = elem.MEPModel.ConnectorManager
-                        vertical_diam = None
-
-                        for conn in connector_mgr.Connectors:
-                            dir = conn.CoordinateSystem.BasisZ
-                            if abs(dir.Z) > 0.9:
-                                try:
-                                    connected = list(conn.AllRefs)
-                                    for ref in connected:
-                                        if ref.Owner.Id != elem.Id and hasattr(
-                                            ref.Owner, "LookupParameter"
-                                        ):
-                                            pipe = ref.Owner
-                                            diam_param = pipe.LookupParameter(
-                                                "Outside Diameter"
-                                            ) or pipe.LookupParameter("Diameter")
-                                            if diam_param:
-                                                d_mm = diam_param.AsDouble() * 304.8
-                                                vertical_diam = d_mm
-                                                break
-                                except Exception as ex:
-                                    debug(
-                                        "⚠️ Failed to resolve vertical pipe diameter:",
-                                        ex,
-                                    )
-
-                        if vertical_diam is not None:
-                            try:
-                                bend_param = elem.LookupParameter("2x45°")
-                                if (
-                                    bend_param
-                                    and bend_param.StorageType == StorageType.Integer
-                                ):
-                                    t = Transaction(doc, "Set 2x45° for elbow")
-                                    t.Start()
-                                    if vertical_diam > 100:
-                                        bend_param.Set(1)
-                                        debug(
-                                            "✅ 2x45° turned ON for:",
-                                            elem.Id,
-                                            "| Ø =",
-                                            vertical_diam,
-                                        )
-                                    else:
-                                        bend_param.Set(0)
-                                        debug(
-                                            "✅ 2x45° turned OFF for:",
-                                            elem.Id,
-                                            "| Ø =",
-                                            vertical_diam,
-                                        )
-                                    t.Commit()
-                                    updated += 1
-                            except Exception as ex:
-                                debug("❌ Failed to set 2x45° on elbow:", ex)
-
-                    # Auto toggle reducer_eccentric for multireducer going UP
-                    elif "multireducer_geb" in fam_name:
-                        try:
-                            connector_mgr = elem.MEPModel.ConnectorManager
-                            is_vertical_up = False
-
-                            for conn in connector_mgr.Connectors:
-                                dir = conn.CoordinateSystem.BasisZ
-                                if abs(dir.Z) > 0.9:
-                                    connected = list(conn.AllRefs)
-                                    for ref in connected:
-                                        if ref.Owner.Id != elem.Id:
-                                            # Check if the direction is upward
-                                            vec = conn.CoordinateSystem.BasisZ
-                                            if vec.Z > 0.9:
-                                                is_vertical_up = True
-                                                break
-                                    if is_vertical_up:
-                                        break
-
-                            if is_vertical_up:
-                                reducer_param = elem.LookupParameter(
-                                    "reducer_eccentric"
-                                )
-                                if reducer_param and reducer_param.AsInteger() == 1:
-                                    t = Transaction(doc, "Auto-Fix Reducer Eccentric")
-                                    t.Start()
-                                    reducer_param.Set(0)
-                                    t.Commit()
-                                    debug(
-                                        "✅ Turned OFF reducer_eccentric for vertical-up multireducer:",
-                                        elem.Id,
-                                    )
-                                    updated += 1
-                        except Exception as ex:
-                            debug("❌ Failed to auto-toggle reducer_eccentric:", ex)
-
-            except Exception as ex:
-                debug("Exception while processing:", ex)
-                skipped += 1
-
-        return updated, skipped
-
-    def btnFixReducers_Click(self, sender, event):
-
-        updated, skipped = self.auto_fix_inline()
-
-        for row in self.dataGrid.Rows:
-            cat = row.Cells["Category"].Value
-            if cat != "Pipe Fittings":
-                continue
-
-            try:
-                eid = int(str(row.Cells["Id"].Value))
-                elem = doc.GetElement(ElementId(eid))
-                if not elem:
-                    continue
-
-                name = row.Cells["Name"].Value
-                tag_status = row.Cells["TagStatus"].Value
-
-                # Flip 2x45° logic (manual logic reused)
-                if tag_status == "Flip 2x45°":
-                    debug(">> Activating Flip 2x45° for:", name)
-                    if isinstance(elem, FamilyInstance):
-                        try:
-                            bend_param = elem.LookupParameter("bend_visible")
-                            preserve_param = elem.LookupParameter(
-                                "bend_visible_preserve"
-                            )
-
-                            if (
-                                bend_param
-                                and bend_param.StorageType == StorageType.Integer
-                            ):
-                                bend_param.Set(0)
-                                debug(" -> bend_visible OFF")
-
-                            if (
-                                preserve_param
-                                and preserve_param.StorageType == StorageType.Integer
-                            ):
-                                preserve_param.Set(0)
-                                debug(" -> bend_visible_preserve OFF")
-
-                            debug("✅ Flip 2x45° applied to:", eid)
-                        except Exception as e:
-                            debug("⚠️ Failed to flip 2x45° for", eid, "Error:", str(e))
-
-                # New: Vertical Reducer Detection & Fix
-                name_lc = name.lower()
-                if "multireducer_geb" in name_lc and "var. dn/od" in name_lc:
-                    try:
-                        is_vertical = False
-                        if hasattr(elem, "HandOrientation"):
-                            dir = elem.HandOrientation
-                            debug("Orientation vector (HandOrientation):", dir)
-                            if abs(dir.Z) > 0.9:
-                                is_vertical = True
-
-                        debug(
-                            "Checking vertical reducer:",
-                            eid,
-                            "| is_vertical =",
-                            is_vertical,
-                        )
-
-                        if is_vertical:
-                            reducer_param = elem.LookupParameter("reducer_eccentric")
-                            geom_param = elem.LookupParameter("geom_exc")
-
-                            t = Transaction(doc, "Fix Vertical Reducer")
-                            t.Start()
-
-                            if reducer_param and reducer_param.AsInteger() == 1:
-                                reducer_param.Set(0)
-                                debug(" -> reducer_eccentric turned OFF")
-
-                            if geom_param and geom_param.AsInteger() == 1:
-                                geom_param.Set(0)
-                                debug(" -> geom_exc turned OFF")
-
-                            t.Commit()
-                            debug("✅ Fixed vertical reducer for:", eid)
-                    except Exception as ve:
-                        debug(
-                            "❌ Error fixing vertical reducer for:", eid, "Error:", ve
-                        )
-
-                # Re-read parameters from Revit
-                p_warn = elem.LookupParameter("waarschuwing")
-                warning_val = p_warn.AsString() if p_warn else ""
-                row.Cells["Warning"].Value = warning_val
-
-                p_bend = elem.LookupParameter("2x45°")
-                if p_bend and p_bend.StorageType == StorageType.Integer:
-                    bend45_val = "Yes" if p_bend.AsInteger() == 1 else "No"
-                    row.Cells["Bend45"].Value = bend45_val
-            except:
-                continue
-
-        MessageBox.Show(
-            "✅ Reducers Fixed!\n\nUpdated: {}\nSkipped: {}".format(updated, skipped),
-            "Fix Reducers",
-        )
-
-    def clear_placeholder(self, sender, event):
+    def _clear_placeholder(self, sender, e):
         if self.txtTextNoteCode.Text == "prefab 5.5.5":
             self.txtTextNoteCode.Text = ""
             self.txtTextNoteCode.ForeColor = Color.Black
 
-    def restore_placeholder(self, sender, event):
-        if self.txtTextNoteCode.Text.strip() == "":
+    def _restore_placeholder(self, sender, e):
+        if not self.txtTextNoteCode.Text.strip():
             self.txtTextNoteCode.Text = "prefab 5.5.5"
             self.txtTextNoteCode.ForeColor = Color.Gray
 
-    def bulkAddRemoveTags_Click(self, sender, event):
-        rows_to_process = []
-        for row in self.dataGrid.Rows:
-            cat = row.Cells["Category"].Value
+    def update_counters(self):
+        pipes_total = 0
+        pipes_tagged = 0
+        fittings_total = 0
+        accessories_total = 0
+        for i in range(self.dataGrid.Rows.Count):
+            row = self.dataGrid.Rows[i]
+            cat = row.Cells["Category"].Value or ""
             if cat == "Pipes":
-                rows_to_process.append(row)
+                pipes_total += 1
+                if row.Cells["TagStatus"].Value == "Remove Tag":
+                    pipes_tagged += 1
+            elif cat == "Pipe Fittings":
+                fittings_total += 1
+            elif cat == "Pipe Accessories":
+                accessories_total += 1
+        self.lblPipes.Text = "Pipes: {}/{}".format(pipes_tagged, pipes_total)
+        self.lblFittings.Text = "Fittings: {}".format(fittings_total)
+        self.lblAccessories.Text = "Accessories: {}".format(accessories_total)
 
-        for row in rows_to_process:
-            val = row.Cells["TagStatus"].Value
-            host_id = int(str(row.Cells["Id"].Value))
-            host = doc.GetElement(ElementId(host_id))
+    def find_pipe_tags_in_view_for_host(self, view, host_elem_id):
+        return find_pipe_tags_for_host_in_view(doc, view.Id, host_elem_id)
 
-            if val == "Add/Place Tag":
-                tr = Transaction(doc, "Add Tag")
-                tr.Start()
-                bb = host.get_BoundingBox(uidoc.ActiveView)
-                if bb:
-                    ctr = XYZ(
-                        (bb.Min.X + bb.Max.X) / 2.0,
-                        (bb.Min.Y + bb.Max.Y) / 2.0,
-                        (bb.Min.Z + bb.Max.Z) / 2.0,
-                    )
-                    ref = Reference(host)
-                    new_tag = IndependentTag.Create(
-                        doc,
-                        doc.ActiveView.Id,
-                        ref,
-                        True,
-                        TagMode.TM_ADDBY_CATEGORY,
-                        TagOrientation.Horizontal,
-                        ctr,
-                    )
-                tr.Commit()
-                row.Cells["TagStatus"].Value = "Remove Tag"
-                te = doc.GetElement(new_tag.Id)
-                if te:
-                    data = {
-                        "Id": str(te.Id),
-                        "Category": "Pipe Tags",
-                        "Name": te.Name or "",
-                        "DefaultCode": host.LookupParameter("Comments").AsString()
-                        or "",
-                        "NewCode": row.Cells["NewCode"].Value,
-                        "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
-                        "Length": row.Cells["Length"].Value,
-                        "Size": "",
-                        "GEB_Article_Number": "",
-                        "TagStatus": "Yes",
-                    }
-                    self._add_row(data)
-
-            elif val == "Remove Tag":
-                host_eid = host.Id.IntegerValue
-                deleted_id = None
-                tag_elem_id = None
-                for t in (
-                    FilteredElementCollector(doc)
-                    .OfCategory(BuiltInCategory.OST_PipeTags)
-                    .WhereElementIsNotElementType()
-                    .ToElements()
-                ):
-                    tagged = (
-                        t.GetTaggedElementIds()
-                        if hasattr(t, "GetTaggedElementIds")
-                        else [t.TaggedElementId]
-                    )
-                    for rid in tagged:
-                        eid = (
-                            rid.HostElementId.IntegerValue
-                            if hasattr(rid, "HostElementId")
-                            else rid.IntegerValue
-                        )
-                        if eid == host_eid:
-                            deleted_id = t.Id.IntegerValue
-                            tag_elem_id = t.Id
-                            break
-                    if deleted_id:
-                        break
-                if deleted_id:
-                    self.dataGrid.SelectionChanged -= self.on_row_selected
-                    tr = Transaction(doc, "Remove Tag")
-                    tr.Start()
-                    doc.Delete(tag_elem_id)
-                    tr.Commit()
-                    row.Cells["TagStatus"].Value = "Add/Place Tag"
-                    row.Cells["TagStatus"].ReadOnly = False
-                    for i in range(self.dataGrid.Rows.Count):
-                        r2 = self.dataGrid.Rows[i]
-                        if (
-                            r2.Cells["Category"].Value == "Pipe Tags"
-                            and int(str(r2.Cells["Id"].Value)) == deleted_id
-                        ):
-                            self.dataGrid.Rows.RemoveAt(i)
-                            break
-                    self.dataGrid.SelectionChanged += self.on_row_selected
-
-    # Smart dynamic spacing
-    def rearrange_buttons(self, sender, event):
-        controls = list(self.buttonPanel.Controls)
-        total_width = sum(c.Width for c in controls)
-        available = self.buttonPanel.Width - total_width
-        spacing = max(10, available // (len(controls) + 1))
-        x = spacing
-        for ctrl in controls:
-            ctrl.Location = Point(x, (self.buttonPanel.Height - ctrl.Height) // 2)
-            x += ctrl.Width + spacing
-
-    def _add_row(self, data):
-        """Helper to append a new DataGridView row from a dict."""
-        idx = self.dataGrid.Rows.Add()
-        row = self.dataGrid.Rows[idx]
-        for k, v in data.items():
-            row.Cells[k].Value = v
-
-        # Start with default
-        row.Cells["TagStatus"].Value = "Remove Tag"
-        row.Cells["TagStatus"].ReadOnly = True
-
-        # Try to identify reducer buttons
+    def _create_pipe_tag_for_host(self, host):
+        if not host:
+            return (False, None)
+        bb = host.get_BoundingBox(uidoc.ActiveView)
+        if not bb:
+            return (False, None)
+        ctr = XYZ(
+            (bb.Min.X + bb.Max.X) * 0.5,
+            (bb.Min.Y + bb.Max.Y) * 0.5,
+            (bb.Min.Z + bb.Max.Z) * 0.5,
+        )
+        symbol_id = decide_pipe_tag_symbol_id(host, uidoc.ActiveView)
+        if symbol_id is None:
+            if is_vertical_pipe(host):
+                fam, typ = TAG_CFG["VERT_ARROW"]
+            else:
+                fam, typ = TAG_CFG["ACO_PIPE"]
+            return (False, "{} - {}".format(fam, typ))
+        tag = IndependentTag.Create(
+            doc,
+            doc.ActiveView.Id,
+            Reference(host),
+            SAFE_CFG["tag_use_leader"],
+            TagMode.TM_ADDBY_CATEGORY,
+            TagOrientation.Horizontal,
+            ctr,
+        )
         try:
-            cat = data.get("Category", "")
-            eid = int(data.get("Id", "0"))
-            elem = doc.GetElement(ElementId(eid))
-
-            if cat == "Pipe Fittings" and isinstance(elem, FamilyInstance):
-                fam_name = elem.Symbol.Family.Name.lower()
-                debug("✅ Family name:", fam_name)
-
-                if "multireducer_geb" in fam_name:
-                    row.Cells["TagStatus"].Value = "Flip Reducer"
-                    row.Cells["TagStatus"].ReadOnly = False
-
-                elif "multibocht" in fam_name:
-                    row.Cells["TagStatus"].Value = "Flip 2x45°"
-                    row.Cells["TagStatus"].ReadOnly = False
-
-                elif "liggend" in fam_name:
-                    row.Cells["TagStatus"].Value = "Flip T-stuk"
-                    row.Cells["TagStatus"].ReadOnly = False
-
+            tag.ChangeTypeId(symbol_id)
         except Exception as ex:
-            debug("⚠️ Error resolving Flip button logic:", ex)
+            doc.Delete(tag.Id)
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Failed to apply tag type to created tag.\nHost: {}\nError: {}".format(
+                    host.Id.IntegerValue, ex
+                ),
+            )
+            return (False, None)
+        return (True, None)
 
-    def btnPlaceTextNote_Click(self, sender, event):
-        text_note_code = self.txtTextNoteCode.Text.strip()
-        if text_note_code == "":
-            MessageBox.Show("Please enter a Text Note Code.", "Error")
-            return
-        if not self.regionElements or len(self.regionElements) == 0:
+    def refresh_pipe_tag_rows_and_status(self):
+        region_pipe_ids = set()
+        if self.regionElements:
+            for e in self.regionElements:
+                try:
+                    if (
+                        e
+                        and e.Category
+                        and e.Category.Id.IntegerValue
+                        == int(BuiltInCategory.OST_PipeCurves)
+                    ):
+                        region_pipe_ids.add(e.Id.IntegerValue)
+                except Exception:
+                    pass
+
+        for i in range(self.dataGrid.Rows.Count):
+            r = self.dataGrid.Rows[i]
+            if (r.Cells["Category"].Value or "") != "Pipes":
+                continue
+            hid = safe_int(r.Cells["Id"].Value)
+            host = doc.GetElement(ElementId(hid))
+            has_tag = bool(
+                host
+                and (not region_pipe_ids or host.Id.IntegerValue in region_pipe_ids)
+                and find_pipe_tag_in_view(uidoc.ActiveView, host.Id)
+            )
+            r.Cells["TagStatus"].Value = "Remove Tag" if has_tag else "Add/Place Tag"
+
+        self.update_counters()
+
+    def placePrefabTextNote(self, sender, e):
+        raw = self.txtTextNoteCode.Text.strip()
+        if not raw:
             MessageBox.Show(
-                "Region elements not available to compute location.", "Error"
+                "Please enter a prefab text first.", get_runtime_window_title()
             )
             return
-        (region_min, region_max) = get_region_bounding_box(self.regionElements)
-        corner = region_min
-        ttn = Transaction(doc, "Place Text Note")
-        ttn.Start()
-        note_type = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
-        if note_type:
-            opts = TextNoteOptions(note_type.Id)
-            new_note = TextNote.Create(
-                doc, doc.ActiveView.Id, corner, text_note_code, opts
-            )
-            if new_note:
-                MessageBox.Show("Text Note created successfully.", "Success")
-                self.textNotePlaced = True
-        else:
-            MessageBox.Show("No TextNoteType found.", "Error")
-        ttn.Commit()
+        if not self.regionPolygon:
+            MessageBox.Show("No region polygon available.", get_runtime_window_title())
+            return
+        pminx, pminy, _, _ = polygon_bounds_xy(self.regionPolygon)
+        note_pt = XYZ(pminx + XY_PAD, pminy + XY_PAD, 0)
+        prefab_re = re.compile(r"\d+(?:\.\d+)+")
+        notes = (
+            FilteredElementCollector(doc, uidoc.ActiveView.Id)
+            .OfClass(TextNote)
+            .WhereElementIsNotElementType()
+            .ToElements()
+        )
+        target = None
+        for n in notes:
+            try:
+                txt = n.Text or ""
+                p = n.Coord
+                if prefab_re.search(txt) and is_point_inside_polygon(
+                    XYZ(p.X, p.Y, 0), self.regionPolygon
+                ):
+                    target = n
+                    break
+            except Exception:
+                continue
 
-    def autoFillPipeTagCodes(self, sender, event):
-        # 1) Parse base
+        with Transaction(doc, "Place Prefab Text Note") as t:
+            t.Start()
+            if target:
+                target.Text = raw
+            else:
+                nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+                if nt:
+                    TextNote.Create(
+                        doc, uidoc.ActiveView.Id, note_pt, raw, TextNoteOptions(nt.Id)
+                    )
+            t.Commit()
+        self.textNotePlaced = True
+
+    def bulkAddRemoveTags(self, sender, e):
+        choice = MessageBox.Show(
+            "Yes: Remove all pipe tags for all pipes in region.\nNo: Add missing pipe tags for all pipes in region.",
+            get_runtime_window_title(),
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Question,
+        )
+        if choice == DialogResult.Cancel:
+            return
+
+        pipe_rows = [
+            self.dataGrid.Rows[i]
+            for i in range(self.dataGrid.Rows.Count)
+            if (self.dataGrid.Rows[i].Cells["Category"].Value or "") == "Pipes"
+        ]
+        if not pipe_rows:
+            return
+
+        pipes = []
+        for row in pipe_rows:
+            host_id = safe_int(row.Cells["Id"].Value)
+            host = doc.GetElement(ElementId(host_id))
+            if host:
+                pipes.append(host)
+
+        missing_types = set()
+        failures = []
+        action = "add_missing" if choice == DialogResult.No else "remove_all"
+        missing_types, failures = tag_pipes_in_view(
+            uidoc.ActiveView, pipes, action=action, source_view=uidoc.ActiveView
+        )
+        self.refresh_pipe_tag_rows_and_status()
+        if missing_types:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Could not find required tag types:\n- {}".format(
+                    "\n- ".join(sorted(missing_types))
+                ),
+            )
+        if failures:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Tag creation failed for pipe ids:\n- {}".format(
+                    "\n- ".join([str(x) for x in sorted(set(failures))])
+                ),
+            )
+
+    def flipSelectedReducer(self, sender, e):
+        row = self.dataGrid.CurrentRow
+        if not row:
+            reason = "No editor row is selected."
+            print("REDUCER FLIP -> selected element id: -")
+            print("REDUCER FLIP -> category: -")
+            print("REDUCER FLIP -> family/type: -")
+            print("REDUCER FLIP -> method used: reducer_eccentric parameter toggle")
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return
+
+        element_id_value = safe_int(row.Cells["Id"].Value, -1)
+        category = str(row.Cells["Category"].Value or "")
+        element = None
+        if element_id_value > 0:
+            element = doc.GetElement(ElementId(element_id_value))
+
+        family_name, type_name, instance_name = self.get_family_type_debug_names(
+            element
+        )
+
+        family_type = "{} : {} : {}".format(
+            family_name or "-", type_name or "-", instance_name or "-"
+        )
+        method = "toggle integer parameter reducer_eccentric"
+        print("REDUCER FLIP -> selected element id: {}".format(element_id_value))
+        print("REDUCER FLIP -> category: {}".format(category or "-"))
+        print("REDUCER FLIP -> family/type: {}".format(family_type))
+        print("REDUCER FLIP -> method used: {}".format(method))
+
+        if category != "Pipe Fittings":
+            reason = "Selected row is not a Pipe Fitting."
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return
+        if not element or not element.IsValidObject:
+            reason = "Selected fitting element could not be resolved."
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return
+        if not isinstance(element, FamilyInstance):
+            reason = "Selected Pipe Fitting is not a family instance reducer."
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return
+        if "multireducer_geb" not in family_name.lower():
+            reason = (
+                "Selected Pipe Fitting is not a supported multireducer_geb reducer."
+            )
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return
+
+        reducer_parameter = element.LookupParameter("reducer_eccentric")
+        if (
+            not reducer_parameter
+            or reducer_parameter.StorageType != StorageType.Integer
+            or reducer_parameter.IsReadOnly
+        ):
+            reason = (
+                "Reducer parameter 'reducer_eccentric' is unavailable or read-only."
+            )
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return
+
+        current_value = reducer_parameter.AsInteger()
+        transaction = Transaction(doc, "Sheet Generator - Flip Reducer")
+        try:
+            transaction.Start()
+            reducer_parameter.Set(0 if current_value == 1 else 1)
+            transaction.Commit()
+            new_value = reducer_parameter.AsInteger()
+            reason = "Success; reducer_eccentric changed from {} to {}.".format(
+                current_value, new_value
+            )
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            self.dataGrid.Refresh()
+            MessageBox.Show(reason, get_runtime_window_title())
+        except Exception as ex:
+            rollback_transaction(transaction)
+            reason = "Failed to toggle reducer_eccentric: {}".format(ex)
+            print("REDUCER FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+
+    def autoFillPipeTagCodes(self, sender, e):
         raw = self.txtTextNoteCode.Text.strip()
         m = re.search(r"([\d\.]+)", raw)
         if not m:
-            MessageBox.Show("Could not parse base code from text note.", "Error")
+            MessageBox.Show(
+                "Could not parse base code from text note.", get_runtime_window_title()
+            )
             return
-        base = m.group(1)  # e.g. "4.1.1"
+        base = m.group(1)
 
-        # 2) (optional) keep prefix/base_n split if you want for pipes
-        parts = base.split(".")
-        if len(parts) >= 3:
-            prefix = parts[0] + "." + parts[1]  # "4.1"
-            try:
-                base_n = int(parts[2])  # 1
-            except:
-                base_n = 0
-        else:
-            prefix, base_n = base, 0
-
-        # 2) Collect indices
-        fit_rows, pipe_rows, tag_rows = [], [], []
+        pipe_rows, fit_rows = [], []
         for i in range(self.dataGrid.Rows.Count):
             cat = self.dataGrid.Rows[i].Cells["Category"].Value
-            if cat == "Pipe Fittings":
-                fit_rows.append(i)
-            elif cat == "Pipes":
+            if cat == "Pipes":
                 pipe_rows.append(i)
-            elif cat == "Pipe Tags":
-                tag_rows.append(i)
+            elif cat == "Pipe Fittings":
+                fit_rows.append(i)
 
-        # Override all Pipe Fittings rows to the base code
-        for idx in fit_rows:
-            self.dataGrid.Rows[idx].Cells["NewCode"].Value = base
+        # fittings = base
+        for i in fit_rows:
+            self.dataGrid.Rows[i].Cells["NewCode"].Value = base
 
-        # 5) Pipes sorted and numbered: full base + .1,.2...
-        pipe_centers = []
-        for idx in pipe_rows:
-            rid = int(str(self.dataGrid.Rows[idx].Cells["Id"].Value))
+        # pipes numbered by X,Y
+        entries = []
+        for i in pipe_rows:
+            rid = safe_int(self.dataGrid.Rows[i].Cells["Id"].Value)
             elem = doc.GetElement(ElementId(rid))
-            bbox = elem.get_BoundingBox(uidoc.ActiveView)
-            if bbox:
-                ctr = XYZ(
-                    (bbox.Min.X + bbox.Max.X) * 0.5,
-                    (bbox.Min.Y + bbox.Max.Y) * 0.5,
-                    (bbox.Min.Z + bbox.Max.Z) * 0.5,
+            bb = elem.get_BoundingBox(uidoc.ActiveView) if elem else None
+            ctr = (
+                XYZ(
+                    (bb.Min.X + bb.Max.X) * 0.5,
+                    (bb.Min.Y + bb.Max.Y) * 0.5,
+                    (bb.Min.Z + bb.Max.Z) * 0.5,
                 )
+                if bb
+                else XYZ(0, 0, 0)
+            )
+            entries.append((i, ctr))
+        entries.sort(key=lambda x: (x[1].X, x[1].Y))
+        for n, (i, _) in enumerate(entries, 1):
+            self.dataGrid.Rows[i].Cells["NewCode"].Value = "{}.{}".format(base, n)
+
+        self.update_counters()
+
+    def get_family_type_debug_names(self, elem):
+        family_name = ""
+        type_name = ""
+        instance_name = ""
+        type_element_name = ""
+        try:
+            if elem:
+                instance_name = elem.Name or ""
+        except Exception:
+            instance_name = ""
+        try:
+            if elem and isinstance(elem, FamilyInstance) and elem.Symbol:
+                try:
+                    if elem.Symbol.Family:
+                        family_name = elem.Symbol.Family.Name or ""
+                except Exception:
+                    family_name = ""
+                try:
+                    type_name = elem.Symbol.Name or ""
+                except Exception:
+                    type_name = ""
+        except Exception:
+            family_name = ""
+            type_name = ""
+        try:
+            if elem:
+                type_element = doc.GetElement(elem.GetTypeId())
+                if type_element:
+                    type_element_name = type_element.Name or ""
+        except Exception:
+            type_element_name = ""
+        if not type_name and type_element_name:
+            type_name = type_element_name
+        return family_name, type_name, instance_name
+
+    def _get_family_type_labels(self, elem):
+        family_name, type_name, _ = self.get_family_type_debug_names(elem)
+        return family_name, type_name
+
+    def normalize_tstuk_search_text(self, value):
+        try:
+            text = str(value or "").lower()
+        except Exception:
+            text = ""
+        for ch in ["_", "-", ".", "/", "\\", "(", ")", "[", "]", "{", "}", ":", ";"]:
+            text = text.replace(ch, " ")
+        return " ".join(text.split())
+
+    def normalize_tstuk_key(self, value):
+        text = self.normalize_tstuk_search_text(value)
+        return text.replace(" ", "")
+
+    def get_tstuk_parameter_keywords(self):
+        return [
+            "switch",
+            "excent",
+            "eccentric",
+            "reducer",
+            "t-stuk",
+            "stuk",
+            "liggend",
+            "branch",
+            "multibranch",
+        ]
+
+    def get_tstuk_switch_names(self):
+        return [
+            "switch_excentriciteit",
+            "switch excentriciteit",
+            "switch eccentriciteit",
+            "switch eccentricity",
+            "excentriciteit",
+            "eccentriciteit",
+            "eccentricity",
+            "excenter",
+            "excentre",
+            "excentr",
+        ]
+
+    def get_tstuk_searchable_text(self, elem):
+        family_name, type_name, instance_name = self.get_family_type_debug_names(elem)
+        return "{} {} {}".format(family_name, type_name, instance_name).strip()
+
+    def get_parameter_name(self, parameter):
+        try:
+            if parameter and parameter.Definition:
+                return parameter.Definition.Name or ""
+        except Exception:
+            pass
+        return ""
+
+    def get_parameter_storage_label(self, parameter):
+        try:
+            return str(parameter.StorageType)
+        except Exception:
+            return "-"
+
+    def get_parameter_value_debug(self, parameter):
+        if not parameter:
+            return "-"
+        try:
+            if parameter.StorageType == StorageType.Integer:
+                return str(parameter.AsInteger())
+            if parameter.StorageType == StorageType.Double:
+                try:
+                    value_string = parameter.AsValueString()
+                    if value_string:
+                        return value_string
+                except Exception:
+                    pass
+                return str(parameter.AsDouble())
+            if parameter.StorageType == StorageType.String:
+                return parameter.AsString() or ""
+            if parameter.StorageType == StorageType.ElementId:
+                element_id = parameter.AsElementId()
+                return str(element_id.IntegerValue) if element_id else "-"
+        except Exception as ex:
+            return "UNREADABLE: {}".format(ex)
+        return "-"
+
+    def iter_parameters_safe(self, owner):
+        params = []
+        if not owner:
+            return params
+        try:
+            for parameter in owner.Parameters:
+                params.append(parameter)
+        except Exception:
+            pass
+        return params
+
+    def parameter_matches_tstuk_debug_keywords(self, parameter):
+        name = self.get_parameter_name(parameter)
+        name_lc = name.lower()
+        name_key = self.normalize_tstuk_key(name)
+        for keyword in self.get_tstuk_parameter_keywords():
+            keyword_lc = keyword.lower()
+            keyword_key = self.normalize_tstuk_key(keyword)
+            if keyword_lc in name_lc or keyword_key in name_key:
+                return True
+        return False
+
+    def parameter_matches_tstuk_switch_name(self, parameter):
+        name_key = self.normalize_tstuk_key(self.get_parameter_name(parameter))
+        if not name_key:
+            return False
+        for candidate_name in self.get_tstuk_switch_names():
+            candidate_key = self.normalize_tstuk_key(candidate_name)
+            if candidate_key and (
+                candidate_key == name_key or candidate_key in name_key
+            ):
+                return True
+        return False
+
+    def print_parameter_debug_rows(self, label, parameters):
+        printed = 0
+        for parameter in parameters:
+            if not self.parameter_matches_tstuk_debug_keywords(parameter):
+                continue
+            try:
+                is_read_only = parameter.IsReadOnly
+            except Exception:
+                is_read_only = True
+            print(
+                "TSTUK DEBUG -> {} param: {} | storage: {} | readonly: {} | value: {}".format(
+                    label,
+                    self.get_parameter_name(parameter) or "-",
+                    self.get_parameter_storage_label(parameter),
+                    "true" if is_read_only else "false",
+                    self.get_parameter_value_debug(parameter),
+                )
+            )
+            printed += 1
+        if printed == 0:
+            print("TSTUK DEBUG -> {} params: -".format(label))
+
+    def get_type_parameter_owner(self, elem):
+        try:
+            type_element = doc.GetElement(elem.GetTypeId())
+            if type_element:
+                return type_element
+        except Exception:
+            pass
+        try:
+            if elem and isinstance(elem, FamilyInstance) and elem.Symbol:
+                return elem.Symbol
+        except Exception:
+            pass
+        return None
+
+    def print_tstuk_element_debug(self, elem):
+        category_name = "-"
+        element_id_value = "-"
+        try:
+            if elem:
+                element_id_value = elem.Id.IntegerValue
+        except Exception:
+            element_id_value = "-"
+        try:
+            category_name = elem.Category.Name if elem and elem.Category else "-"
+        except Exception:
+            category_name = "-"
+        family_name, type_name, instance_name = self.get_family_type_debug_names(elem)
+        searchable_text = self.get_tstuk_searchable_text(elem)
+        print("TSTUK DEBUG -> element id: {}".format(element_id_value))
+        print("TSTUK DEBUG -> category: {}".format(category_name))
+        print("TSTUK DEBUG -> family: {}".format(family_name or "-"))
+        print("TSTUK DEBUG -> type: {}".format(type_name or "-"))
+        print("TSTUK DEBUG -> instance name: {}".format(instance_name or "-"))
+        print(
+            "TSTUK DEBUG -> family/type/name searchable text: {}".format(
+                searchable_text or "-"
+            )
+        )
+        self.print_parameter_debug_rows("instance", self.iter_parameters_safe(elem))
+        self.print_parameter_debug_rows(
+            "type", self.iter_parameters_safe(self.get_type_parameter_owner(elem))
+        )
+
+    def configure_tstuk_flip_cell(self, row, elem):
+        is_candidate, reason, _, _, _, _, _, _ = self.is_tstuk_flip_candidate(elem)
+        cell = row.Cells["FlipTstuk"]
+        if is_candidate:
+            cell.Value = "Flip T-stuk"
+            cell.ReadOnly = False
+            cell.ToolTipText = "Toggle switch_excentriciteit"
+        else:
+            try:
+                category_name = elem.Category.Name if elem and elem.Category else ""
+            except Exception:
+                category_name = ""
+            if category_name == "Pipe Fittings":
+                cell.Value = "Check"
+                cell.ReadOnly = False
+                cell.ToolTipText = reason or "Check T-stuk flip metadata"
             else:
-                ctr = XYZ(0, 0, 0)
-            pipe_centers.append((idx, ctr))
+                cell.Value = ""
+                cell.ReadOnly = True
+                cell.ToolTipText = "Not a T-stuk flip candidate"
+        return is_candidate
 
-        pipe_centers.sort(key=lambda x: (x[1].X, x[1].Y))
-        for i, (idx, _) in enumerate(pipe_centers, 1):
-            self.dataGrid.Rows[idx].Cells["NewCode"].Value = "{}.{}".format(base, i)
+    def has_tstuk_name_heuristic(self, elem):
+        searchable_text = self.normalize_tstuk_search_text(
+            self.get_tstuk_searchable_text(elem)
+        )
+        searchable_key = searchable_text.replace(" ", "")
+        for token in [
+            "t stuk",
+            "t-stuk",
+            "tstuk",
+            "tee",
+            "branch",
+            "multibranch",
+            "liggend",
+            "var dn",
+            "var. dn",
+            "od",
+        ]:
+            token_text = self.normalize_tstuk_search_text(token)
+            token_key = token_text.replace(" ", "")
+            if token_text in searchable_text or token_key in searchable_key:
+                return True
+        return False
 
-        # 6) Mirror pipe numbering onto pipe‐tag rows (same count)
-        for i, _ in enumerate(pipe_centers, 1):
-            if i - 1 < len(tag_rows):
-                trow = tag_rows[i - 1]
-                self.dataGrid.Rows[trow].Cells["NewCode"].Value = "{}.{}".format(
-                    base, i
+    def resolve_tstuk_switch_parameter(self, elem):
+        family_name, type_name, instance_name = self.get_family_type_debug_names(elem)
+        instance_bad_match_reason = ""
+        for parameter in self.iter_parameters_safe(elem):
+            if not self.parameter_matches_tstuk_switch_name(parameter):
+                continue
+            parameter_name = self.get_parameter_name(parameter)
+            if (
+                parameter.StorageType == StorageType.Integer
+                and not parameter.IsReadOnly
+            ):
+                return (
+                    parameter,
+                    "instance",
+                    parameter_name,
+                    "OK",
+                    family_name,
+                    type_name,
+                    instance_name,
                 )
+            instance_bad_match_reason = (
+                "Instance parameter '{}' matched but is not writable integer "
+                "(storage: {}, readonly: {}).".format(
+                    parameter_name or "-",
+                    self.get_parameter_storage_label(parameter),
+                    "true" if parameter.IsReadOnly else "false",
+                )
+            )
+
+        type_owner = self.get_type_parameter_owner(elem)
+        for parameter in self.iter_parameters_safe(type_owner):
+            if not self.parameter_matches_tstuk_switch_name(parameter):
+                continue
+            parameter_name = self.get_parameter_name(parameter)
+            return (
+                parameter,
+                "type",
+                parameter_name,
+                "Parameter found on type, not instance; refusing to change type parameter unless explicitly enabled.",
+                family_name,
+                type_name,
+                instance_name,
+            )
+
+        if instance_bad_match_reason:
+            return (
+                None,
+                "instance",
+                "-",
+                instance_bad_match_reason,
+                family_name,
+                type_name,
+                instance_name,
+            )
+        if self.has_tstuk_name_heuristic(elem):
+            return (
+                None,
+                "-",
+                "-",
+                "Likely T-stuk/multibranch by name, but no writable instance integer switch parameter was found.",
+                family_name,
+                type_name,
+                instance_name,
+            )
+        return (
+            None,
+            "-",
+            "-",
+            "No writable instance integer T-stuk switch parameter was found.",
+            family_name,
+            type_name,
+            instance_name,
+        )
+
+    def is_tstuk_flip_candidate(self, elem):
+        if not elem or not elem.IsValidObject:
+            return (False, "Element could not be resolved.", None, "-", "", "", "", "")
+        try:
+            category_name = elem.Category.Name if elem.Category else ""
+        except Exception:
+            category_name = ""
+        if category_name != "Pipe Fittings":
+            return (False, "Element is not a Pipe Fitting.", None, "-", "", "", "", "")
+        if not isinstance(elem, FamilyInstance):
+            return (
+                False,
+                "Pipe Fitting is not a FamilyInstance.",
+                None,
+                "-",
+                "",
+                "",
+                "",
+                "",
+            )
+
+        (
+            parameter,
+            parameter_source,
+            parameter_name,
+            reason,
+            family_name,
+            type_name,
+            instance_name,
+        ) = self.resolve_tstuk_switch_parameter(elem)
+        is_candidate = (
+            parameter is not None
+            and parameter_source == "instance"
+            and parameter.StorageType == StorageType.Integer
+            and not parameter.IsReadOnly
+        )
+        return (
+            is_candidate,
+            reason,
+            parameter,
+            parameter_source,
+            parameter_name,
+            family_name,
+            type_name,
+            instance_name,
+        )
+
+    def flip_tstuk_for_element(self, elem, row_index):
+        category_name = "-"
+        try:
+            category_name = elem.Category.Name if elem and elem.Category else "-"
+        except Exception:
+            category_name = "-"
+
+        element_id_value = "-"
+        try:
+            element_id_value = elem.Id.IntegerValue if elem else "-"
+        except Exception:
+            element_id_value = "-"
+
+        family_name, type_name, instance_name = self.get_family_type_debug_names(elem)
+        searchable_text = self.get_tstuk_searchable_text(elem)
+        print("TSTUK FLIP -> row index: {}".format(row_index))
+        print("TSTUK FLIP -> selected element id: {}".format(element_id_value))
+        print("TSTUK FLIP -> category: {}".format(category_name))
+        print("TSTUK FLIP -> family: {}".format(family_name or "-"))
+        print("TSTUK FLIP -> type: {}".format(type_name or "-"))
+        print("TSTUK FLIP -> instance name: {}".format(instance_name or "-"))
+        print("TSTUK FLIP -> searchable text: {}".format(searchable_text or "-"))
+
+        (
+            is_candidate,
+            reason,
+            parameter,
+            parameter_source,
+            parameter_name,
+            _,
+            _,
+            _,
+        ) = self.is_tstuk_flip_candidate(elem)
+        print("TSTUK FLIP -> parameter source: {}".format(parameter_source or "-"))
+        print("TSTUK FLIP -> parameter: {}".format(parameter_name or "-"))
+        if not is_candidate:
+            print("TSTUK FLIP -> rejected: {}".format(reason))
+            print("TSTUK FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return False, reason
+
+        old_value = parameter.AsInteger()
+        new_value = 1 if old_value == 0 else 0
+        print("TSTUK FLIP -> old value: {}".format(old_value))
+        print("TSTUK FLIP -> new value: {}".format(new_value))
+
+        transaction = Transaction(doc, "Sheet Generator - Flip T-stuk")
+        try:
+            transaction.Start()
+            parameter.Set(new_value)
+            transaction.Commit()
+            try:
+                doc.Regenerate()
+            except Exception:
+                pass
+            reason = "Success; switch_excentriciteit changed from {} to {}.".format(
+                old_value, new_value
+            )
+            print("TSTUK FLIP -> success/failure reason: {}".format(reason))
+            return True, reason
+        except Exception as ex:
+            rollback_transaction(transaction)
+            reason = "Failed to toggle switch_excentriciteit: {}".format(ex)
+            print("TSTUK FLIP -> success/failure reason: {}".format(reason))
+            MessageBox.Show(reason, get_runtime_window_title())
+            return False, reason
+
+    def handle_tstuk_flip_row_click(self, row_index):
+        if row_index < 0:
+            return
+        row = self.dataGrid.Rows[row_index]
+        if row.Cells["FlipTstuk"].ReadOnly or not row.Cells["FlipTstuk"].Value:
+            return
+        element_id_value = safe_int(row.Cells["Id"].Value, -1)
+        element = None
+        if element_id_value > 0:
+            element = doc.GetElement(ElementId(element_id_value))
+        self.print_tstuk_element_debug(element)
+        success, reason = self.flip_tstuk_for_element(element, row_index)
+        if success:
+            row.Cells["Warning"].Value = "T-stuk flipped: {}".format(reason)
+            self.configure_tstuk_flip_cell(row, element)
+            self.dataGrid.Refresh()
+            MessageBox.Show(reason, get_runtime_window_title())
+
+    def dataGrid_CellClick(self, sender, e):
+        if e.RowIndex < 0 or e.ColumnIndex < 0:
+            return
+        if self.dataGrid.Columns[e.ColumnIndex].Name == "FlipTstuk":
+            self.handle_tstuk_flip_row_click(e.RowIndex)
 
     def dataGrid_CellContentClick(self, sender, e):
-        col = self.dataGrid.Columns[e.ColumnIndex].Name
-        if col != "TagStatus":
+        if e.RowIndex < 0 or e.ColumnIndex < 0:
+            return
+        column_name = self.dataGrid.Columns[e.ColumnIndex].Name
+        if column_name == "FlipTstuk":
+            # FlipTstuk is handled by CellClick only to avoid double toggles.
             return
 
-        # Always include the clicked row
-        clicked_row = self.dataGrid.Rows[e.RowIndex]
-        selected_indexes = {r.Index for r in self.dataGrid.SelectedRows if r.Index >= 0}
-        selected_indexes.add(clicked_row.Index)
+        # Only handle basic Pipe Tag add/remove here (leaderless).
+        if column_name != "TagStatus":
+            return
+        row = self.dataGrid.Rows[e.RowIndex]
+        cat = row.Cells["Category"].Value
+        val = row.Cells["TagStatus"].Value
+        if cat != "Pipes":
+            return
 
-        # Build selected rows list from indexes
-        selected_rows = [self.dataGrid.Rows[i] for i in selected_indexes]
+        host_id = safe_int(row.Cells["Id"].Value)
+        host = doc.GetElement(ElementId(host_id))
+        if not host:
+            return
 
-        for row in selected_rows:
-            cat = row.Cells["Category"].Value
-            val = row.Cells["TagStatus"].Value
+        if val == "Add/Place Tag":
+            missing_types, failures = tag_pipes_in_view(
+                uidoc.ActiveView,
+                [host],
+                action="add_missing",
+                source_view=uidoc.ActiveView,
+            )
+            self.refresh_pipe_tag_rows_and_status()
+            if missing_types:
+                TaskDialog.Show(
+                    get_runtime_window_title(),
+                    "Could not find required tag type:\n- {}".format(
+                        "\n- ".join(sorted(missing_types))
+                    ),
+                )
+            elif failures:
+                TaskDialog.Show(
+                    get_runtime_window_title(),
+                    "Could not create a pipe tag for host id {}".format(
+                        host.Id.IntegerValue
+                    ),
+                )
+        elif val == "Remove Tag":
+            _, _ = tag_pipes_in_view(
+                uidoc.ActiveView,
+                [host],
+                action="remove_all",
+                source_view=uidoc.ActiveView,
+            )
+            self.refresh_pipe_tag_rows_and_status()
 
-            if cat == "Pipe Fittings" and val == "Flip T-stuk":
-                try:
-                    host_id = int(str(row.Cells["Id"].Value))
-                    elem = doc.GetElement(ElementId(host_id))
-                    if elem:
-                        p = elem.LookupParameter("switch_excentriciteit")
-                        if p and p.StorageType == StorageType.Integer:
-                            current = p.AsInteger()
-                            t = Transaction(doc, "Flip T-stuk (switch_excentriciteit)")
-                            t.Start()
-                            p.Set(0 if current == 1 else 1)
-                            t.Commit()
-                            debug(
-                                "🔄 Flipped T-stuk (switch_excentriciteit = %s): %s"
-                                % (str(not current), str(elem.Id))
-                            )
-                except Exception as ex:
-                    debug("❌ Failed to flip T-stuk using switch_excentriciteit:", ex)
-
-            elif cat == "Pipe Fittings" and val == "Flip 2x45°":
-                try:
-                    host_id = int(str(row.Cells["Id"].Value))
-                    elem = doc.GetElement(ElementId(host_id))
-                    if elem:
-                        param = elem.LookupParameter("2x45°")
-                        if param and param.StorageType == StorageType.Integer:
-                            current_val = param.AsInteger()
-
-                            t = Transaction(doc, "Toggle 2x45°")
-                            t.Start()
-                            param.Set(0 if current_val == 1 else 1)
-                            t.Commit()
-
-                            if current_val == 1:
-                                row.Cells["Bend45"].Value = "No"
-                            else:
-                                row.Cells["Bend45"].Value = "Yes"
-
-                            debug(
-                                "✅ Toggled 2x45° to",
-                                "OFF" if current_val == 1 else "ON",
-                                "for:",
-                                host_id,
-                            )
-                        else:
-                            debug(
-                                "⚠️ Parameter '2x45°' not found or not boolean:", host_id
-                            )
-                    else:
-                        debug("⚠️ Could not get element from ID:", host_id)
-                except Exception as ex:
-                    debug("❌ Failed to flip 2x45°:", ex)
-
-            elif cat == "Pipe Fittings" and val == "Flip Reducer":
-                try:
-                    host_id = int(str(row.Cells["Id"].Value))
-                    elem = doc.GetElement(ElementId(host_id))
-
-                    if elem and isinstance(elem, FamilyInstance):
-                        name = row.Cells["Name"].Value or ""
-                        family_name = elem.Symbol.Family.Name.lower()
-
-                        if "multireducer_geb" in family_name:
-                            reducer_param = elem.LookupParameter("reducer_eccentric")
-                            if (
-                                reducer_param
-                                and reducer_param.StorageType == StorageType.Integer
-                            ):
-                                current_val = reducer_param.AsInteger()
-
-                                t = Transaction(doc, "Toggle reducer_eccentric")
-                                t.Start()
-                                reducer_param.Set(0 if current_val == 1 else 1)
-                                t.Commit()
-
-                                debug(
-                                    "✅ Toggled reducer_eccentric to",
-                                    "OFF" if current_val == 1 else "ON",
-                                    "for:",
-                                    host_id,
-                                )
-                except Exception as ex:
-                    debug("❌ Failed to toggle redcuer_eccentric:", ex)
-
-            # ----------------------
-            # ADD/REMOVE TAG (Pipes)
-            # ----------------------
-            elif cat == "Pipes":
-                host_id = int(str(row.Cells["Id"].Value))
-                host = doc.GetElement(ElementId(host_id))
-
-                if val == "Add/Place Tag":
-                    tr = Transaction(doc, "Add Tag")
-                    tr.Start()
-                    bb = host.get_BoundingBox(uidoc.ActiveView)
-                    if bb:
-                        ctr = XYZ(
-                            (bb.Min.X + bb.Max.X) / 2.0,
-                            (bb.Min.Y + bb.Max.Y) / 2.0,
-                            (bb.Min.Z + bb.Max.Z) / 2.0,
-                        )
-                        ref = Reference(host)
-                        new_tag = IndependentTag.Create(
-                            doc,
-                            doc.ActiveView.Id,
-                            ref,
-                            True,
-                            TagMode.TM_ADDBY_CATEGORY,
-                            TagOrientation.Horizontal,
-                            ctr,
-                        )
-                    tr.Commit()
-
-                    row.Cells["TagStatus"].Value = "Remove Tag"
-
-                    # Add new Pipe Tag row
-                    te = doc.GetElement(new_tag.Id)
-                    if te:
-                        data = {
-                            "Id": str(te.Id),
-                            "Category": "Pipe Tags",
-                            "Name": te.Name or "",
-                            "DefaultCode": host.LookupParameter("Comments").AsString()
-                            or "",
-                            "NewCode": row.Cells["NewCode"].Value,
-                            "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
-                            "Length": row.Cells["Length"].Value,
-                            "Size": "",
-                            "GEB_Article_Number": "",
-                            "TagStatus": "Yes",
-                        }
-                        self._add_row(data)
-
-                elif val == "Remove Tag":
-                    host_eid = host.Id.IntegerValue
-                    deleted_id = None
-                    tag_elem_id = None
-                    for t in (
-                        FilteredElementCollector(doc)
-                        .OfCategory(BuiltInCategory.OST_PipeTags)
-                        .WhereElementIsNotElementType()
-                        .ToElements()
-                    ):
-                        tagged = (
-                            t.GetTaggedElementIds()
-                            if hasattr(t, "GetTaggedElementIds")
-                            else [t.TaggedElementId]
-                        )
-                        for rid in tagged:
-                            eid = (
-                                rid.HostElementId.IntegerValue
-                                if hasattr(rid, "HostElementId")
-                                else rid.IntegerValue
-                            )
-                            if eid == host_eid:
-                                deleted_id = t.Id.IntegerValue
-                                tag_elem_id = t.Id
-                                break
-                        if deleted_id:
-                            break
-                    if deleted_id:
-                        self.dataGrid.SelectionChanged -= self.on_row_selected
-                        tr = Transaction(doc, "Remove Tag")
-                        tr.Start()
-                        doc.Delete(tag_elem_id)
-                        tr.Commit()
-                        row.Cells["TagStatus"].Value = "Add/Place Tag"
-                        row.Cells["TagStatus"].ReadOnly = False
-                        for i in range(self.dataGrid.Rows.Count):
-                            r2 = self.dataGrid.Rows[i]
-                            if (
-                                r2.Cells["Category"].Value == "Pipe Tags"
-                                and int(str(r2.Cells["Id"].Value)) == deleted_id
-                            ):
-                                self.dataGrid.Rows.RemoveAt(i)
-                                break
-                        self.dataGrid.SelectionChanged += self.on_row_selected
-
-            # --------------------------
-            # REMOVE TAG (Pipe Tags)
-            # --------------------------
-            elif cat == "Pipe Tags" and val == "Remove Tag":
-                tag_id = ElementId(int(str(row.Cells["Id"].Value)))
-                self.dataGrid.SelectionChanged -= self.on_row_selected
-                try:
-                    tag_elem = doc.GetElement(tag_id)
-                    host_id = None
-                    if tag_elem:
-                        ids = (
-                            tag_elem.GetTaggedElementIds()
-                            if hasattr(tag_elem, "GetTaggedElementIds")
-                            else [tag_elem.TaggedElementId]
-                        )
-                        if ids and len(ids):
-                            rid = ids[0]
-                            host_id = (
-                                rid.HostElementId.IntegerValue
-                                if hasattr(rid, "HostElementId")
-                                else rid.IntegerValue
-                            )
-
-                    tr = Transaction(doc, "Remove Pipe-Tag")
-                    tr.Start()
-                    doc.Delete(tag_id)
-                    tr.Commit()
-
-                    self.dataGrid.Rows.RemoveAt(row.Index)
-
-                    if host_id:
-                        for i in range(self.dataGrid.Rows.Count):
-                            pr = self.dataGrid.Rows[i]
-                            if (
-                                int(str(pr.Cells["Id"].Value)) == host_id
-                                and pr.Cells["Category"].Value == "Pipes"
-                            ):
-                                pr.Cells["TagStatus"].Value = "Add/Place Tag"
-                                pr.Cells["TagStatus"].ReadOnly = False
-                                break
-                finally:
-                    self.dataGrid.SelectionChanged += self.on_row_selected
-
-    def okButton_Click(self, sender, event):
-        updated_data = []
-        for row in self.dataGrid.Rows:
-            entry = {
-                "Id": row.Cells["Id"].Value,
-                "Category": row.Cells["Category"].Value,
-                "Name": row.Cells["Name"].Value,
-                "DefaultCode": row.Cells["DefaultCode"].Value,
-                "NewCode": row.Cells["NewCode"].Value,
-                "OutsideDiameter": row.Cells["OutsideDiameter"].Value,
-                "Length": row.Cells["Length"].Value,
-                "TagStatus": row.Cells["TagStatus"].Value,
-            }
-            updated_data.append(entry)
-
+    def okButton_Click(self, sender, e):
+        updated = []
+        for r in self.dataGrid.Rows:
+            updated.append(
+                {
+                    "Id": r.Cells["Id"].Value,
+                    "Category": r.Cells["Category"].Value,
+                    "Name": r.Cells["Name"].Value,
+                    "DefaultCode": r.Cells["DefaultCode"].Value,
+                    "NewCode": r.Cells["NewCode"].Value,
+                    "TagStatus": r.Cells["TagStatus"].Value,
+                }
+            )
         self.Result = {
-            "Elements": updated_data,
+            "Elements": updated,
             "TextNotePlaced": self.textNotePlaced,
             "TextNote": self.txtTextNoteCode.Text.strip(),
         }
         self.DialogResult = DialogResult.OK
         self.Close()
 
-    def on_row_selected(self, sender, event):
-        """When the user clicks or arrows to a row, select that element in Revit."""
+    def _cancel(self, sender, e):
+        self.Result = None
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+    def on_row_selected(self, sender, e):
         row = self.dataGrid.CurrentRow
         if not row:
             return
         id_val = row.Cells["Id"].Value
         if not id_val:
             return
-
-        # try to parse and highlight, but swallow any invalid-object errors
         try:
             eid = ElementId(int(str(id_val)))
             elem = doc.GetElement(eid)
-            # guard against deleted/invalid elements
             if elem and elem.IsValidObject:
                 uidoc.Selection.SetElementIds(List[ElementId]([eid]))
         except:
             return
 
 
-def show_element_editor(elements_data, region_elements=None):
-    form = ElementEditorForm(elements_data, region_elements)
-    if form.ShowDialog() == DialogResult.OK:
-        return form.Result
+def show_element_editor(elements_data, region_elements=None, region_polygon=None):
+    f = ElementEditorForm(elements_data, region_elements)
+    f.regionPolygon = region_polygon
+    return f.ShowDialog() == DialogResult.OK and f.Result or None
+
+
+def choose_post_editor_workflow():
+    td = TaskDialog(get_runtime_window_title())
+    td.MainInstruction = "Choose what to do next"
+    td.MainContent = "Apply changes only, or continue with plan sheet creation."
+    td.AddCommandLink(
+        TaskDialogCommandLinkId.CommandLink1,
+        "Apply changes only (no sheet)",
+    )
+    td.AddCommandLink(
+        TaskDialogCommandLinkId.CommandLink2,
+        "Apply + create sheet (plan only for now)",
+    )
+    td.CommonButtons = TaskDialogCommonButtons.Cancel
+    r = td.Show()
+    if r == TaskDialogResult.CommandLink2:
+        return "sheet"
+    if r == TaskDialogResult.CommandLink1:
+        return "apply_only"
+    return "cancel"
+
+
+class RegularPipeTagModeForm(Form):
+    def __init__(self):
+        self.Text = "{} - Regular Pipe Tag Style".format(get_runtime_window_title())
+        self.Width = 520
+        self.Height = 220
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.SelectedKey = REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+
+        label = Label()
+        label.Text = "Choose regular pipe tag style for this run:"
+        label.Location = Point(12, 12)
+        label.Size = Size(480, 24)
+        self.Controls.Add(label)
+
+        self.radio_a = RadioButton()
+        self.radio_a.Text = "Diameter + pipe length"
+        self.radio_a.Location = Point(20, 48)
+        self.radio_a.Size = Size(460, 28)
+        self.radio_a.Checked = True
+        self.Controls.Add(self.radio_a)
+
+        self.radio_b = RadioButton()
+        self.radio_b.Text = "Diameter + height"
+        self.radio_b.Location = Point(20, 82)
+        self.radio_b.Size = Size(460, 28)
+        self.Controls.Add(self.radio_b)
+
+        ok = Button()
+        ok.Text = "OK"
+        ok.Location = Point(300, 135)
+        ok.DialogResult = DialogResult.OK
+        self.Controls.Add(ok)
+
+        cancel = Button()
+        cancel.Text = "Cancel"
+        cancel.Location = Point(390, 135)
+        cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(cancel)
+
+        self.AcceptButton = ok
+        self.CancelButton = cancel
+
+    def get_selected_key(self):
+        if self.radio_b.Checked:
+            return "DIAMETER_HEIGHT"
+        return "DIAMETER_LENGTH"
+
+
+def prompt_regular_pipe_tag_mode():
+    form = RegularPipeTagModeForm()
+    if form.ShowDialog() != DialogResult.OK:
+        selected_option = get_regular_pipe_tag_mode_option(
+            REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        )
+        sym = find_regular_pipe_tag_symbol(selected_option)
+        mode = clone_regular_pipe_tag_mode(selected_option, True, sym)
+        apply_regular_pipe_tag_mode(mode)
+        log_regular_pipe_tag_mode(mode)
+        return mode
+
+    selected_option = get_regular_pipe_tag_mode_option(form.get_selected_key())
+    sym = find_regular_pipe_tag_symbol(selected_option)
+    fallback_used = False
+    if sym is None:
+        fallback_option = get_regular_pipe_tag_mode_option(
+            REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        )
+        td = TaskDialog(get_runtime_window_title())
+        td.MainInstruction = "Selected regular pipe tag type was not found"
+        td.MainContent = "Could not find selected regular pipe tag:\n{} - {}\n\nUse fallback?\n{} - {}".format(
+            selected_option.get("family"),
+            selected_option.get("type"),
+            fallback_option.get("family"),
+            fallback_option.get("type"),
+        )
+        td.CommonButtons = TaskDialogCommonButtons.Yes | TaskDialogCommonButtons.No
+        use_fallback = td.Show()
+        selected_option = fallback_option
+        sym = find_regular_pipe_tag_symbol(selected_option)
+        fallback_used = True
+        if use_fallback != TaskDialogResult.Yes:
+            print(
+                "TAG MODE -> fallback used to preserve default behavior after missing selection."
+            )
+        if sym is None:
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Fallback regular pipe tag type was also not found:\n{} - {}\n\nThe run will continue with the existing default behavior and Revit will report missing tag types if tagging cannot proceed.".format(
+                    fallback_option.get("family"),
+                    fallback_option.get("type"),
+                ),
+            )
+
+    mode = clone_regular_pipe_tag_mode(selected_option, fallback_used, sym)
+    apply_regular_pipe_tag_mode(mode)
+    log_regular_pipe_tag_mode(mode)
+    return mode
+
+
+def log_regular_pipe_tag_mode(mode):
+    print("TAG MODE SELECTED -> {}".format(mode.get("key")))
+    print("TAG FAMILY -> {}".format(mode.get("family")))
+    print("TAG TYPE -> {}".format(mode.get("type")))
+    print("TAG MODE FALLBACK USED -> {}".format(bool(mode.get("fallback_used"))))
+
+
+class RunConfigurationForm(Form):
+    TITLEBLOCK_FALLBACK = "<Choose during sheet creation>"
+    SCHEDULE_FALLBACK = "<Use existing schedule fallback>"
+    SCHEDULE_MODE_AS_IS = "Use selected master as-is"
+    SCHEDULE_MODE_NORMALIZE = "Use selected master, then normalize to tool standard"
+    SCHEDULE_MODE_FALLBACK = (
+        "Ignore selected masters and use current fallback/build logic"
+    )
+
+    def __init__(self, profile):
+        self.profile = profile or {}
+        self.tag_options = collect_loaded_pipe_tag_options(doc)
+        self.titleblock_options = collect_titleblock_options(doc)
+        self.pipe_schedule_options = collect_schedule_master_options(doc, "pipe")
+        self.fitting_schedule_options = collect_schedule_master_options(doc, "fitting")
+
+        self.Text = "{} - Run Configuration".format(get_runtime_window_title())
+        self.Width = 820
+        self.Height = 820
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.StartPosition = FormStartPosition.CenterScreen
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.MinimizeBox = False
+
+        self._build_regular_group()
+        self._build_vertical_group()
+        self._build_sheet_group()
+        self._build_buttons()
+        self._load_profile_defaults()
+        self._log_available_counts()
+        self._sync_enabled_state()
+        self._update_all_previews()
+
+    def _log_available_counts(self):
+        print(
+            "CONFIG UI -> available regular custom tag families: {}".format(
+                len(pipe_tag_family_names(self.tag_options))
+            )
+        )
+        print(
+            "CONFIG UI -> available vertical custom tag families: {}".format(
+                len(pipe_tag_family_names(self.tag_options))
+            )
+        )
+        print(
+            "CONFIG UI -> available titleblocks: {}".format(
+                len(self.titleblock_options)
+            )
+        )
+        print(
+            "CONFIG UI -> available pipe schedule masters: {}".format(
+                len(self.pipe_schedule_options)
+            )
+        )
+        print(
+            "CONFIG UI -> available fitting schedule masters: {}".format(
+                len(self.fitting_schedule_options)
+            )
+        )
+
+    def _build_regular_group(self):
+        group = GroupBox()
+        group.Text = "A. Regular pipe tag"
+        group.Location = Point(12, 12)
+        group.Size = Size(780, 185)
+        self.Controls.Add(group)
+
+        self.rb_regular_length = RadioButton()
+        self.rb_regular_length.Text = "Diameter + pipe length"
+        self.rb_regular_length.Location = Point(14, 24)
+        self.rb_regular_length.Size = Size(220, 22)
+        self.rb_regular_length.Checked = True
+        group.Controls.Add(self.rb_regular_length)
+
+        self.rb_regular_height = RadioButton()
+        self.rb_regular_height.Text = "Diameter + height"
+        self.rb_regular_height.Location = Point(14, 50)
+        self.rb_regular_height.Size = Size(220, 22)
+        group.Controls.Add(self.rb_regular_height)
+
+        self.rb_regular_custom = RadioButton()
+        self.rb_regular_custom.Text = "Custom loaded family/type"
+        self.rb_regular_custom.Location = Point(14, 76)
+        self.rb_regular_custom.Size = Size(220, 22)
+        self.rb_regular_custom.CheckedChanged += self._on_regular_mode_changed
+        group.Controls.Add(self.rb_regular_custom)
+
+        fam_label = Label()
+        fam_label.Text = "Family"
+        fam_label.Location = Point(250, 24)
+        fam_label.Size = Size(80, 18)
+        group.Controls.Add(fam_label)
+
+        self.cbo_regular_family = ComboBox()
+        self.cbo_regular_family.Location = Point(330, 22)
+        self.cbo_regular_family.Size = Size(420, 24)
+        self.cbo_regular_family.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_regular_family.SelectedIndexChanged += self._on_regular_family_changed
+        group.Controls.Add(self.cbo_regular_family)
+
+        type_label = Label()
+        type_label.Text = "Type"
+        type_label.Location = Point(250, 58)
+        type_label.Size = Size(80, 18)
+        group.Controls.Add(type_label)
+
+        self.cbo_regular_type = ComboBox()
+        self.cbo_regular_type.Location = Point(330, 56)
+        self.cbo_regular_type.Size = Size(420, 24)
+        self.cbo_regular_type.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_regular_type.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_regular_type)
+
+        refresh = Button()
+        refresh.Text = "Refresh loaded tags"
+        refresh.Location = Point(330, 98)
+        refresh.Size = Size(160, 28)
+        refresh.Click += self._on_refresh_tags
+        group.Controls.Add(refresh)
+
+        load = Button()
+        load.Text = "Load tag family from file..."
+        load.Location = Point(500, 98)
+        load.Size = Size(210, 28)
+        load.Click += self._on_load_tag_family
+        group.Controls.Add(load)
+
+        self.lbl_regular_preview = Label()
+        self.lbl_regular_preview.Text = (
+            "Regular pipe tag resolved to: fallback to built-in regular preset"
+        )
+        self.lbl_regular_preview.Location = Point(14, 136)
+        self.lbl_regular_preview.Size = Size(730, 36)
+        group.Controls.Add(self.lbl_regular_preview)
+
+    def _build_vertical_group(self):
+        group = GroupBox()
+        group.Text = "B. Vertical pipe tag"
+        group.Location = Point(12, 205)
+        group.Size = Size(780, 160)
+        self.Controls.Add(group)
+
+        self.chk_vertical_override = CheckBox()
+        self.chk_vertical_override.Text = "Use custom vertical tag family/type"
+        self.chk_vertical_override.Location = Point(14, 26)
+        self.chk_vertical_override.Size = Size(260, 22)
+        self.chk_vertical_override.CheckedChanged += self._on_vertical_override_changed
+        group.Controls.Add(self.chk_vertical_override)
+
+        fam_label = Label()
+        fam_label.Text = "Family"
+        fam_label.Location = Point(250, 26)
+        fam_label.Size = Size(80, 18)
+        group.Controls.Add(fam_label)
+
+        self.cbo_vertical_family = ComboBox()
+        self.cbo_vertical_family.Location = Point(330, 24)
+        self.cbo_vertical_family.Size = Size(420, 24)
+        self.cbo_vertical_family.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_vertical_family.SelectedIndexChanged += (
+            self._on_vertical_family_changed
+        )
+        group.Controls.Add(self.cbo_vertical_family)
+
+        type_label = Label()
+        type_label.Text = "Type"
+        type_label.Location = Point(250, 60)
+        type_label.Size = Size(80, 18)
+        group.Controls.Add(type_label)
+
+        self.cbo_vertical_type = ComboBox()
+        self.cbo_vertical_type.Location = Point(330, 58)
+        self.cbo_vertical_type.Size = Size(420, 24)
+        self.cbo_vertical_type.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_vertical_type.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_vertical_type)
+
+        refresh = Button()
+        refresh.Text = "Refresh loaded tags"
+        refresh.Location = Point(330, 96)
+        refresh.Size = Size(160, 28)
+        refresh.Click += self._on_refresh_tags
+        group.Controls.Add(refresh)
+
+        load = Button()
+        load.Text = "Load tag family from file..."
+        load.Location = Point(500, 96)
+        load.Size = Size(210, 28)
+        load.Click += self._on_load_tag_family
+        group.Controls.Add(load)
+
+        self.lbl_vertical_preview = Label()
+        self.lbl_vertical_preview.Text = (
+            "Vertical pipe tag resolved to: fallback to existing vertical behavior"
+        )
+        self.lbl_vertical_preview.Location = Point(14, 128)
+        self.lbl_vertical_preview.Size = Size(730, 24)
+        group.Controls.Add(self.lbl_vertical_preview)
+
+    def _build_sheet_group(self):
+        group = GroupBox()
+        group.Text = "C. Sheet creation assets"
+        group.Location = Point(12, 375)
+        group.Size = Size(780, 320)
+        self.Controls.Add(group)
+
+        tb_label = Label()
+        tb_label.Text = "Titleblock"
+        tb_label.Location = Point(14, 30)
+        tb_label.Size = Size(150, 18)
+        group.Controls.Add(tb_label)
+
+        self.cbo_titleblock = ComboBox()
+        self.cbo_titleblock.Location = Point(180, 28)
+        self.cbo_titleblock.Size = Size(570, 24)
+        self.cbo_titleblock.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_titleblock.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_titleblock)
+
+        pipe_label = Label()
+        pipe_label.Text = "Pipe schedule master"
+        pipe_label.Location = Point(14, 70)
+        pipe_label.Size = Size(150, 18)
+        group.Controls.Add(pipe_label)
+
+        self.cbo_pipe_schedule = ComboBox()
+        self.cbo_pipe_schedule.Location = Point(180, 68)
+        self.cbo_pipe_schedule.Size = Size(570, 24)
+        self.cbo_pipe_schedule.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_pipe_schedule.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_pipe_schedule)
+
+        fit_label = Label()
+        fit_label.Text = "Fitting schedule master"
+        fit_label.Location = Point(14, 110)
+        fit_label.Size = Size(150, 18)
+        group.Controls.Add(fit_label)
+
+        self.cbo_fitting_schedule = ComboBox()
+        self.cbo_fitting_schedule.Location = Point(180, 108)
+        self.cbo_fitting_schedule.Size = Size(570, 24)
+        self.cbo_fitting_schedule.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_fitting_schedule.SelectedIndexChanged += self._on_selection_changed
+        group.Controls.Add(self.cbo_fitting_schedule)
+
+        mode_label = Label()
+        mode_label.Text = "Schedule mode"
+        mode_label.Location = Point(14, 150)
+        mode_label.Size = Size(150, 18)
+        group.Controls.Add(mode_label)
+
+        self.cbo_schedule_mode = ComboBox()
+        self.cbo_schedule_mode.Location = Point(180, 148)
+        self.cbo_schedule_mode.Size = Size(570, 24)
+        self.cbo_schedule_mode.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_schedule_mode.Items.Add(self.SCHEDULE_MODE_AS_IS)
+        self.cbo_schedule_mode.Items.Add(self.SCHEDULE_MODE_NORMALIZE)
+        self.cbo_schedule_mode.Items.Add(self.SCHEDULE_MODE_FALLBACK)
+        self.cbo_schedule_mode.SelectedIndex = 2
+        self.cbo_schedule_mode.SelectedIndexChanged += self._on_schedule_mode_changed
+        group.Controls.Add(self.cbo_schedule_mode)
+
+        self.chk_use_schedule_masters = CheckBox()
+        self.chk_use_schedule_masters.Text = (
+            "Use selected master schedules when creating sheet"
+        )
+        self.chk_use_schedule_masters.Location = Point(180, 180)
+        self.chk_use_schedule_masters.Size = Size(380, 22)
+        self.chk_use_schedule_masters.Visible = False
+        group.Controls.Add(self.chk_use_schedule_masters)
+
+        self.chk_remember_project = CheckBox()
+        self.chk_remember_project.Text = "Remember selections for this project"
+        self.chk_remember_project.Location = Point(180, 205)
+        self.chk_remember_project.Size = Size(300, 22)
+        group.Controls.Add(self.chk_remember_project)
+
+        self.lbl_titleblock_preview = Label()
+        self.lbl_titleblock_preview.Location = Point(14, 232)
+        self.lbl_titleblock_preview.Size = Size(730, 18)
+        group.Controls.Add(self.lbl_titleblock_preview)
+
+        self.lbl_pipe_schedule_preview = Label()
+        self.lbl_pipe_schedule_preview.Location = Point(14, 254)
+        self.lbl_pipe_schedule_preview.Size = Size(730, 18)
+        group.Controls.Add(self.lbl_pipe_schedule_preview)
+
+        self.lbl_fitting_schedule_preview = Label()
+        self.lbl_fitting_schedule_preview.Location = Point(14, 276)
+        self.lbl_fitting_schedule_preview.Size = Size(730, 18)
+        group.Controls.Add(self.lbl_fitting_schedule_preview)
+
+    def _build_buttons(self):
+        ok = Button()
+        ok.Text = "OK"
+        ok.Location = Point(615, 710)
+        ok.Size = Size(80, 30)
+        ok.DialogResult = DialogResult.OK
+        self.Controls.Add(ok)
+
+        cancel = Button()
+        cancel.Text = "Cancel"
+        cancel.Location = Point(710, 710)
+        cancel.Size = Size(80, 30)
+        cancel.DialogResult = DialogResult.Cancel
+        self.Controls.Add(cancel)
+
+        self.AcceptButton = ok
+        self.CancelButton = cancel
+
+    def _load_profile_defaults(self):
+        self._refresh_tag_dropdowns()
+        self._refresh_sheet_dropdowns()
+        mode = self.profile.get("regular_tag_mode") or REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        if mode == "DIAMETER_HEIGHT":
+            self.rb_regular_height.Checked = True
+        elif mode == "CUSTOM":
+            self.rb_regular_custom.Checked = True
+        else:
+            self.rb_regular_length.Checked = True
+        self._select_combo_text(
+            self.cbo_regular_family, self.profile.get("regular_tag_family_name")
+        )
+        self._refresh_type_combo(
+            self.cbo_regular_type, self.cbo_regular_family.SelectedItem
+        )
+        self._select_combo_text(
+            self.cbo_regular_type, self.profile.get("regular_tag_type_name")
+        )
+        self.chk_vertical_override.Checked = bool(
+            self.profile.get("vertical_tag_override_enabled", False)
+        )
+        self._select_combo_text(
+            self.cbo_vertical_family, self.profile.get("vertical_tag_family_name")
+        )
+        self._refresh_type_combo(
+            self.cbo_vertical_type, self.cbo_vertical_family.SelectedItem
+        )
+        self._select_combo_text(
+            self.cbo_vertical_type, self.profile.get("vertical_tag_type_name")
+        )
+        self._select_combo_text(
+            self.cbo_titleblock, self.profile.get("titleblock_display")
+        )
+        self._select_combo_text(
+            self.cbo_pipe_schedule, self.profile.get("pipe_schedule_master_name")
+        )
+        self._select_combo_text(
+            self.cbo_fitting_schedule, self.profile.get("fitting_schedule_master_name")
+        )
+        schedule_mode = self.profile.get("schedule_mode")
+        if not schedule_mode:
+            schedule_mode = (
+                self.SCHEDULE_MODE_AS_IS
+                if self.profile.get("use_selected_schedule_masters", False)
+                else self.SCHEDULE_MODE_FALLBACK
+            )
+        self._select_combo_text(self.cbo_schedule_mode, schedule_mode)
+        self.chk_use_schedule_masters.Checked = (
+            str(self.cbo_schedule_mode.SelectedItem or "")
+            != self.SCHEDULE_MODE_FALLBACK
+        )
+
+    def _select_combo_text(self, combo, value):
+        if not value:
+            return False
+        for i in range(combo.Items.Count):
+            if str(combo.Items[i]) == str(value):
+                combo.SelectedIndex = i
+                return True
+        return False
+
+    def _refresh_tag_dropdowns(self):
+        self.tag_options = collect_loaded_pipe_tag_options(doc)
+        families = pipe_tag_family_names(self.tag_options)
+        for combo in [self.cbo_regular_family, self.cbo_vertical_family]:
+            current = combo.SelectedItem
+            combo.Items.Clear()
+            for fam in families:
+                combo.Items.Add(fam)
+            if current and not self._select_combo_text(combo, current):
+                combo.SelectedIndex = -1
+            elif combo.Items.Count > 0 and combo.SelectedIndex < 0:
+                combo.SelectedIndex = 0
+        self._refresh_type_combo(
+            self.cbo_regular_type, self.cbo_regular_family.SelectedItem
+        )
+        self._refresh_type_combo(
+            self.cbo_vertical_type, self.cbo_vertical_family.SelectedItem
+        )
+
+    def _refresh_type_combo(self, combo, family_name):
+        current = combo.SelectedItem
+        combo.Items.Clear()
+        for typ in pipe_tag_type_names(self.tag_options, family_name):
+            combo.Items.Add(typ)
+        if current and self._select_combo_text(combo, current):
+            return
+        if combo.Items.Count > 0:
+            combo.SelectedIndex = 0
+        self._update_all_previews()
+
+    def _refresh_sheet_dropdowns(self):
+        self.cbo_titleblock.Items.Clear()
+        self.cbo_titleblock.Items.Add(self.TITLEBLOCK_FALLBACK)
+        for item in self.titleblock_options:
+            self.cbo_titleblock.Items.Add(item.get("display"))
+        self.cbo_titleblock.SelectedIndex = 0
+
+        self.cbo_pipe_schedule.Items.Clear()
+        self.cbo_pipe_schedule.Items.Add(self.SCHEDULE_FALLBACK)
+        for item in self.pipe_schedule_options:
+            self.cbo_pipe_schedule.Items.Add(item.get("name"))
+        self.cbo_pipe_schedule.SelectedIndex = 0
+
+        self.cbo_fitting_schedule.Items.Clear()
+        self.cbo_fitting_schedule.Items.Add(self.SCHEDULE_FALLBACK)
+        for item in self.fitting_schedule_options:
+            self.cbo_fitting_schedule.Items.Add(item.get("name"))
+        self.cbo_fitting_schedule.SelectedIndex = 0
+
+    def _sync_enabled_state(self):
+        custom_regular = self.rb_regular_custom.Checked
+        self.cbo_regular_family.Enabled = custom_regular
+        self.cbo_regular_type.Enabled = custom_regular
+        vertical_custom = self.chk_vertical_override.Checked
+        self.cbo_vertical_family.Enabled = vertical_custom
+        self.cbo_vertical_type.Enabled = vertical_custom
+        self._update_all_previews()
+
+    def _on_regular_mode_changed(self, sender, event):
+        self._sync_enabled_state()
+
+    def _on_vertical_override_changed(self, sender, event):
+        self._sync_enabled_state()
+
+    def _on_regular_family_changed(self, sender, event):
+        self._refresh_type_combo(
+            self.cbo_regular_type, self.cbo_regular_family.SelectedItem
+        )
+        self._update_all_previews()
+
+    def _on_vertical_family_changed(self, sender, event):
+        self._refresh_type_combo(
+            self.cbo_vertical_type, self.cbo_vertical_family.SelectedItem
+        )
+        self._update_all_previews()
+
+    def _on_schedule_mode_changed(self, sender, event):
+        self.chk_use_schedule_masters.Checked = (
+            str(self.cbo_schedule_mode.SelectedItem or "")
+            != self.SCHEDULE_MODE_FALLBACK
+        )
+        self._update_all_previews()
+
+    def _on_selection_changed(self, sender, event):
+        self._update_all_previews()
+
+    def _on_refresh_tags(self, sender, event):
+        self._refresh_tag_dropdowns()
+
+    def _on_load_tag_family(self, sender, event):
+        before_regular_family = str(self.cbo_regular_family.SelectedItem or "")
+        before_regular_type = str(self.cbo_regular_type.SelectedItem or "")
+        before_vertical_family = str(self.cbo_vertical_family.SelectedItem or "")
+        before_vertical_type = str(self.cbo_vertical_type.SelectedItem or "")
+        if load_tag_family_from_file(doc):
+            self._refresh_tag_dropdowns()
+            if (
+                str(self.cbo_regular_family.SelectedItem or "") != before_regular_family
+                or str(self.cbo_regular_type.SelectedItem or "") != before_regular_type
+            ):
+                print(
+                    "CONFIG -> first loaded regular tag type selected after refresh: {} / {}".format(
+                        self.cbo_regular_family.SelectedItem,
+                        self.cbo_regular_type.SelectedItem,
+                    )
+                )
+            if (
+                str(self.cbo_vertical_family.SelectedItem or "")
+                != before_vertical_family
+                or str(self.cbo_vertical_type.SelectedItem or "")
+                != before_vertical_type
+            ):
+                print(
+                    "CONFIG -> first loaded vertical tag type selected after refresh: {} / {}".format(
+                        self.cbo_vertical_family.SelectedItem,
+                        self.cbo_vertical_type.SelectedItem,
+                    )
+                )
+            print("CONFIG -> loaded family; refreshed tag dropdowns")
+            self._update_all_previews()
+
+    def _find_titleblock_display_item(self, display):
+        for item in self.titleblock_options:
+            if item.get("display") == display:
+                return item
+        return None
+
+    def _find_schedule_item(self, options, name):
+        for item in options:
+            if item.get("name") == name:
+                return item
+        return None
+
+    def _update_all_previews(self):
+        try:
+            if self.rb_regular_custom.Checked:
+                self.lbl_regular_preview.Text = (
+                    "Regular pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(
+                            self.cbo_regular_family.SelectedItem,
+                            self.cbo_regular_type.SelectedItem,
+                        )
+                    )
+                )
+            elif self.rb_regular_height.Checked:
+                opt = get_regular_pipe_tag_mode_option("DIAMETER_HEIGHT")
+                self.lbl_regular_preview.Text = (
+                    "Regular pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(opt.get("family"), opt.get("type"))
+                    )
+                )
+            else:
+                opt = get_regular_pipe_tag_mode_option("DIAMETER_LENGTH")
+                self.lbl_regular_preview.Text = (
+                    "Regular pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(opt.get("family"), opt.get("type"))
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            if self.chk_vertical_override.Checked:
+                self.lbl_vertical_preview.Text = (
+                    "Vertical pipe tag resolved to: {}".format(
+                        describe_pipe_tag_option(
+                            self.cbo_vertical_family.SelectedItem,
+                            self.cbo_vertical_type.SelectedItem,
+                        )
+                    )
+                )
+            else:
+                self.lbl_vertical_preview.Text = "Vertical pipe tag resolved to: fallback to existing vertical behavior"
+        except Exception:
+            pass
+        try:
+            tb_display = str(self.cbo_titleblock.SelectedItem or "")
+            tb_item = self._find_titleblock_display_item(tb_display)
+            if tb_item:
+                sym = tb_item.get("symbol")
+                self.lbl_titleblock_preview.Text = (
+                    "Titleblock resolved to: {} / {}".format(
+                        tb_display, sym.Id.IntegerValue
+                    )
+                )
+            else:
+                self.lbl_titleblock_preview.Text = (
+                    "Titleblock resolved to: choose during sheet creation"
+                )
+        except Exception:
+            pass
+        try:
+            schedule_mode = str(self.cbo_schedule_mode.SelectedItem or "")
+            if schedule_mode == self.SCHEDULE_MODE_FALLBACK:
+                self.lbl_pipe_schedule_preview.Text = "Pipe schedule master resolved to: fallback to schedule auto-build logic"
+                self.lbl_fitting_schedule_preview.Text = "Fitting schedule master resolved to: fallback to schedule auto-build logic"
+                return
+            pipe_name = str(self.cbo_pipe_schedule.SelectedItem or "")
+            pipe_item = self._find_schedule_item(self.pipe_schedule_options, pipe_name)
+            if pipe_item:
+                sched = pipe_item.get("schedule")
+                self.lbl_pipe_schedule_preview.Text = (
+                    "Pipe schedule master resolved to: {} / {} / {}".format(
+                        pipe_name,
+                        pipe_item.get("category") or get_schedule_category_text(sched),
+                        sched.Id.IntegerValue,
+                    )
+                )
+            else:
+                self.lbl_pipe_schedule_preview.Text = "Pipe schedule master resolved to: fallback to schedule auto-build logic"
+        except Exception:
+            pass
+        try:
+            fit_name = str(self.cbo_fitting_schedule.SelectedItem or "")
+            fit_item = self._find_schedule_item(self.fitting_schedule_options, fit_name)
+            if fit_item:
+                sched = fit_item.get("schedule")
+                self.lbl_fitting_schedule_preview.Text = (
+                    "Fitting schedule master resolved to: {} / {} / {}".format(
+                        fit_name,
+                        fit_item.get("category") or get_schedule_category_text(sched),
+                        sched.Id.IntegerValue,
+                    )
+                )
+            else:
+                self.lbl_fitting_schedule_preview.Text = "Fitting schedule master resolved to: fallback to schedule auto-build logic"
+        except Exception:
+            pass
+
+    def get_config(self):
+        if self.rb_regular_custom.Checked:
+            regular_mode = "CUSTOM"
+            regular_family = str(self.cbo_regular_family.SelectedItem or "")
+            regular_type = str(self.cbo_regular_type.SelectedItem or "")
+        elif self.rb_regular_height.Checked:
+            opt = get_regular_pipe_tag_mode_option("DIAMETER_HEIGHT")
+            regular_mode = opt.get("key")
+            regular_family = opt.get("family")
+            regular_type = opt.get("type")
+        else:
+            opt = get_regular_pipe_tag_mode_option("DIAMETER_LENGTH")
+            regular_mode = opt.get("key")
+            regular_family = opt.get("family")
+            regular_type = opt.get("type")
+
+        titleblock_display = str(self.cbo_titleblock.SelectedItem or "")
+        if titleblock_display == self.TITLEBLOCK_FALLBACK:
+            titleblock_display = ""
+        pipe_schedule_name = str(self.cbo_pipe_schedule.SelectedItem or "")
+        if pipe_schedule_name == self.SCHEDULE_FALLBACK:
+            pipe_schedule_name = ""
+        fitting_schedule_name = str(self.cbo_fitting_schedule.SelectedItem or "")
+        if fitting_schedule_name == self.SCHEDULE_FALLBACK:
+            fitting_schedule_name = ""
+        schedule_mode = str(self.cbo_schedule_mode.SelectedItem or "")
+        if not schedule_mode:
+            schedule_mode = self.SCHEDULE_MODE_FALLBACK
+
+        return {
+            "regular_tag_mode": regular_mode,
+            "regular_tag_family_name": regular_family,
+            "regular_tag_type_name": regular_type,
+            "vertical_tag_override_enabled": bool(self.chk_vertical_override.Checked),
+            "vertical_tag_family_name": str(
+                self.cbo_vertical_family.SelectedItem or ""
+            ),
+            "vertical_tag_type_name": str(self.cbo_vertical_type.SelectedItem or ""),
+            "selected_titleblock_id": None,
+            "titleblock_display": titleblock_display,
+            "schedule_mode": schedule_mode,
+            "use_selected_schedule_masters": schedule_mode
+            != self.SCHEDULE_MODE_FALLBACK,
+            "selected_pipe_schedule_master_id": None,
+            "pipe_schedule_master_name": pipe_schedule_name,
+            "selected_fitting_schedule_master_id": None,
+            "fitting_schedule_master_name": fitting_schedule_name,
+            "remember_for_project": bool(self.chk_remember_project.Checked),
+        }
+
+
+def find_titleblock_by_display(display):
+    if not display:
+        return None
+    for item in collect_titleblock_options(doc):
+        if item.get("display") == display:
+            return item.get("symbol")
     return None
 
 
-# ==================================================
-# Filter Gathered Elements to Relevant Categories
-# ==================================================
-def filter_relevant_elements(gathered_elements):
-    """
-    Build a list of dicts with keys:
-     "Id","Category","Name","DefaultCode","NewCode",
-     "OutsideDiameter","Length","GEB_Article_Number","TagStatus"
-    """
-    relevant = []
+def find_schedule_by_name(name, kind=None):
+    if not name:
+        return None
+    for item in collect_schedule_master_options(doc, kind):
+        if item.get("name") == name:
+            return item.get("schedule")
+    return None
 
-    pipe_ids = {
-        e.Id.IntegerValue
-        for e in gathered_elements
-        if e.Category and e.Category.Name == "Pipes"
-    }
-    # grab all tags in the view
-    all_pipe_tags = (
-        FilteredElementCollector(doc)
-        .OfCategory(BuiltInCategory.OST_PipeTags)
-        .WhereElementIsNotElementType()
-        .ToElements()
+
+def resolve_runtime_config(runtime_config):
+    if runtime_config is None:
+        return None
+
+    regular_sym = find_tag_symbol(
+        doc,
+        runtime_config.get("regular_tag_family_name"),
+        runtime_config.get("regular_tag_type_name"),
+    )
+    fallback_used = False
+    if regular_sym is None:
+        fallback_used = True
+        fallback_option = get_regular_pipe_tag_mode_option(
+            REGULAR_PIPE_TAG_MODE_DEFAULT_KEY
+        )
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Selected regular pipe tag was not found:\n{} - {}\n\nUsing fallback:\n{} - {}".format(
+                runtime_config.get("regular_tag_family_name"),
+                runtime_config.get("regular_tag_type_name"),
+                fallback_option.get("family"),
+                fallback_option.get("type"),
+            ),
+        )
+        runtime_config["regular_tag_mode"] = fallback_option.get("key")
+        runtime_config["regular_tag_family_name"] = fallback_option.get("family")
+        runtime_config["regular_tag_type_name"] = fallback_option.get("type")
+        regular_sym = find_regular_pipe_tag_symbol(fallback_option)
+    else:
+        ensure_symbol_active(doc, regular_sym)
+
+    regular_mode = dict(
+        key=runtime_config.get("regular_tag_mode") or "CUSTOM",
+        label=runtime_config.get("regular_tag_mode") or "Custom loaded family/type",
+        family=runtime_config.get("regular_tag_family_name"),
+        type=runtime_config.get("regular_tag_type_name"),
+        leader=True,
+        offset_mm=SAFE_CFG.get("tag_offset_mm", 250),
+        fallback_used=fallback_used,
+        symbol=regular_sym,
+    )
+    if runtime_config.get("regular_tag_mode") == "DIAMETER_LENGTH":
+        regular_mode["offset_mm"] = 500
+    elif runtime_config.get("regular_tag_mode") == "DIAMETER_HEIGHT":
+        regular_mode["offset_mm"] = 350
+    apply_regular_pipe_tag_mode(regular_mode)
+    runtime_config["regular_tag_mode_config"] = regular_mode
+    print(
+        "CONFIG RESOLVE -> regular tag: {}".format(
+            "fallback" if fallback_used else "resolved"
+        )
     )
 
-    # pull in any tags whose host pipe was in our region
-    for tag in all_pipe_tags:
-        try:
-            host = None
-            if hasattr(tag, "GetTaggedElementIds"):
-                ids = tag.GetTaggedElementIds()
-                if ids and ids.Count > 0:
-                    host = doc.GetElement(ids[0])
-            elif hasattr(tag, "TaggedElementId"):
-                host = doc.GetElement(tag.TaggedElementId)
-            if host and host.Id.IntegerValue in pipe_ids:
-                # and only if we haven't already added it in gathered_elements
-                if not any(str(tag.Id) == d["Id"] for d in relevant):
-                    warning_val = ""
-                    bend45_val = ""
-                    # build your dict exactly like you do for pipe‑tags below
-                    relevant.append(
-                        {
-                            "Id": str(tag.Id),
-                            "Category": "Pipe Tags",
-                            "Name": tag.Name or "",
-                            "Warning": "",
-                            "Bend45": "",
-                            "DefaultCode": host.LookupParameter("Comments").AsString()
-                            or "",
-                            "NewCode": host.LookupParameter("Comments").AsString()
-                            or "",
-                            "OutsideDiameter": convert_param_to_string(
-                                host.LookupParameter("Outside Diameter")
-                            ),
-                            "Length": convert_param_to_string(
-                                host.LookupParameter("Length")
-                            ),
-                            "Size": "",  # if you want
-                            "GEB_Article_Number": "",
-                            "TagStatus": "Yes",
-                        }
-                    )
-        except:
-            pass
+    vertical_override = bool(runtime_config.get("vertical_tag_override_enabled"))
+    if vertical_override:
+        vertical_sym = find_tag_symbol(
+            doc,
+            runtime_config.get("vertical_tag_family_name"),
+            runtime_config.get("vertical_tag_type_name"),
+        )
+        if vertical_sym is None:
+            print("CONFIG RESOLVE -> vertical tag: fallback selected type missing")
+            TaskDialog.Show(
+                get_runtime_window_title(),
+                "Selected vertical pipe tag was not found:\n{} - {}\n\nUsing existing vertical tag behavior.".format(
+                    runtime_config.get("vertical_tag_family_name"),
+                    runtime_config.get("vertical_tag_type_name"),
+                ),
+            )
+            runtime_config["vertical_tag_override_enabled"] = False
+        else:
+            ensure_symbol_active(doc, vertical_sym)
+            TAGCFG_VERD["family"] = runtime_config.get("vertical_tag_family_name")
+            TAGCFG_VERD["type"] = runtime_config.get("vertical_tag_type_name")
+            _RESOLVED_TAG_SYMBOLS["PIPE_VERTICAL"] = vertical_sym
+            print("CONFIG RESOLVE -> vertical tag: resolved")
+    else:
+        print("CONFIG RESOLVE -> vertical tag: fallback existing behavior")
+
+    tb = find_titleblock_by_display(runtime_config.get("titleblock_display"))
+    if tb is not None:
+        runtime_config["selected_titleblock_id"] = tb.Id.IntegerValue
+        print(
+            "CONFIG RESOLVE -> titleblock: resolved {}".format(
+                runtime_config.get("titleblock_display")
+            )
+        )
+    else:
+        runtime_config["selected_titleblock_id"] = None
+        print("CONFIG RESOLVE -> titleblock: fallback choose during sheet creation")
+
+    pipe_sched = find_schedule_by_name(
+        runtime_config.get("pipe_schedule_master_name"), "pipe"
+    )
+    if pipe_sched is not None:
+        runtime_config["selected_pipe_schedule_master_id"] = pipe_sched.Id.IntegerValue
+        print(
+            "CONFIG RESOLVE -> pipe schedule master: resolved {}".format(
+                pipe_sched.Name
+            )
+        )
+    else:
+        runtime_config["selected_pipe_schedule_master_id"] = None
+        if runtime_config.get("use_selected_schedule_masters"):
+            print(
+                "CONFIG RESOLVE -> pipe schedule master: fallback existing build logic"
+            )
+
+    fit_sched = find_schedule_by_name(
+        runtime_config.get("fitting_schedule_master_name"), "fitting"
+    )
+    if fit_sched is not None:
+        runtime_config["selected_fitting_schedule_master_id"] = (
+            fit_sched.Id.IntegerValue
+        )
+        print(
+            "CONFIG RESOLVE -> fitting schedule master: resolved {}".format(
+                fit_sched.Name
+            )
+        )
+    else:
+        runtime_config["selected_fitting_schedule_master_id"] = None
+        if runtime_config.get("use_selected_schedule_masters"):
+            print(
+                "CONFIG RESOLVE -> fitting schedule master: fallback existing build logic"
+            )
+    print(
+        "CONFIG RESOLVE -> schedule mode: {}".format(
+            runtime_config.get("schedule_mode")
+        )
+    )
+
+    log_runtime_config(runtime_config)
+    if runtime_config.get("remember_for_project"):
+        save_project_profile(doc, runtime_config)
+    return runtime_config
+
+
+def log_runtime_config(runtime_config):
+    print(
+        "CONFIG -> regular tag mode = {}".format(runtime_config.get("regular_tag_mode"))
+    )
+    print(
+        "CONFIG -> regular tag family = {}".format(
+            runtime_config.get("regular_tag_family_name")
+        )
+    )
+    print(
+        "CONFIG -> regular tag type = {}".format(
+            runtime_config.get("regular_tag_type_name")
+        )
+    )
+    print(
+        "CONFIG -> vertical override = {}".format(
+            bool(runtime_config.get("vertical_tag_override_enabled"))
+        )
+    )
+    print(
+        "CONFIG -> vertical family = {}".format(
+            runtime_config.get("vertical_tag_family_name")
+        )
+    )
+    print(
+        "CONFIG -> vertical type = {}".format(
+            runtime_config.get("vertical_tag_type_name")
+        )
+    )
+    print("CONFIG -> schedule mode = {}".format(runtime_config.get("schedule_mode")))
+    print(
+        "CONFIG -> use schedule masters = {}".format(
+            bool(runtime_config.get("use_selected_schedule_masters"))
+        )
+    )
+    print(
+        "CONFIG -> pipe schedule master = {}".format(
+            runtime_config.get("pipe_schedule_master_name")
+        )
+    )
+    print(
+        "CONFIG -> fitting schedule master = {}".format(
+            runtime_config.get("fitting_schedule_master_name")
+        )
+    )
+    print("CONFIG -> titleblock = {}".format(runtime_config.get("titleblock_display")))
+    print(
+        "CONFIG -> remember for project = {}".format(
+            bool(runtime_config.get("remember_for_project"))
+        )
+    )
+
+
+def prompt_run_configuration():
+    profile = load_project_profile(doc)
+    form = RunConfigurationForm(profile)
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+    runtime_config = form.get_config()
+    return resolve_runtime_config(runtime_config)
+
+
+# ==================================================
+# Filtering for relevant elements
+# ==================================================
+def filter_relevant_elements(gathered_elements):
+    relevant = []
+    source_view = uidoc.ActiveView
 
     for e in gathered_elements:
         if not e.Category:
             continue
         cat = e.Category.Name
-        if cat not in ("Pipes", "Pipe Fittings", "Pipe Tags", "Text Notes"):
+        if cat == "Pipes" and is_excluded_nlrs_pipe(e):
+            continue
+        if cat not in (
+            "Pipes",
+            "Pipe Fittings",
+            "Pipe Accessories",
+            "Text Notes",
+        ):
             continue
 
         com = e.LookupParameter("Comments")
         default_code = com.AsString() if com and com.AsString() else ""
 
-        # initialize
         warning_val = ""
         bend45_val = ""
         outside_diam = ""
         length_val = ""
         art_num = ""
         tag_status = ""
-        size_val = ""
 
-        # --- Pipes ---
         if cat == "Pipes":
             odp = e.LookupParameter("Outside Diameter")
             lp = e.LookupParameter("Length")
             outside_diam = convert_param_to_string(odp)
             length_val = convert_param_to_string(lp)
 
-            # detect existing tags
-            tag_status = "No"
-            for tag in all_pipe_tags:
-                try:
-                    tagged_ids = []
-                    if hasattr(tag, "GetTaggedElementIds"):
-                        tagged_ids = tag.GetTaggedElementIds()
-                    elif hasattr(tag, "TaggedElementId"):
-                        tagged_ids = [tag.TaggedElementId]
-                    for tid in tagged_ids:
-                        if tid and tid.IntegerValue == e.Id.IntegerValue:
-                            tag_status = "Yes"
-                            break
-                    if tag_status == "Yes":
-                        break
-                except:
-                    pass
+            tag_status = "Yes" if find_pipe_tag_in_view(source_view, e.Id) else "No"
 
-        # --- Pipe Fittings ---
         elif cat == "Pipe Fittings":
             p_warn = e.LookupParameter("waarschuwing")
             warning_val = p_warn.AsString() if p_warn else ""
-
-            p_bend = e.LookupParameter("2x45°")
-            bend45_val = ""
+            p_bend = e.LookupParameter("2x45\u00b0")
             if p_bend and p_bend.StorageType == StorageType.Integer:
                 bend45_val = "Yes" if p_bend.AsInteger() == 1 else "No"
-            # diameter (try several names)
             for pname in ("Outside Diameter", "Diameter", "Nominal Diameter"):
                 p = e.LookupParameter(pname)
                 if p:
                     outside_diam = convert_param_to_string(p)
                     break
-            # length
             lp = e.LookupParameter("Length")
             length_val = convert_param_to_string(lp)
-            # GEB article
             ap = e.LookupParameter("GEB_Article_Number")
-            art_num = ap.AsString() if ap and ap.AsString() else ""
+            art_num = ap.AsString() if (ap and ap.AsString()) else ""
+            tag_status = ""  # fittings not tagged here in safe-mode
 
-            # only the specific fitting gets Add/Place Tag
-            if e.Name and e.Name.find("DN") >= 0:
-                tag_status = "No"
-            else:
-                tag_status = ""
-
-        # --- Pipe Tags ---
-        elif cat == "Pipe Tags":
-            tag_status = "Yes"
-            host = None
-            try:
-                if hasattr(e, "GetTaggedElementIds"):
-                    ids = e.GetTaggedElementIds()
-                    if ids and ids.Count > 0:
-                        host = doc.GetElement(ids[0])
-                if not host and hasattr(e, "TaggedElementId"):
-                    host = doc.GetElement(e.TaggedElementId)
-            except:
-                host = None
-
-            if host:
-                odp = host.LookupParameter("Outside Diameter")
-                lp = host.LookupParameter("Length")
-                outside_diam = convert_param_to_string(odp)
-                length_val = convert_param_to_string(lp)
-
-        # --- Text Notes & others ---
-        else:
-            tag_status = ""
-
-        size_val = ""
-        if cat == "Pipe Fittings":
-            param_size = e.LookupParameter("Size")
-            if param_size:
-                size_val = convert_param_to_string(param_size)
+        elif cat == "Pipe Accessories":
+            tag_status = ""  # accessories not tagged in this workflow
 
         relevant.append(
             {
@@ -2395,216 +3704,3734 @@ def filter_relevant_elements(gathered_elements):
                 "NewCode": default_code,
                 "OutsideDiameter": outside_diam,
                 "Length": length_val,
-                "Size": size_val,
+                "Size": "",
                 "GEB_Article_Number": art_num,
                 "TagStatus": tag_status,
             }
         )
-
     return relevant
 
 
 # ==================================================
-# MAIN WORKFLOW
+# Tagging helpers (leaderless, single transaction)
 # ==================================================
-gathered_elements = select_boundary_and_gather()
-if gathered_elements is None or len(gathered_elements) == 0:
-    MessageBox.Show("No elements were gathered. Operation cancelled.", "Error")
-    sys.exit("Operation cancelled by the user.")
+def _midpoint_or_center(elem, view):
+    try:
+        loc = getattr(elem, "Location", None)
+        if loc and hasattr(loc, "Curve") and loc.Curve:
+            return loc.Curve.Evaluate(0.5, True)
+    except:
+        pass
+    bb = elem.get_BoundingBox(view)
+    if not bb:
+        return XYZ(0, 0, 0)
+    return XYZ(
+        (bb.Min.X + bb.Max.X) / 2.0,
+        (bb.Min.Y + bb.Max.Y) / 2.0,
+        (bb.Min.Z + bb.Max.Z) / 2.0,
+    )
 
-scanned_ids = List[ElementId]([e.Id for e in gathered_elements if e is not None])
-scanned_elems = [doc.GetElement(eid) for eid in scanned_ids]
 
-filtered_elements = filter_relevant_elements(scanned_elems)
-if len(filtered_elements) == 0:
-    MessageBox.Show("No relevant elements found in the selected region.", "Error")
-    sys.exit("Operation cancelled by the user.")
+def view_offset_vector(view, mm):
+    d = mm_to_ft(mm)
+    try:
+        right = view.RightDirection
+        up = view.UpDirection
+        return XYZ(
+            right.X * d + up.X * (0.25 * d),
+            right.Y * d + up.Y * (0.25 * d),
+            right.Z * d + up.Z * (0.25 * d),
+        )
+    except Exception:
+        return XYZ(d, d * 0.25, 0)
 
-result = show_element_editor(filtered_elements, region_elements=scanned_elems)
-if result is None:
-    sys.exit("Operation cancelled by the user.")
 
-uidoc.Selection.SetElementIds(List[ElementId]())
+def choose_plan_tag_head(elem, view, anchor_pt, base_mm, occupied_pts):
+    try:
+        dir_xy = get_curve_direction_xy(elem)
+        side = get_short_side_vector_xy(dir_xy)
+    except Exception:
+        side = XYZ(1, 0, 0)
+    try:
+        up = view.UpDirection
+    except Exception:
+        up = XYZ(0, 1, 0)
+    side_ft = mm_to_ft(base_mm)
+    up_ft = mm_to_ft(max(90.0, base_mm * 0.30))
+    candidates = [
+        XYZ(
+            anchor_pt.X + side.X * side_ft + up.X * up_ft,
+            anchor_pt.Y + side.Y * side_ft + up.Y * up_ft,
+            anchor_pt.Z + side.Z * side_ft + up.Z * up_ft,
+        ),
+        XYZ(
+            anchor_pt.X - side.X * side_ft + up.X * up_ft,
+            anchor_pt.Y - side.Y * side_ft + up.Y * up_ft,
+            anchor_pt.Z - side.Z * side_ft + up.Z * up_ft,
+        ),
+        XYZ(
+            anchor_pt.X + side.X * side_ft * 1.35 + up.X * up_ft * 1.4,
+            anchor_pt.Y + side.Y * side_ft * 1.35 + up.Y * up_ft * 1.4,
+            anchor_pt.Z + side.Z * side_ft * 1.35 + up.Z * up_ft * 1.4,
+        ),
+        XYZ(
+            anchor_pt.X - side.X * side_ft * 1.35 + up.X * up_ft * 1.4,
+            anchor_pt.Y - side.Y * side_ft * 1.35 + up.Y * up_ft * 1.4,
+            anchor_pt.Z - side.Z * side_ft * 1.35 + up.Z * up_ft * 1.4,
+        ),
+    ]
+    min_clear = mm_to_ft(120.0)
+    for cand in candidates:
+        conflict = False
+        for pt in occupied_pts:
+            dx = cand.X - pt.X
+            dy = cand.Y - pt.Y
+            if math.sqrt(dx * dx + dy * dy) < min_clear:
+                conflict = True
+                break
+        if not conflict:
+            return cand
+    return candidates[0]
 
-post_editor_dialog = TaskDialog("Sheet Generator")
-post_editor_dialog.MainInstruction = "Choose what to do next."
-post_editor_dialog.MainContent = "You can continue with sheet creation or stop after applying tags/text in the current view."
-post_editor_dialog.AddCommandLink(
-    TaskDialogCommandLinkId.CommandLink1,
-    "Proceed with sheet creation (duplicate view + create sheet + place schedules)",
-)
-post_editor_dialog.AddCommandLink(
-    TaskDialogCommandLinkId.CommandLink2,
-    "Only place tags/text in current view and stop (no sheet)",
-)
-post_editor_dialog.CommonButtons = TaskDialogCommonButtons.Cancel
-post_editor_choice = post_editor_dialog.Show()
-proceed_with_sheet_creation = post_editor_choice == TaskDialogResult.CommandLink1
 
-text_note_display = (result.get("TextNote") or "").strip()
-code_norm = normalize_code(text_note_display)
-if not code_norm:
-    MessageBox.Show("Enter a valid prefab code such as 5.5.5.", "Invalid Prefab Code")
-    sys.exit("Invalid prefab code")
+def tag_pipes_in_view(view, pipes, action="add_missing", source_view=None):
+    """
+    action:
+      - add_missing: add tags where missing
+      - remove_all: remove all tags
+      - sync_from_source: if source has tag -> ensure present in view, else remove
+    """
+    if source_view is None:
+        source_view = view
+    resolved, _ = resolve_required_tag_symbols(doc)
+    sym_aco = resolved.get("ACO_PIPE")
+    sym_vert = resolved.get("VERT_ARROW")
+    missing_types = set()
+    failures = []
+    occupied_nonvert_heads = []
+    nonvertical_adjusted = 0
+    vertical_preserved = 0
+    with Transaction(doc, "Tag pipes in view") as t:
+        t.Start()
+        for p in pipes:
+            if (
+                not p
+                or not p.Category
+                or p.Category.Id.IntegerValue != int(BuiltInCategory.OST_PipeCurves)
+            ):
+                continue
+            existing = find_pipe_tags_for_host_in_view(doc, view.Id, p.Id)
+            source_has = bool(find_pipe_tag_in_view(source_view, p.Id))
 
-baseCode = code_norm
-for eData in result["Elements"]:
-    if eData["Category"] == "Pipe Fittings":
-        eData["NewCode"] = baseCode
+            do_add = False
+            do_remove = False
+            if action == "remove_all":
+                do_remove = True
+            elif action == "add_missing":
+                do_add = True
+            elif action == "sync_from_source":
+                do_add = source_has
+                do_remove = not source_has
 
-# --- Renumber Pipes based on region order (sorted left-to-right, bottom-to-up) ---
-if not result.get("TextNotePlaced", False):
-    base = code_norm
+            if do_remove and existing:
+                for tdel in existing:
+                    doc.Delete(tdel.Id)
+                existing = []
+            if do_add and existing:
+                continue
+            if not do_add:
+                continue
 
-    pipe_entries = []
-    for idx, eData in enumerate(result["Elements"]):
-        if eData["Category"] == "Pipes":
-            elem = doc.GetElement(ElementId(int(str(eData["Id"]))))
-            if elem:
-                bbox = elem.get_BoundingBox(uidoc.ActiveView)
-                if bbox:
-                    center = XYZ(
-                        (bbox.Min.X + bbox.Max.X) / 2.0,
-                        (bbox.Min.Y + bbox.Max.Y) / 2.0,
-                        (bbox.Min.Z + bbox.Max.Z) / 2.0,
+            is_vert = is_vertical_pipe(p)
+            if is_vert:
+                symbol_id = sym_vert.Id if sym_vert else None
+                use_leader = bool(TAGCFG_VERD.get("leader", False))
+                use_offset_mm = TAGCFG_VERD.get("offset_mm", 0)
+            else:
+                symbol_id = sym_aco.Id if sym_aco else None
+                use_leader = bool(TAGCFG_ACO.get("leader", True))
+                use_offset_mm = TAGCFG_ACO.get(
+                    "offset_mm", SAFE_CFG.get("tag_offset_mm", 250)
+                )
+            if symbol_id is None:
+                if is_vertical_pipe(p):
+                    fam, typ = TAG_CFG["VERT_ARROW"]
+                else:
+                    fam, typ = TAG_CFG["ACO_PIPE"]
+                missing_types.add("{} - {}".format(fam, typ))
+                continue
+
+            try:
+                pt = _midpoint_or_center(p, view)
+                tag = IndependentTag.Create(
+                    doc,
+                    view.Id,
+                    Reference(p),
+                    use_leader,
+                    TagMode.TM_ADDBY_CATEGORY,
+                    TagOrientation.Horizontal,
+                    pt,
+                )
+                tag.ChangeTypeId(symbol_id)
+                if use_leader:
+                    try:
+                        tag.HasLeader = True
+                    except Exception:
+                        pass
+                if is_vert:
+                    vertical_preserved += 1
+                elif use_offset_mm and use_offset_mm > 0:
+                    head_pt = choose_plan_tag_head(
+                        p, view, pt, max(300, use_offset_mm), occupied_nonvert_heads
                     )
-                    pipe_entries.append((idx, center))
-    pipe_entries.sort(key=lambda x: (x[1].X, x[1].Y))
+                    try:
+                        tag.TagHeadPosition = head_pt
+                        occupied_nonvert_heads.append(head_pt)
+                        nonvertical_adjusted += 1
+                    except Exception:
+                        pass
+            except Exception:
+                failures.append(p.Id.IntegerValue)
+        doc.Regenerate()
+        t.Commit()
+    print("FLOOR PLAN -> nonvertical tags adjusted:", nonvertical_adjusted)
+    print("FLOOR PLAN -> vertical tags preserved:", vertical_preserved)
+    return missing_types, failures
 
-    ctr = 1
-    for i, _ in pipe_entries:
-        result["Elements"][i]["NewCode"] = base + "." + str(ctr)
-        ctr += 1
 
-    for eData in result["Elements"]:
-        if eData["Category"] == "Pipe Fittings":
-            eData["NewCode"] = base
-
-# --- Update the elements' "Comments" from the DataGridView ---
-t = Transaction(doc, "Update Comments")
-try:
-    t.Start()
-    for eData in result["Elements"]:
-        id_val = eData.get("Id")
+def get_untagged_pipes_in_view(doc, view):
+    pipes = list(
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeCurves)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    tagged = set()
+    for t in (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    ):
         try:
-            eid = int(str(id_val))
-        except (TypeError, ValueError):
+            if hasattr(t, "GetTaggedElementIds"):
+                for rid in t.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    tagged.add(hid.IntegerValue)
+            elif hasattr(t, "TaggedElementId") and t.TaggedElementId:
+                tagged.add(t.TaggedElementId.IntegerValue)
+        except:
+            pass
+    return [p for p in pipes if p.Id.IntegerValue not in tagged]
+
+
+def auto_tag_pipes_in_view(doc, view, use_leader=False, tag_aco=None, tag_vert=None):
+    untagged = get_untagged_pipes_in_view(doc, view)
+    if not untagged:
+        return 0
+    if tag_aco is not None:
+        _RESOLVED_TAG_SYMBOLS["PIPE_DEFAULT"] = tag_aco
+    if tag_vert is not None:
+        _RESOLVED_TAG_SYMBOLS["PIPE_VERTICAL"] = tag_vert
+    missing, failures = tag_pipes_in_view(
+        view, untagged, action="add_missing", source_view=view
+    )
+    if missing:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Could not find required tag types:\n- {}".format(
+                "\n- ".join(sorted(missing))
+            ),
+        )
+    return max(0, len(untagged) - len(failures))
+
+
+def ensure_prefab_text_note_in_view(view, polygon, text_value):
+    if not text_value:
+        return
+    pminx, pminy, _, _ = polygon_bounds_xy(polygon)
+    note_pt = XYZ(pminx + XY_PAD, pminy + XY_PAD, 0)
+    prefab_re = re.compile(r"\d+(?:\.\d+)+")
+    notes = (
+        FilteredElementCollector(doc, view.Id)
+        .OfClass(TextNote)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    target = None
+    for n in notes:
+        try:
+            txt = n.Text or ""
+            p = n.Coord
+            if prefab_re.search(txt) and is_point_inside_polygon(
+                XYZ(p.X, p.Y, 0), polygon
+            ):
+                target = n
+                break
+        except Exception:
             continue
 
+    with Transaction(doc, "Ensure Prefab Text Note") as t:
+        t.Start()
+        if target:
+            target.Text = text_value
+        else:
+            nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+            if nt:
+                TextNote.Create(
+                    doc, view.Id, note_pt, text_value, TextNoteOptions(nt.Id)
+                )
+        t.Commit()
+
+
+def count_pipe_tags_in_view(doc, view):
+    try:
+        return (
+            FilteredElementCollector(doc, view.Id)
+            .OfCategory(BuiltInCategory.OST_PipeTags)
+            .WhereElementIsNotElementType()
+            .GetElementCount()
+        )
+    except Exception:
+        return -1
+
+
+def count_pipe_tags_for_scanned_pipes(doc, view, scanned_pipe_ids):
+    return len(get_pipe_tag_ids_for_hosts_in_view(doc, view, set(scanned_pipe_ids)))
+
+
+def get_existing_pipe_tagged_host_ids_in_view(doc, view):
+    host_ids = set()
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            if hasattr(tag, "GetTaggedElementIds"):
+                ids = tag.GetTaggedElementIds()
+                for rid in ids:
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid:
+                        host_ids.add(hid.IntegerValue)
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                host_ids.add(tag.TaggedElementId.IntegerValue)
+        except Exception:
+            continue
+    return host_ids
+
+
+def get_pipe_tags_for_hosts_in_view(doc, view, host_id_set):
+    result = []
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            tagged_match = False
+            if hasattr(tag, "GetTaggedElementIds"):
+                ids = tag.GetTaggedElementIds()
+                for rid in ids:
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue in host_id_set:
+                        tagged_match = True
+                        break
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue in host_id_set:
+                    tagged_match = True
+            if tagged_match:
+                result.append(tag)
+        except Exception:
+            continue
+    return result
+
+
+def collect_pipe_tags_by_host(view, scanned_pipe_ids):
+    by_host = {}
+    tags = get_pipe_tags_for_hosts_in_view(doc, view, set(scanned_pipe_ids))
+    for tag in tags:
+        host_ids = []
+        try:
+            if hasattr(tag, "GetTaggedElementIds"):
+                for rid in tag.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue in scanned_pipe_ids:
+                        host_ids.append(hid.IntegerValue)
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue in scanned_pipe_ids:
+                    host_ids.append(tag.TaggedElementId.IntegerValue)
+        except Exception:
+            host_ids = []
+        for hid in host_ids:
+            by_host.setdefault(hid, []).append(tag)
+    return by_host
+
+
+def resolve_pipe_tag_kind(pipe):
+    return "VERT_ARROW" if is_vertical_pipe(pipe) else "ACO_PIPE"
+
+
+def tag_matches_kind(tag, desired_kind):
+    try:
+        tag_type = doc.GetElement(tag.GetTypeId())
+        fam = tag_type.Family.Name if tag_type and tag_type.Family else ""
+        typ = get_symbol_type_name(tag_type) if tag_type else ""
+    except Exception:
+        return False
+    fam_n = _norm(fam)
+    typ_n = _norm(typ)
+    if desired_kind == "VERT_ARROW":
+        return fam_n == _norm(TAGCFG_VERD["family"]) and typ_n == _norm(
+            TAGCFG_VERD["type"]
+        )
+    preferred = [
+        _norm(TAGCFG_ACO["type"]),
+        _norm("TypeMark + DN + ø"),
+        _norm("DN + Length"),
+    ]
+    return fam_n == _norm(TAGCFG_ACO["family"]) and typ_n in preferred
+
+
+def get_pipe_tag_ids_for_hosts_in_view(doc, view, host_id_set):
+    ids = []
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            matched = False
+            if hasattr(tag, "GetTaggedElementIds"):
+                for rid in tag.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue in host_id_set:
+                        matched = True
+                        break
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue in host_id_set:
+                    matched = True
+            if matched:
+                ids.append(tag.Id.IntegerValue)
+        except Exception:
+            continue
+    return ids
+
+
+def get_pipe_tag_for_host_in_view(doc, view, host_id):
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            if hasattr(tag, "GetTaggedElementIds"):
+                for rid in tag.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue == host_id.IntegerValue:
+                        return tag
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue == host_id.IntegerValue:
+                    return tag
+        except Exception:
+            continue
+    return None
+
+
+def find_specific_tag_on_host_in_view(doc, view, host_id, family_name, type_name=None):
+    tags = find_pipe_tags_for_host_in_view(doc, view.Id, host_id)
+    fam_n = _norm(family_name)
+    typ_n = _norm(type_name) if type_name else ""
+    for tag in tags:
+        try:
+            tag_type = doc.GetElement(tag.GetTypeId())
+            fam = tag_type.Family.Name if tag_type and tag_type.Family else ""
+            typ = get_symbol_type_name(tag_type) if tag_type else ""
+            if _norm(fam) != fam_n:
+                continue
+            if type_name and _norm(typ) != typ_n:
+                continue
+            return tag
+        except Exception:
+            continue
+    return None
+
+
+def count_specific_pipe_tags_in_view(doc, view, family_name, type_name=None):
+    count = 0
+    for tag in (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    ):
+        try:
+            tag_type = doc.GetElement(tag.GetTypeId())
+            fam = tag_type.Family.Name if tag_type and tag_type.Family else ""
+            typ = get_symbol_type_name(tag_type) if tag_type else ""
+            if _norm(fam) != _norm(family_name):
+                continue
+            if type_name and _norm(typ) != _norm(type_name):
+                continue
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def create_sheet_safe_plan_from_scanned_view(doc, source_view, desired_name):
+    last_error = None
+    source_tag_count = count_pipe_tags_in_view(doc, source_view)
+    source_tagged_host_ids = get_existing_pipe_tagged_host_ids_in_view(doc, source_view)
+    source_extra_tag_count = count_specific_pipe_tags_in_view(
+        doc, source_view, TAGCFG_EXTRA_H["family"], TAGCFG_EXTRA_H["type"]
+    )
+    with Transaction(doc, "Create sheet-safe plan clone") as t:
+        t.Start()
+        new_view = None
+        for opt in [ViewDuplicateOption.WithDetailing, ViewDuplicateOption.Duplicate]:
+            try:
+                new_id = source_view.Duplicate(opt)
+                new_view = doc.GetElement(new_id)
+                break
+            except Exception as ex:
+                last_error = ex
+                new_view = None
+        if new_view is None:
+            t.RollBack()
+            raise Exception(
+                "Failed to clone scanned source view for sheet: {}".format(last_error)
+            )
+
+        try:
+            new_view.ViewTemplateId = ElementId.InvalidElementId
+        except Exception:
+            pass
+        try:
+            new_view.Scale = source_view.Scale
+        except Exception:
+            pass
+        try:
+            new_view.CropBoxActive = source_view.CropBoxActive
+            new_view.CropBoxVisible = source_view.CropBoxVisible
+            new_view.CropBox = source_view.CropBox
+        except Exception:
+            pass
+        if desired_name:
+            try:
+                new_view.Name = desired_name
+            except Exception:
+                try:
+                    new_view.Name = "{} ({})".format(
+                        desired_name, new_view.Id.IntegerValue
+                    )
+                except Exception:
+                    pass
+        source_tag_ids = [
+            tag.Id
+            for tag in (
+                FilteredElementCollector(doc, source_view.Id)
+                .OfCategory(BuiltInCategory.OST_PipeTags)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+        ]
+        source_text_note_ids = [
+            note.Id
+            for note in (
+                FilteredElementCollector(doc, source_view.Id)
+                .OfClass(TextNote)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+        ]
+        copied_text_count = 0
+        copied_text_ids = []
+        clone_tag_count_pre = count_pipe_tags_in_view(doc, new_view)
+        clone_scanned_tag_count_pre = count_pipe_tags_for_scanned_pipes(
+            doc, new_view, source_tagged_host_ids
+        )
+        clone_text_count_pre = (
+            FilteredElementCollector(doc, new_view.Id)
+            .OfClass(TextNote)
+            .WhereElementIsNotElementType()
+            .GetElementCount()
+        )
+        print(
+            "PLAN CLONE -> source floor plan tag count before clone:", source_tag_count
+        )
+        print(
+            "PLAN CLONE -> clone floor plan tag count after clone:", clone_tag_count_pre
+        )
+        print(
+            "PLAN CLONE -> clone scanned pipe tag count after clone:",
+            clone_scanned_tag_count_pre,
+        )
+        if source_tag_ids and clone_tag_count_pre < len(source_tag_ids):
+            try:
+                ElementTransformUtils.CopyElements(
+                    source_view,
+                    List[ElementId](source_tag_ids),
+                    new_view,
+                    Transform.Identity,
+                    CopyPasteOptions(),
+                )
+            except Exception as ex:
+                print("PLAN CLONE -> tag copy fallback/skip:", ex)
+        if source_text_note_ids and clone_text_count_pre < len(source_text_note_ids):
+            try:
+                new_ids = ElementTransformUtils.CopyElements(
+                    source_view,
+                    List[ElementId](source_text_note_ids),
+                    new_view,
+                    Transform.Identity,
+                    CopyPasteOptions(),
+                )
+                copied_text_count = len(source_text_note_ids)
+                copied_text_ids = [x.IntegerValue for x in new_ids] if new_ids else []
+            except Exception as ex:
+                print("PLAN CLONE -> text note copy fallback/skip:", ex)
+        t.Commit()
+    clone_tag_count = count_pipe_tags_in_view(doc, new_view)
+    clone_scanned_tag_count = count_pipe_tags_for_scanned_pipes(
+        doc, new_view, source_tagged_host_ids
+    )
+    clone_extra_tag_count = count_specific_pipe_tags_in_view(
+        doc, new_view, TAGCFG_EXTRA_H["family"], TAGCFG_EXTRA_H["type"]
+    )
+    print("PLAN CLONE -> source view:", source_view.Name, source_view.Id.IntegerValue)
+    print("PLAN CLONE -> clone view:", new_view.Name, new_view.Id.IntegerValue)
+    print("PLAN CLONE -> pipe tags in source:", source_tag_count)
+    print(
+        "PLAN CLONE -> clone floor plan tag count after explicit copy pass:",
+        clone_tag_count,
+    )
+    print(
+        "PLAN CLONE -> clone scanned pipe tag count after explicit copy pass:",
+        clone_scanned_tag_count,
+    )
+    print("PLAN CLONE -> extra horizontal tags in source:", source_extra_tag_count)
+    print("PLAN CLONE -> extra horizontal tags in clone:", clone_extra_tag_count)
+    print("PLAN CLONE -> prefab text note ids copied:", copied_text_ids)
+    return new_view
+
+
+def build_scanned_bbox(doc, elems, pad_xy_mm=400.0, pad_z_mm=400.0):
+    mins = []
+    maxs = []
+    for elem in elems:
+        if not elem:
+            continue
+        try:
+            bb = elem.get_BoundingBox(None)
+        except Exception:
+            bb = None
+        if not bb:
+            continue
+        mins.append(bb.Min)
+        maxs.append(bb.Max)
+    if not mins or not maxs:
+        return None
+    pad_xy = mm_to_ft(pad_xy_mm)
+    pad_z = mm_to_ft(pad_z_mm)
+    min_x = min(p.X for p in mins) - pad_xy
+    min_y = min(p.Y for p in mins) - pad_xy
+    min_z = min(p.Z for p in mins) - pad_z
+    max_x = max(p.X for p in maxs) + pad_xy
+    max_y = max(p.Y for p in maxs) + pad_xy
+    max_z = max(p.Z for p in maxs) + pad_z
+    bb = BoundingBoxXYZ()
+    bb.Min = XYZ(min_x, min_y, min_z)
+    bb.Max = XYZ(max_x, max_y, max_z)
+    return bb
+
+
+def get_3d_view_family_type(doc):
+    for vft in FilteredElementCollector(doc).OfClass(ViewFamilyType):
+        try:
+            if vft.ViewFamily == ViewFamily.ThreeDimensional:
+                return vft
+        except Exception:
+            continue
+    return None
+
+
+def get_prefab_3d_elements(scanned_elems):
+    filtered_scanned_pipes = []
+    filtered_scanned_fittings = []
+    excluded_nlrs = 0
+    for elem in scanned_elems:
+        if not elem or not elem.Category:
+            continue
+        if is_excluded_nlrs_pipe(elem):
+            excluded_nlrs += 1
+            continue
+        cat_id = elem.Category.Id.IntegerValue
+        if cat_id == int(BuiltInCategory.OST_PipeCurves):
+            filtered_scanned_pipes.append(elem)
+        elif cat_id == int(BuiltInCategory.OST_PipeFitting):
+            filtered_scanned_fittings.append(elem)
+    three_d_source_elems = filtered_scanned_pipes + filtered_scanned_fittings
+    print("3D SOURCE -> pipes used:", len(filtered_scanned_pipes))
+    print("3D SOURCE -> fittings used:", len(filtered_scanned_fittings))
+    print("3D SOURCE -> total used:", len(three_d_source_elems))
+    return (
+        three_d_source_elems,
+        filtered_scanned_pipes,
+        filtered_scanned_fittings,
+        excluded_nlrs,
+    )
+
+
+def hide_irrelevant_3d_content(view3d, relevant_ids):
+    hidden_cats = []
+    hidden_link_count = 0
+    allowed_ids = set(
+        [
+            int(BuiltInCategory.OST_PipeCurves),
+            int(BuiltInCategory.OST_PipeFitting),
+            int(BuiltInCategory.OST_TextNotes),
+            int(BuiltInCategory.OST_PipeTags),
+        ]
+    )
+    for cat in doc.Settings.Categories:
+        try:
+            if not cat or not view3d.CanCategoryBeHidden(cat.Id):
+                continue
+            if cat.Id.IntegerValue in allowed_ids:
+                continue
+            nm = cat.Name or ""
+            view3d.SetCategoryHidden(cat.Id, True)
+            hidden_cats.append(nm)
+        except Exception:
+            continue
+    try:
+        for cat_id in [BuiltInCategory.OST_RvtLinks]:
+            cat = Category.GetCategory(doc, cat_id)
+            if cat and view3d.CanCategoryBeHidden(cat.Id):
+                view3d.SetCategoryHidden(cat.Id, True)
+                hidden_cats.append(cat.Name)
+    except Exception:
+        pass
+    try:
+        link_ids = List[ElementId]()
+        for link_inst in (
+            FilteredElementCollector(doc).OfClass(RevitLinkInstance).ToElements()
+        ):
+            link_ids.Add(link_inst.Id)
+        if link_ids.Count > 0:
+            view3d.HideElements(link_ids)
+            hidden_link_count = link_ids.Count
+    except Exception:
+        hidden_link_count = 0
+    return hidden_cats, hidden_link_count
+
+
+def get_connected_prefab_components(elems):
+    ids = set(e.Id.IntegerValue for e in elems if e is not None)
+    by_id = {e.Id.IntegerValue: e for e in elems if e is not None}
+    graph = dict((eid, set()) for eid in ids)
+    for elem in elems:
+        if not elem:
+            continue
+        eid = elem.Id.IntegerValue
+        for c in get_pipe_connectors(elem):
+            try:
+                for ref in c.AllRefs:
+                    owner = ref.Owner
+                    if not owner:
+                        continue
+                    oid = owner.Id.IntegerValue
+                    if oid == eid:
+                        continue
+                    if oid in ids:
+                        graph[eid].add(oid)
+                        graph[oid].add(eid)
+            except Exception:
+                pass
+    seen = set()
+    components = []
+    for eid in sorted(graph.keys()):
+        if eid in seen:
+            continue
+        stack = [eid]
+        comp = []
+        seen.add(eid)
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nxt in sorted(graph.get(cur, [])):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        components.append(sorted(comp))
+    groups = [[by_id[eid] for eid in comp if eid in by_id] for comp in components]
+    print("3D EXPLODED -> connected groups:", len(components))
+    print("3D EXPLODED -> group sizes:", [len(c) for c in components])
+    return groups
+
+
+def create_prefab_3d_normal_view(doc, base_code, scanned_elems):
+    vft = get_3d_view_family_type(doc)
+    if vft is None:
+        raise Exception("No 3D ViewFamilyType found.")
+    relevant_elems, filtered_scanned_pipes, filtered_scanned_fittings, excluded_nlrs = (
+        get_prefab_3d_elements(scanned_elems)
+    )
+    section_box = build_scanned_bbox(doc, relevant_elems)
+    if section_box is None:
+        raise Exception("Could not compute scanned element extents for 3D view.")
+    pipe_count = len(filtered_scanned_pipes)
+    fitting_count = len(filtered_scanned_fittings)
+    with Transaction(doc, "Create 3D Normal View") as t:
+        t.Start()
+        view3d = View3D.CreateIsometric(doc, vft.Id)
+        try:
+            view3d.Name = "{} - 3D Normal".format(base_code)
+        except Exception:
+            view3d.Name = "{} - 3D Normal ({})".format(
+                base_code, view3d.Id.IntegerValue
+            )
+        view3d.IsSectionBoxActive = True
+        view3d.SetSectionBox(section_box)
+        try:
+            view3d.Scale = 50
+        except Exception:
+            pass
+        try:
+            view3d.DetailLevel = ViewDetailLevel.Fine
+        except Exception:
+            pass
+        try:
+            p = view3d.get_Parameter(BuiltInParameter.VIEW_DETAIL_LEVEL)
+            if p and not p.IsReadOnly:
+                p.Set(3)
+        except Exception:
+            pass
+        hidden_cats, hidden_link_count = hide_irrelevant_3d_content(
+            view3d, [e.Id for e in relevant_elems]
+        )
+        normal_locked = ensure_3d_view_locked(view3d)
+        t.Commit()
+    print("CREATED 3D NORMAL:", view3d.Name, view3d.Id.IntegerValue)
+    print("3D NORMAL -> locked:", normal_locked)
+    print(
+        "3D NORMAL -> IsLocked final:",
+        view3d.IsLocked if hasattr(view3d, "IsLocked") else "n/a",
+    )
+    print("3D NORMAL -> hidden categories:", ", ".join(hidden_cats))
+    print("3D NORMAL -> Revit links hidden:", hidden_link_count)
+    print("3D NORMAL -> scanned elements shown:", len(relevant_elems))
+    print("3D NORMAL -> excluded NLRS pipes:", excluded_nlrs)
+    print("3D NORMAL -> included pipes:", pipe_count)
+    print("3D NORMAL -> included fittings:", fitting_count)
+    print("3D NORMAL -> detail level forced to Fine")
+    print(
+        "3D NORMAL -> final visible categories limited to Pipes/Pipe Fittings/Annotations"
+    )
+    return view3d, pipe_count, fitting_count, excluded_nlrs, normal_locked
+
+
+def create_prefab_3d_exploded_view(doc, base_code, scanned_elems):
+    normal_like, _, _, _, _ = create_prefab_3d_normal_view(
+        doc, base_code, scanned_elems
+    )
+    with Transaction(doc, "Rename 3D Exploded View") as t:
+        t.Start()
+        try:
+            normal_like.Name = "{} - 3D Exploded".format(base_code)
+        except Exception:
+            normal_like.Name = "{} - 3D Exploded ({})".format(
+                base_code, normal_like.Id.IntegerValue
+            )
+        t.Commit()
+
+    displacement_mode = "fallback"
+    disp_set_count = 0
+    displaced_count = 0
+    avg_offset_mm = 0.0
+    relevant_elems, filtered_scanned_pipes, filtered_scanned_fittings, excluded_nlrs = (
+        get_prefab_3d_elements(scanned_elems)
+    )
+    pipe_count = len(filtered_scanned_pipes)
+    fitting_count = len(filtered_scanned_fittings)
+    displaced_pipe_count = 0
+    displaced_fitting_count = 0
+
+    groups = get_connected_prefab_components(relevant_elems)
+    group_count = len(groups)
+    try:
+        with Transaction(doc, "Explode 3D View") as t:
+            t.Start()
+            vectors = []
+            elem_vector_map = {}
+            for i, group in enumerate(groups):
+                row = i // 3
+                col = i % 3
+                vec = XYZ(
+                    mm_to_ft((col + 1) * 3500.0),
+                    -mm_to_ft((row + 1) * 2200.0),
+                    0,
+                )
+                eid_list = List[ElementId]([e.Id for e in group])
+                if eid_list.Count == 0:
+                    continue
+                DisplacementElement.Create(doc, eid_list, vec, normal_like, None)
+                vectors.append(vec)
+                disp_set_count += 1
+                displaced_count += eid_list.Count
+                for elem in group:
+                    elem_vector_map[elem.Id.IntegerValue] = vec
+                    if elem.Category.Id.IntegerValue == int(
+                        BuiltInCategory.OST_PipeCurves
+                    ):
+                        displaced_pipe_count += 1
+                    elif elem.Category.Id.IntegerValue == int(
+                        BuiltInCategory.OST_PipeFitting
+                    ):
+                        displaced_fitting_count += 1
+            if vectors:
+                avg_offset_mm = sum(
+                    math.sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z) * 304.8
+                    for v in vectors
+                ) / float(len(vectors))
+            t.Commit()
+        displacement_mode = "displacement"
+        _EXPLODED_VIEW_VECTORS[normal_like.Id.IntegerValue] = elem_vector_map
+    except Exception as ex:
+        print("3D EXPLODED -> displacement fallback used:", ex)
+        displacement_mode = "fallback"
+        _EXPLODED_VIEW_VECTORS[normal_like.Id.IntegerValue] = {}
+
+    with Transaction(doc, "Lock 3D Exploded View") as t_lock:
+        t_lock.Start()
+        exploded_locked = ensure_3d_view_locked(normal_like)
+        t_lock.Commit()
+
+    print("CREATED 3D EXPLODED:", normal_like.Name, normal_like.Id.IntegerValue)
+    print("3D EXPLODED -> locked:", exploded_locked)
+    print(
+        "3D EXPLODED -> IsLocked final:",
+        normal_like.IsLocked if hasattr(normal_like, "IsLocked") else "n/a",
+    )
+    print("3D EXPLODED -> included pipes:", pipe_count)
+    print("3D EXPLODED -> included fittings:", fitting_count)
+    print("3D EXPLODED -> excluded NLRS pipes:", excluded_nlrs)
+    print("3D EXPLODED -> connected groups:", group_count)
+    print("3D EXPLODED -> mode:", displacement_mode)
+    print("3D EXPLODED -> displacement sets created:", disp_set_count)
+    print("3D EXPLODED -> elements displaced:", displaced_count)
+    print("3D EXPLODED -> displaced pipes:", displaced_pipe_count)
+    print("3D EXPLODED -> displaced fittings:", displaced_fitting_count)
+    print("3D EXPLODED -> average offset magnitude mm:", round(avg_offset_mm, 1))
+    print("3D EXPLODED -> detail level forced to Fine")
+    print(
+        "3D EXPLODED -> final visible categories limited to Pipes/Pipe Fittings/Annotations"
+    )
+    print("3D EXPLODED -> displacement vectors assigned:", len(groups))
+    return (
+        normal_like,
+        displacement_mode,
+        pipe_count,
+        fitting_count,
+        group_count,
+        excluded_nlrs,
+        exploded_locked,
+    )
+
+
+def build_pipe_label(pipe, code_map):
+    code = code_map.get(pipe.Id.IntegerValue, "")
+    dia = convert_param_to_string(pipe.LookupParameter("Outside Diameter"))
+    if not dia:
+        dia = convert_param_to_string(pipe.LookupParameter("Diameter"))
+    length = convert_param_to_string(pipe.LookupParameter("Length"))
+    dia = (dia or "-").replace(" mm", "").strip()
+    length = (length or "-").replace(" mm", "").strip()
+    prefix = "{} ".format(code) if code else ""
+    return "{}{} / L={}".format(prefix, dia, length)
+
+
+def get_param_text(elem, names):
+    for name in names:
+        try:
+            p = elem.LookupParameter(name)
+            if p:
+                sval = p.AsString() if p.StorageType == StorageType.String else None
+                if sval:
+                    return sval
+                v = p.AsValueString()
+                if v:
+                    return v
+        except Exception:
+            pass
+        try:
+            typ = doc.GetElement(elem.GetTypeId())
+            if typ:
+                p = typ.LookupParameter(name)
+                if p:
+                    sval = p.AsString() if p.StorageType == StorageType.String else None
+                    if sval:
+                        return sval
+                    v = p.AsValueString()
+                    if v:
+                        return v
+        except Exception:
+            pass
+    return ""
+
+
+def build_regular_pipe_3d_text(pipe, code_map):
+    return build_pipe_label(pipe, code_map)
+
+
+def build_vertical_pipe_3d_text(pipe, code_map):
+    dia = convert_param_to_string(
+        pipe.LookupParameter("Outside Diameter")
+    ) or convert_param_to_string(pipe.LookupParameter("Diameter"))
+    dia = (dia or "-").replace(" mm", "").strip()
+    sys_txt = get_param_text(pipe, ["System Abbreviation", "System Name", "Comments"])
+    prefix = (sys_txt or "").strip().split(" ")[0]
+    if prefix:
+        return "{} ø{}".format(prefix, dia)
+    return "ø{}".format(dia)
+
+
+def build_extra_horizontal_3d_text(pipe, code_map):
+    dia = convert_param_to_string(
+        pipe.LookupParameter("Outside Diameter")
+    ) or convert_param_to_string(pipe.LookupParameter("Diameter"))
+    dia = (dia or "-").replace(" mm", "").strip()
+    sys_txt = get_param_text(pipe, ["System Abbreviation", "System Name", "Comments"])
+    elev_txt = get_param_text(
+        pipe,
+        [
+            "Bottom Elevation",
+            "Lower End Bottom Elevation",
+            "Middle Elevation",
+            "Offset",
+            "Reference Level",
+        ],
+    )
+    line1 = "{} ø{}".format((sys_txt or "-").strip().split(" ")[0], dia)
+    line2 = "bb={}".format((elev_txt or "-").strip())
+    return "{}\n{}".format(line1, line2)
+
+
+def get_regular_pipe_tag_text(pipe, code_map):
+    return build_regular_pipe_3d_text(pipe, code_map)
+
+
+def get_vertical_pipe_tag_text(pipe, code_map):
+    return build_vertical_pipe_3d_text(pipe, code_map)
+
+
+def get_extra_horizontal_tag_text(pipe, code_map):
+    return build_extra_horizontal_3d_text(pipe, code_map)
+
+
+def try_lock_3d_view_for_tagging(view3d):
+    try:
+        if hasattr(view3d, "SaveOrientationAndLock"):
+            view3d.SaveOrientationAndLock()
+            return True
+    except Exception as ex:
+        debug("3D LOCK -> SaveOrientationAndLock failed: {}".format(ex))
+    try:
+        if hasattr(view3d, "IsLocked") and view3d.IsLocked:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def ensure_3d_view_locked(view3d):
+    try:
+        if hasattr(view3d, "IsLocked"):
+            try:
+                if view3d.IsLocked:
+                    return True
+            except Exception:
+                pass
+        if hasattr(view3d, "SaveOrientationAndLock"):
+            view3d.SaveOrientationAndLock()
+            try:
+                if hasattr(view3d, "IsLocked"):
+                    return bool(view3d.IsLocked)
+            except Exception:
+                return True
+        try:
+            if hasattr(view3d, "IsLocked"):
+                return bool(view3d.IsLocked)
+        except Exception:
+            pass
+    except Exception as ex:
+        debug("3D LOCK failed for {}: {}".format(view3d.Name, ex))
+    return False
+
+
+def is_vertical_arrow_tag_type(tag_type_id):
+    try:
+        ts = doc.GetElement(tag_type_id)
+        if not ts:
+            return False
+        fam = ""
+        typ = ""
+        try:
+            fam = ts.FamilyName or ""
+        except Exception:
+            try:
+                fam = ts.Family.Name or ""
+            except Exception:
+                fam = ""
+        try:
+            typ = Element.Name.GetValue(ts) or ""
+        except Exception:
+            try:
+                typ = ts.Name or ""
+            except Exception:
+                typ = ""
+        fam = fam.strip().lower()
+        typ = typ.strip().lower()
+        return fam == "bvdk_verdiepingspijl" and typ == "van boven"
+    except Exception:
+        return False
+
+
+def create_3d_pipe_tag(
+    doc,
+    view3d,
+    host_elem,
+    tag_type_id,
+    head_pt,
+    elbow_pt=None,
+    end_pt=None,
+    use_leader=True,
+):
+    try:
+        ref = Reference(host_elem)
+        tag = IndependentTag.Create(
+            doc,
+            view3d.Id,
+            ref,
+            use_leader,
+            TagMode.TM_ADDBY_CATEGORY,
+            TagOrientation.Horizontal,
+            head_pt,
+        )
+        if tag_type_id and tag.GetTypeId().IntegerValue != tag_type_id.IntegerValue:
+            tag.ChangeTypeId(tag_type_id)
+        try:
+            tag.HasLeader = bool(use_leader)
+        except Exception:
+            pass
+        if elbow_pt is not None:
+            try:
+                tag.LeaderElbow = elbow_pt
+            except Exception:
+                try:
+                    tag.SetLeaderElbow(ref, elbow_pt)
+                except Exception:
+                    pass
+        if end_pt is not None:
+            try:
+                tag.TagHeadPosition = head_pt
+            except Exception:
+                pass
+            try:
+                tag.SetLeaderEnd(ref, end_pt)
+            except Exception:
+                pass
+        return tag
+    except Exception as ex:
+        debug("3D TAG CREATE failed for {}: {}".format(host_elem.Id.IntegerValue, ex))
+        return None
+
+
+def _normalize_vec(vec):
+    try:
+        mag = math.sqrt(vec.X * vec.X + vec.Y * vec.Y + vec.Z * vec.Z)
+        if mag < 1e-9:
+            return XYZ(1, 0, 0)
+        return XYZ(vec.X / mag, vec.Y / mag, vec.Z / mag)
+    except Exception:
+        return XYZ(1, 0, 0)
+
+
+def get_exploded_callout_points(view3d, elem, base_mm=600, up_mm=250):
+    anchor_pt = _midpoint_or_center(elem, view3d)
+    vec = _EXPLODED_VIEW_VECTORS.get(view3d.Id.IntegerValue, {}).get(
+        elem.Id.IntegerValue, XYZ(1, 0, 0)
+    )
+    dir_vec = _normalize_vec(vec)
+    head_pt = XYZ(
+        anchor_pt.X + dir_vec.X * mm_to_ft(base_mm),
+        anchor_pt.Y + dir_vec.Y * mm_to_ft(base_mm) + mm_to_ft(up_mm),
+        anchor_pt.Z + dir_vec.Z * mm_to_ft(base_mm),
+    )
+    elbow_pt = XYZ(
+        anchor_pt.X + dir_vec.X * mm_to_ft(250),
+        anchor_pt.Y + dir_vec.Y * mm_to_ft(250),
+        anchor_pt.Z + dir_vec.Z * mm_to_ft(250),
+    )
+    return anchor_pt, head_pt, elbow_pt
+
+
+def get_close_3d_tag_head(anchor_pt, dir_vec=None, is_vertical=False, is_extra=False):
+    if dir_vec is None:
+        dir_vec = XYZ(1, 0, 0)
+    mag = math.sqrt(
+        dir_vec.X * dir_vec.X + dir_vec.Y * dir_vec.Y + dir_vec.Z * dir_vec.Z
+    )
+    if mag < 1e-9:
+        dir_vec = XYZ(1, 0, 0)
+    else:
+        dir_vec = XYZ(dir_vec.X / mag, dir_vec.Y / mag, dir_vec.Z / mag)
+    if is_vertical:
+        return XYZ(
+            anchor_pt.X + mm_to_ft(180), anchor_pt.Y + mm_to_ft(120), anchor_pt.Z
+        )
+    if is_extra:
+        return XYZ(
+            anchor_pt.X + mm_to_ft(260), anchor_pt.Y + mm_to_ft(160), anchor_pt.Z
+        )
+    return XYZ(anchor_pt.X + mm_to_ft(300), anchor_pt.Y + mm_to_ft(180), anchor_pt.Z)
+
+
+def get_curve_based_close_offset(elem):
+    try:
+        loc = elem.Location
+        if loc and hasattr(loc, "Curve") and loc.Curve:
+            p0 = loc.Curve.GetEndPoint(0)
+            p1 = loc.Curve.GetEndPoint(1)
+            v = p1 - p0
+            mag = math.sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z)
+            if mag > 1e-9:
+                vx = v.X / mag
+                vy = v.Y / mag
+                vz = v.Z / mag
+                sx = -vy
+                sy = vx
+                if abs(vz) > 0.85:
+                    return XYZ(mm_to_ft(120), mm_to_ft(80), 0)
+                return XYZ(sx * mm_to_ft(180), sy * mm_to_ft(180), mm_to_ft(60))
+    except Exception:
+        pass
+    return XYZ(mm_to_ft(180), mm_to_ft(140), mm_to_ft(60))
+
+
+def get_vertical_pipe_anchor_pt(elem, view):
+    try:
+        loc = elem.Location
+        if loc and hasattr(loc, "Curve") and loc.Curve:
+            p0 = loc.Curve.GetEndPoint(0)
+            p1 = loc.Curve.GetEndPoint(1)
+            return p0 if p0.Z >= p1.Z else p1
+    except Exception:
+        pass
+    try:
+        bb = elem.get_BoundingBox(view)
+        if bb:
+            return XYZ(
+                (bb.Min.X + bb.Max.X) * 0.5, (bb.Min.Y + bb.Max.Y) * 0.5, bb.Max.Z
+            )
+    except Exception:
+        pass
+    return _midpoint_or_center(elem, view)
+
+
+def get_vertical_tag_head_pt(anchor_pt):
+    return XYZ(anchor_pt.X, anchor_pt.Y, anchor_pt.Z)
+
+
+def get_exploded_visible_anchor_pt(elem, view):
+    try:
+        bb = elem.get_BoundingBox(view)
+        if bb:
+            return XYZ(
+                (bb.Min.X + bb.Max.X) * 0.5,
+                (bb.Min.Y + bb.Max.Y) * 0.5,
+                (bb.Min.Z + bb.Max.Z) * 0.5,
+            )
+    except Exception:
+        pass
+    return _midpoint_or_center(elem, view)
+
+
+def get_exploded_tag_head_pt(
+    anchor_pt, elem, is_vertical_tag=False, is_extra_tag=False
+):
+    if is_vertical_tag:
+        return get_vertical_tag_head_pt(anchor_pt)
+    if is_extra_tag:
+        return get_exploded_extra_tag_head_pt(anchor_pt, elem)
+    return get_exploded_regular_tag_head_pt(anchor_pt, elem)
+
+
+def clamp_head_near_anchor(anchor_pt, head_pt, max_mm):
+    dx = head_pt.X - anchor_pt.X
+    dy = head_pt.Y - anchor_pt.Y
+    dz = head_pt.Z - anchor_pt.Z
+    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+    maxd = mm_to_ft(max_mm)
+    if dist <= maxd or dist < 1e-9:
+        return head_pt
+    s = maxd / dist
+    return XYZ(anchor_pt.X + dx * s, anchor_pt.Y + dy * s, anchor_pt.Z + dz * s)
+
+
+def get_curve_direction_xy(elem):
+    try:
+        loc = elem.Location
+        if loc and hasattr(loc, "Curve") and loc.Curve:
+            p0 = loc.Curve.GetEndPoint(0)
+            p1 = loc.Curve.GetEndPoint(1)
+            vx = p1.X - p0.X
+            vy = p1.Y - p0.Y
+            mag = math.sqrt(vx * vx + vy * vy)
+            if mag > 1e-9:
+                return XYZ(vx / mag, vy / mag, 0)
+    except Exception:
+        pass
+    return XYZ(1, 0, 0)
+
+
+def get_short_side_vector_xy(dir_xy):
+    return XYZ(-dir_xy.Y, dir_xy.X, 0)
+
+
+def get_exploded_regular_tag_points(elem, view):
+    anchor_pt = get_exploded_visible_anchor_pt(elem, view)
+    dir_xy = get_curve_direction_xy(elem)
+    side = get_short_side_vector_xy(dir_xy)
+    side_mm = 120.0
+    up_mm = 35.0
+    head_pt = XYZ(
+        anchor_pt.X + side.X * mm_to_ft(side_mm),
+        anchor_pt.Y + side.Y * mm_to_ft(side_mm),
+        anchor_pt.Z + mm_to_ft(up_mm),
+    )
+    return anchor_pt, head_pt
+
+
+def get_exploded_extra_tag_points(elem, view):
+    anchor_pt = get_exploded_visible_anchor_pt(elem, view)
+    try:
+        dir_xy = get_curve_direction_xy(elem)
+        side = get_short_side_vector_xy(dir_xy)
+    except Exception:
+        side = XYZ(1, 0, 0)
+    head_pt = XYZ(
+        anchor_pt.X + side.X * mm_to_ft(110.0),
+        anchor_pt.Y + side.Y * mm_to_ft(110.0),
+        anchor_pt.Z + mm_to_ft(30.0),
+    )
+    return anchor_pt, head_pt
+
+
+def get_exploded_regular_tag_head_pt(anchor_pt, elem):
+    dir_xy = get_curve_direction_xy(elem)
+    side = get_short_side_vector_xy(dir_xy)
+    return XYZ(
+        anchor_pt.X + side.X * mm_to_ft(120.0),
+        anchor_pt.Y + side.Y * mm_to_ft(120.0),
+        anchor_pt.Z + mm_to_ft(35.0),
+    )
+
+
+def get_exploded_extra_tag_head_pt(anchor_pt, elem):
+    try:
+        dir_xy = get_curve_direction_xy(elem)
+        side = get_short_side_vector_xy(dir_xy)
+    except Exception:
+        side = XYZ(1, 0, 0)
+    return XYZ(
+        anchor_pt.X + side.X * mm_to_ft(110.0),
+        anchor_pt.Y + side.Y * mm_to_ft(110.0),
+        anchor_pt.Z + mm_to_ft(30.0),
+    )
+
+
+def get_close_3d_tag_points(view3d, elem, is_vertical=False, is_extra=False):
+    anchor_pt = (
+        get_vertical_pipe_anchor_pt(elem, view3d)
+        if is_vertical
+        else _midpoint_or_center(elem, view3d)
+    )
+    dir_vec = _EXPLODED_VIEW_VECTORS.get(view3d.Id.IntegerValue, {}).get(
+        elem.Id.IntegerValue, XYZ(1, 0, 0)
+    )
+    if "Exploded" in view3d.Name:
+        if is_vertical:
+            head_pt = get_vertical_tag_head_pt(anchor_pt)
+            elbow_pt = anchor_pt
+            return anchor_pt, head_pt, elbow_pt
+        if is_extra:
+            head_pt = get_exploded_extra_tag_head_pt(anchor_pt, elem)
+            head_pt = clamp_head_near_anchor(anchor_pt, head_pt, 180.0)
+        else:
+            head_pt = get_exploded_regular_tag_head_pt(anchor_pt, elem)
+            head_pt = clamp_head_near_anchor(anchor_pt, head_pt, 220.0)
+    else:
+        head_pt = (
+            get_vertical_tag_head_pt(anchor_pt)
+            if is_vertical
+            else get_close_3d_tag_head(
+                anchor_pt, dir_vec=dir_vec, is_vertical=is_vertical, is_extra=is_extra
+            )
+        )
+    dir_vec = _normalize_vec(dir_vec)
+    elbow_pt = XYZ(
+        anchor_pt.X + dir_vec.X * mm_to_ft(120),
+        anchor_pt.Y + dir_vec.Y * mm_to_ft(120),
+        anchor_pt.Z + dir_vec.Z * mm_to_ft(120),
+    )
+    if is_vertical:
+        elbow_pt = anchor_pt
+    return anchor_pt, head_pt, elbow_pt
+
+
+def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
+    def rects_overlap(a, b):
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+    def bbox_rect(bb):
+        return (bb.Min.X, bb.Min.Y, bb.Max.X, bb.Max.Y)
+
+    def expand_rect(rect, mm):
+        pad = mm_to_ft(mm)
+        return (rect[0] - pad, rect[1] - pad, rect[2] + pad, rect[3] + pad)
+
+    def text_rect(pt):
+        return (
+            pt.X - mm_to_ft(80.0),
+            pt.Y - mm_to_ft(40.0),
+            pt.X + mm_to_ft(80.0),
+            pt.Y + mm_to_ft(40.0),
+        )
+
+    def fitting_groups_from_fittings(fits):
+        data = []
+        for fit in fits:
+            try:
+                bb = fit.get_BoundingBox(view3d)
+                if not bb:
+                    continue
+                ctr = XYZ(
+                    (bb.Min.X + bb.Max.X) * 0.5,
+                    (bb.Min.Y + bb.Max.Y) * 0.5,
+                    (bb.Min.Z + bb.Max.Z) * 0.5,
+                )
+                data.append((fit, bb, ctr))
+            except Exception:
+                continue
+        groups = []
+        used = set()
+        tol = mm_to_ft(80.0)
+        for fit, bb, ctr in data:
+            fid = fit.Id.IntegerValue
+            if fid in used:
+                continue
+            group = [(fit, bb, ctr)]
+            used.add(fid)
+            changed = True
+            while changed:
+                changed = False
+                for ofit, obb, octr in data:
+                    oid = ofit.Id.IntegerValue
+                    if oid in used:
+                        continue
+                    for _, gbb, gctr in group:
+                        dx = gctr.X - octr.X
+                        dy = gctr.Y - octr.Y
+                        dz = gctr.Z - octr.Z
+                        near_ctr = math.sqrt(dx * dx + dy * dy + dz * dz) <= tol
+                        near_bb = not (
+                            gbb.Max.X + tol < obb.Min.X
+                            or gbb.Min.X - tol > obb.Max.X
+                            or gbb.Max.Y + tol < obb.Min.Y
+                            or gbb.Min.Y - tol > obb.Max.Y
+                            or gbb.Max.Z + tol < obb.Min.Z
+                            or gbb.Min.Z - tol > obb.Max.Z
+                        )
+                        if near_ctr or near_bb:
+                            group.append((ofit, obb, octr))
+                            used.add(oid)
+                            changed = True
+                            break
+            groups.append(group)
+        groups.sort(
+            key=lambda grp: (
+                sum(x[2].X for x in grp) / float(len(grp)),
+                sum(x[2].Y for x in grp) / float(len(grp)),
+                min(x[0].Id.IntegerValue for x in grp),
+            )
+        )
+        return groups
+
+    attempted_tag_count = 0
+    successful_real_tag_count = 0
+    failed_real_tag_count = 0
+    excluded_nlrs_pipe_count = 0
+    vertical_tag_count = 0
+    regular_tag_count = 0
+    extra_tag_count = 0
+    sample_head_distances = []
+    text_count = 0
+    fitting_number_count = 0
+    displaced_vertical_tags = 0
+    exploded_vertical_tag_ids = []
+    occupied_pipe_label_rects = []
+    relevant_elems, pipes, fittings, excluded_nlrs_pipe_count = get_prefab_3d_elements(
+        scanned_elems
+    )
+    if not pipes and not fittings:
+        return {
+            "tags": 0,
+            "text": 0,
+            "mode": "none",
+            "excluded_nlrs": excluded_nlrs_pipe_count,
+            "attempted": 0,
+            "failed": 0,
+            "vertical_real": 0,
+            "regular_real": 0,
+            "extra_real": 0,
+            "sample_head_distances": [],
+        }
+
+    view_locked = False
+    try:
+        view_locked = bool(view3d.IsLocked) if hasattr(view3d, "IsLocked") else False
+    except Exception:
+        view_locked = False
+    print(
+        "3D EXPLODED -> view:",
+        view3d.Name,
+        view3d.Id.IntegerValue,
+        "locked:",
+        view_locked,
+    )
+
+    resolved, _ = resolve_required_tag_symbols(doc)
+    sym_regular = get_regular_pipe_tag_symbol(doc)
+    sym_vertical = resolved.get("VERT_ARROW")
+    sym_extra = resolved.get("EXTRA_HORIZONTAL")
+    extra_targets, _ = find_extra_horizontal_targets(pipes)
+    crop_rect = None
+    try:
+        if view3d.CropBoxActive and view3d.CropBox:
+            crop_rect = bbox_rect(view3d.CropBox)
+    except Exception:
+        crop_rect = None
+
+    with Transaction(doc, "Annotate Exploded 3D With Real Tags") as t:
+        t.Start()
+        nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+        print("ROLLBACK PATCH -> exploded pipe tags restored")
+
+        for pipe in pipes:
+            if is_vertical_pipe(pipe):
+                attempted_tag_count += 1
+                vertical_tag_count += 1
+                if (not view_locked) or sym_vertical is None:
+                    failed_real_tag_count += 1
+                    continue
+                try:
+                    bb = pipe.get_BoundingBox(view3d)
+                    anchor_pt = (
+                        XYZ(
+                            (bb.Min.X + bb.Max.X) * 0.5,
+                            (bb.Min.Y + bb.Max.Y) * 0.5,
+                            bb.Max.Z,
+                        )
+                        if bb
+                        else _midpoint_or_center(pipe, view3d)
+                    )
+                except Exception:
+                    anchor_pt = _midpoint_or_center(pipe, view3d)
+                head_pt = get_vertical_tag_head_pt(anchor_pt)
+                tag = create_3d_pipe_tag(
+                    doc,
+                    view3d,
+                    pipe,
+                    sym_vertical.Id,
+                    head_pt,
+                    elbow_pt=None,
+                    end_pt=None,
+                    use_leader=False,
+                )
+                if tag is None:
+                    failed_real_tag_count += 1
+                    continue
+                try:
+                    tag.HasLeader = False
+                except Exception:
+                    pass
+                try:
+                    tag.TagHeadPosition = head_pt
+                except Exception:
+                    pass
+                successful_real_tag_count += 1
+                displaced_vertical_tags += 1
+                try:
+                    exploded_vertical_tag_ids.append(tag.Id.IntegerValue)
+                except Exception:
+                    pass
+                print(
+                    "EXP PIPE TAG",
+                    pipe.Id.IntegerValue,
+                    "host:",
+                    anchor_pt,
+                    "text:",
+                    head_pt,
+                    "vertical:",
+                    True,
+                )
+                continue
+
+            labels = [
+                ("regular", sym_regular, get_regular_pipe_tag_text(pipe, code_map))
+            ]
+            regular_tag_count += 1
+            if pipe.Id.IntegerValue in extra_targets:
+                labels.append(
+                    ("extra", sym_extra, get_extra_horizontal_tag_text(pipe, code_map))
+                )
+                extra_tag_count += 1
+            for label_kind, sym, _label in labels:
+                attempted_tag_count += 1
+                if sym is None:
+                    failed_real_tag_count += 1
+                    continue
+                anchor_pt = get_exploded_visible_anchor_pt(pipe, view3d)
+                dir_xy = get_curve_direction_xy(pipe)
+                side = get_short_side_vector_xy(dir_xy)
+                offset_mm = 180.0 if label_kind == "regular" else 220.0
+                up_mm = 80.0 if label_kind == "regular" else 110.0
+                head_pt = XYZ(
+                    anchor_pt.X + side.X * mm_to_ft(offset_mm),
+                    anchor_pt.Y + side.Y * mm_to_ft(offset_mm),
+                    anchor_pt.Z + mm_to_ft(up_mm),
+                )
+                host_bb = pipe.get_BoundingBox(view3d)
+                if host_bb:
+                    host_rect = expand_rect(bbox_rect(host_bb), 60.0)
+                    tries = 0
+                    while rects_overlap(text_rect(head_pt), host_rect) and tries < 3:
+                        offset_mm += 70.0
+                        head_pt = XYZ(
+                            anchor_pt.X + side.X * mm_to_ft(offset_mm),
+                            anchor_pt.Y + side.Y * mm_to_ft(offset_mm),
+                            anchor_pt.Z + mm_to_ft(up_mm),
+                        )
+                        tries += 1
+                tag = create_3d_pipe_tag(
+                    doc,
+                    view3d,
+                    pipe,
+                    sym.Id,
+                    head_pt,
+                    elbow_pt=None,
+                    end_pt=None,
+                    use_leader=True,
+                )
+                if tag is None:
+                    failed_real_tag_count += 1
+                    continue
+                try:
+                    tag.HasLeader = True
+                except Exception:
+                    pass
+                try:
+                    tag.TagHeadPosition = head_pt
+                except Exception:
+                    pass
+                successful_real_tag_count += 1
+                occupied_pipe_label_rects.append(text_rect(head_pt))
+                dist_mm = (
+                    math.sqrt(
+                        (head_pt.X - anchor_pt.X) * (head_pt.X - anchor_pt.X)
+                        + (head_pt.Y - anchor_pt.Y) * (head_pt.Y - anchor_pt.Y)
+                        + (head_pt.Z - anchor_pt.Z) * (head_pt.Z - anchor_pt.Z)
+                    )
+                    * 304.8
+                )
+                if len(sample_head_distances) < 5:
+                    sample_head_distances.append(round(dist_mm, 1))
+                print(
+                    "EXP PIPE TAG",
+                    pipe.Id.IntegerValue,
+                    "host:",
+                    anchor_pt,
+                    "text:",
+                    head_pt,
+                    "vertical:",
+                    False,
+                )
+
+        fitting_groups = fitting_groups_from_fittings(fittings)
+        print("3D EXPLODED -> fitting groups:", len(fitting_groups))
+        print("EXPLODED FITTINGS -> clusters detected:", len(fitting_groups))
+        occupied_fitting_rects = []
+        fitting_numbering_skipped = False
+        fitting_retry_count = 0
+        fitting_skipped_after_retries = 0
+        for idx, group in enumerate(fitting_groups, 1):
+            member_ids = [fit.Id.IntegerValue for fit, _, _ in group]
+            anchor_pt = XYZ(
+                sum(ctr.X for _, _, ctr in group) / float(len(group)),
+                sum(ctr.Y for _, _, ctr in group) / float(len(group)),
+                sum(ctr.Z for _, _, ctr in group) / float(len(group)),
+            )
+            fit_rect = (
+                min(bb.Min.X for _, bb, _ in group),
+                min(bb.Min.Y for _, bb, _ in group),
+                max(bb.Max.X for _, bb, _ in group),
+                max(bb.Max.Y for _, bb, _ in group),
+            )
+            print("FIT GROUP", idx, "member ids:", member_ids)
+            print("FIT GROUP", idx, "anchor:", anchor_pt)
+            final_pt = None
+            final_rect = None
+            placed_with_fallback = False
+            reject_direct_cluster_overlap = 0
+            reject_existing_number_overlap = 0
+            reject_crop_overflow = 0
+            reject_other = 0
+            attempt_idx = 0
+            fit_w = fit_rect[2] - fit_rect[0]
+            fit_h = fit_rect[3] - fit_rect[1]
+            if fit_w >= fit_h:
+                candidate_angles = [90, 270, 45, 315, 135, 225, 0, 180]
+            else:
+                candidate_angles = [0, 180, 45, 315, 90, 270, 135, 225]
+            for radius_mm in [35, 50, 70, 90]:
+                for ang in candidate_angles:
+                    attempt_idx += 1
+                    rad = math.radians(ang)
+                    cand = XYZ(
+                        anchor_pt.X + math.cos(rad) * mm_to_ft(radius_mm),
+                        anchor_pt.Y + math.sin(rad) * mm_to_ft(radius_mm),
+                        anchor_pt.Z + mm_to_ft(20.0),
+                    )
+                    cand_rect = text_rect(cand)
+                    if rects_overlap(cand_rect, expand_rect(fit_rect, 6.0)):
+                        reject_direct_cluster_overlap += 1
+                        continue
+                    if any(rects_overlap(cand_rect, r) for r in occupied_fitting_rects):
+                        reject_existing_number_overlap += 1
+                        continue
+                    if crop_rect is not None and not (
+                        cand_rect[0] >= crop_rect[0]
+                        and cand_rect[1] >= crop_rect[1]
+                        and cand_rect[2] <= crop_rect[2]
+                        and cand_rect[3] <= crop_rect[3]
+                    ):
+                        reject_crop_overflow += 1
+                        continue
+                    final_pt = cand
+                    final_rect = cand_rect
+                    break
+                if final_pt is not None:
+                    break
+            fitting_retry_count += max(0, attempt_idx - 1)
+            if final_pt is None and nt is not None:
+                fallback_offsets = []
+                if fit_w >= fit_h:
+                    fallback_offsets = [
+                        XYZ(0, mm_to_ft(42), mm_to_ft(20)),
+                        XYZ(0, -mm_to_ft(42), mm_to_ft(20)),
+                        XYZ(mm_to_ft(42), 0, mm_to_ft(20)),
+                        XYZ(-mm_to_ft(42), 0, mm_to_ft(20)),
+                    ]
+                else:
+                    fallback_offsets = [
+                        XYZ(mm_to_ft(42), 0, mm_to_ft(20)),
+                        XYZ(-mm_to_ft(42), 0, mm_to_ft(20)),
+                        XYZ(0, mm_to_ft(42), mm_to_ft(20)),
+                        XYZ(0, -mm_to_ft(42), mm_to_ft(20)),
+                    ]
+                severe_pad = mm_to_ft(120.0)
+                for off in fallback_offsets:
+                    cand = XYZ(
+                        anchor_pt.X + off.X, anchor_pt.Y + off.Y, anchor_pt.Z + off.Z
+                    )
+                    cand_rect = text_rect(cand)
+                    if any(rects_overlap(cand_rect, r) for r in occupied_fitting_rects):
+                        reject_existing_number_overlap += 1
+                        continue
+                    if crop_rect is not None:
+                        severely_outside = (
+                            cand_rect[2] < crop_rect[0] - severe_pad
+                            or cand_rect[0] > crop_rect[2] + severe_pad
+                            or cand_rect[3] < crop_rect[1] - severe_pad
+                            or cand_rect[1] > crop_rect[3] + severe_pad
+                        )
+                        if severely_outside:
+                            reject_crop_overflow += 1
+                            continue
+                    final_pt = cand
+                    final_rect = cand_rect
+                    placed_with_fallback = True
+                    break
+            print(
+                "FIT GROUP {} -> reject counts: cluster={} existing={} crop={} other={}".format(
+                    idx,
+                    reject_direct_cluster_overlap,
+                    reject_existing_number_overlap,
+                    reject_crop_overflow,
+                    reject_other,
+                )
+            )
+            if final_pt is None or nt is None:
+                print(
+                    "FIT GROUP {} -> final skipped only if actual create failed".format(
+                        idx
+                    )
+                )
+                print("3D EXPLODED -> fitting number skipped:", idx)
+                fitting_numbering_skipped = True
+                fitting_skipped_after_retries += 1
+                continue
+            print("FIT NUM", idx, "fitting anchor:", anchor_pt, "final:", final_pt)
+            try:
+                TextNote.Create(
+                    doc, view3d.Id, final_pt, str(idx), TextNoteOptions(nt.Id)
+                )
+                occupied_fitting_rects.append(final_rect)
+                fitting_number_count += 1
+                if placed_with_fallback:
+                    print("FIT GROUP {} -> placed with fallback".format(idx))
+                else:
+                    print("FIT GROUP {} -> placed with primary candidate".format(idx))
+            except Exception:
+                print(
+                    "FIT GROUP {} -> final skipped only if actual create failed".format(
+                        idx
+                    )
+                )
+                print("3D EXPLODED -> fitting number skipped:", idx)
+                fitting_numbering_skipped = True
+                fitting_skipped_after_retries += 1
+        t.Commit()
+    if fitting_numbering_skipped:
+        print("EXPLODED FITTING NUMBERING SKIPPED")
+
+    print("FINAL 3D EXPLODED -> locked:", view_locked)
+    print("FINAL 3D EXPLODED -> attempted tag count:", attempted_tag_count)
+    print(
+        "FINAL 3D EXPLODED -> successful real 3D tag count:", successful_real_tag_count
+    )
+    print("FINAL 3D EXPLODED -> failed real 3D tag count:", failed_real_tag_count)
+    print("FINAL 3D EXPLODED -> excluded NLRS pipe count:", excluded_nlrs_pipe_count)
+    print("FINAL 3D EXPLODED -> vertical tag count:", vertical_tag_count)
+    print("FINAL 3D EXPLODED -> regular tag count:", regular_tag_count)
+    print("EXPLODED 3D -> vertical pipe tags preserved:", displaced_vertical_tags)
+    print("3D EXPLODED -> displaced vertical tags:", displaced_vertical_tags)
+    print("3D EXPLODED -> fitting numbers placed:", fitting_number_count)
+    print("EXPLODED FITTINGS -> numbers placed:", fitting_number_count)
+    print("EXPLODED FITTINGS -> retries used:", fitting_retry_count)
+    print("EXPLODED FITTINGS -> numbering placed:", fitting_number_count)
+    print("EXPLODED FITTINGS -> skipped after retries:", fitting_skipped_after_retries)
+    print("EXPLODED FITTINGS -> numbers placed on fitting side only")
+    print("EXPLODED FITTINGS -> numbering anchored to fitting clusters only")
+    print("FIT NUMBERS -> total placed:", fitting_number_count)
+    return {
+        "tags": successful_real_tag_count,
+        "text": text_count,
+        "mode": "tags" if successful_real_tag_count > 0 else "none",
+        "excluded_nlrs": excluded_nlrs_pipe_count,
+        "attempted": attempted_tag_count,
+        "failed": failed_real_tag_count,
+        "vertical_real": displaced_vertical_tags,
+        "vertical_onhost": displaced_vertical_tags,
+        "vertical_no_leader": len(exploded_vertical_tag_ids),
+        "vertical_tag_ids": exploded_vertical_tag_ids,
+        "regular_real": regular_tag_count,
+        "regular_leader": regular_tag_count,
+        "extra_real": extra_tag_count,
+        "extra_leader": extra_tag_count,
+        "sample_head_distances": sample_head_distances,
+    }
+
+
+def annotate_prefab_3d_view(doc, uidoc, view3d, scanned_elems, code_map):
+    regular_count = 0
+    vertical_count = 0
+    extra_count = 0
+    regular_real_count = 0
+    vertical_real_count = 0
+    extra_real_count = 0
+    vertical_no_leader_count = 0
+    regular_leader_count = 0
+    extra_leader_count = 0
+    sample_head_distances = []
+    max_regular_mm = 0.0
+    max_extra_mm = 0.0
+    normal_regular_tags = []
+    pipes = [
+        e
+        for e in scanned_elems
+        if e
+        and e.Category
+        and e.Category.Id.IntegerValue == int(BuiltInCategory.OST_PipeCurves)
+        and not is_excluded_nlrs_pipe(e)
+    ]
+    if not pipes:
+        return {"tags": 0, "text": 0, "mode": "none"}
+    extra_targets, _ = find_extra_horizontal_targets(pipes)
+    if "Exploded" in view3d.Name:
+        print("3D EXPLODED -> extra horizontal-connected targets:", len(extra_targets))
+    else:
+        print("3D NORMAL -> extra horizontal-connected targets:", len(extra_targets))
+    view_locked = False
+    try:
+        view_locked = bool(view3d.IsLocked) if hasattr(view3d, "IsLocked") else False
+    except Exception:
+        view_locked = False
+    if not view_locked:
+        print("3D TAGGING SKIPPED -> view not locked:", view3d.Name)
+        return {"tags": 0, "text": 0, "mode": "skipped"}
+    resolved, _ = resolve_required_tag_symbols(doc)
+    sym_regular = get_regular_pipe_tag_symbol(doc)
+    sym_vertical = resolved.get("VERT_ARROW")
+    sym_extra = resolved.get("EXTRA_HORIZONTAL")
+    with Transaction(doc, "Annotate 3D View") as t:
+        t.Start()
+        for idx, pipe in enumerate(pipes):
+            labels = []
+            if is_vertical_pipe(pipe):
+                labels.append(
+                    (
+                        "vertical",
+                        get_vertical_pipe_tag_text(pipe, code_map),
+                    )
+                )
+                vertical_count += 1
+            else:
+                labels.append(
+                    (
+                        "regular",
+                        get_regular_pipe_tag_text(pipe, code_map),
+                    )
+                )
+                regular_count += 1
+            if pipe.Id.IntegerValue in extra_targets:
+                labels.append(
+                    (
+                        "extra",
+                        get_extra_horizontal_tag_text(pipe, code_map),
+                    )
+                )
+                extra_count += 1
+            for label_kind, _label in labels:
+                anchor_pt, head_pt, elbow_pt = get_close_3d_tag_points(
+                    view3d,
+                    pipe,
+                    is_vertical=(label_kind == "vertical"),
+                    is_extra=(label_kind == "extra"),
+                )
+                tag_type_id = None
+                if label_kind == "regular" and sym_regular is not None:
+                    tag_type_id = sym_regular.Id
+                elif label_kind == "vertical" and sym_vertical is not None:
+                    tag_type_id = sym_vertical.Id
+                elif label_kind == "extra" and sym_extra is not None:
+                    tag_type_id = sym_extra.Id
+                if tag_type_id is None:
+                    continue
+                use_leader = not is_vertical_arrow_tag_type(tag_type_id)
+                created_real = create_3d_pipe_tag(
+                    doc,
+                    view3d,
+                    pipe,
+                    tag_type_id,
+                    head_pt,
+                    elbow_pt=elbow_pt,
+                    end_pt=anchor_pt,
+                    use_leader=use_leader,
+                )
+                if created_real is None:
+                    continue
+                if is_vertical_arrow_tag_type(tag_type_id):
+                    try:
+                        created_real.HasLeader = False
+                    except Exception:
+                        pass
+                    try:
+                        created_real.TagHeadPosition = head_pt
+                    except Exception:
+                        pass
+                dist_mm = (
+                    math.sqrt(
+                        (head_pt.X - anchor_pt.X) * (head_pt.X - anchor_pt.X)
+                        + (head_pt.Y - anchor_pt.Y) * (head_pt.Y - anchor_pt.Y)
+                        + (head_pt.Z - anchor_pt.Z) * (head_pt.Z - anchor_pt.Z)
+                    )
+                    * 304.8
+                )
+                if "Exploded" in view3d.Name and len(sample_head_distances) < 5:
+                    sample_head_distances.append(round(dist_mm, 1))
+                if label_kind == "regular":
+                    regular_real_count += 1
+                    regular_leader_count += 1
+                    max_regular_mm = max(max_regular_mm, dist_mm)
+                    if "Exploded" not in view3d.Name:
+                        normal_regular_tags.append((created_real, head_pt))
+                elif label_kind == "vertical":
+                    vertical_real_count += 1
+                    vertical_no_leader_count += 1
+                    print("3D TAG -> vertical no-leader:", pipe.Id.IntegerValue)
+                    print("3D TAG -> vertical on-host:", pipe.Id.IntegerValue)
+                elif label_kind == "extra":
+                    extra_real_count += 1
+                    extra_leader_count += 1
+                    max_extra_mm = max(max_extra_mm, dist_mm)
+        if "Exploded" not in view3d.Name and normal_regular_tags:
+            reset_count = 0
+            for created_real, head_pt in normal_regular_tags:
+                try:
+                    created_real.HasLeader = False
+                except Exception:
+                    continue
+                reset_count += 1
+            doc.Regenerate()
+            for created_real, head_pt in normal_regular_tags:
+                try:
+                    created_real.HasLeader = True
+                except Exception:
+                    continue
+                try:
+                    created_real.TagHeadPosition = head_pt
+                except Exception:
+                    pass
+            doc.Regenerate()
+            print("NORMAL 3D -> leader reset applied to tags:", reset_count)
+        t.Commit()
+    mode = (
+        "tags"
+        if (regular_real_count + vertical_real_count + extra_real_count) > 0
+        else "none"
+    )
+    if "Exploded" in view3d.Name:
+        print("3D EXPLODED -> text annotations regular:", 0)
+        print("3D EXPLODED -> text annotations vertical:", 0)
+        print("3D EXPLODED -> text annotations extra:", 0)
+        print("3D EXPLODED -> real 3D regular tags:", regular_real_count)
+        print("3D EXPLODED -> real 3D vertical tags:", vertical_real_count)
+        print("3D EXPLODED -> real 3D extra tags:", extra_real_count)
+        print("3D EXPLODED -> fallback text regular:", 0)
+        print("3D EXPLODED -> fallback text vertical:", 0)
+        print("3D EXPLODED -> fallback text extra:", 0)
+        print("FINAL 3D EXPLODED -> locked:", view_locked)
+        print("FINAL 3D EXPLODED -> real regular tags:", regular_real_count)
+        print("FINAL 3D EXPLODED -> real vertical tags:", vertical_real_count)
+        print("FINAL 3D EXPLODED -> real extra tags:", extra_real_count)
+        print("FINAL 3D EXPLODED -> fallback regular text:", 0)
+        print("FINAL 3D EXPLODED -> fallback vertical text:", 0)
+        print("FINAL 3D EXPLODED -> fallback extra text:", 0)
+        print("3D EXPLODED -> vertical no-leader tags:", vertical_no_leader_count)
+        print("3D EXPLODED -> regular leader tags:", regular_leader_count)
+        print("3D EXPLODED -> extra leader tags:", extra_leader_count)
+        print("EXPLODED TAG PATCH -> regular tags:", regular_real_count)
+        print("EXPLODED TAG PATCH -> extra tags:", extra_real_count)
+        print(
+            "EXPLODED TAG PATCH -> vertical no-leader tags:", vertical_no_leader_count
+        )
+        print(
+            "EXPLODED TAG PATCH -> max regular head distance mm:",
+            round(max_regular_mm, 1),
+        )
+        print(
+            "EXPLODED TAG PATCH -> max extra head distance mm:", round(max_extra_mm, 1)
+        )
+        for dist_mm in sample_head_distances:
+            print("3D EXPLODED -> sample head distance mm:", dist_mm)
+            print("EXPLODED TAG PATCH -> sample regular distance mm:", dist_mm)
+    else:
+        print("3D NORMAL -> vertical no-leader tags:", vertical_no_leader_count)
+    print("3D ANNOTATE -> view:", view3d.Name, view3d.Id.IntegerValue, "mode:", mode)
+    return {
+        "tags": regular_real_count + vertical_real_count + extra_real_count,
+        "text": 0,
+        "mode": mode,
+        "regular_real": regular_real_count,
+        "vertical_real": vertical_real_count,
+        "extra_real": extra_real_count,
+        "vertical_no_leader": vertical_no_leader_count,
+        "vertical_onhost": vertical_no_leader_count,
+        "regular_leader": regular_leader_count,
+        "extra_leader": extra_leader_count,
+        "sample_head_distances": sample_head_distances,
+        "max_regular_mm": round(max_regular_mm, 1),
+        "max_extra_mm": round(max_extra_mm, 1),
+    }
+
+
+def place_prefab_views_on_sheet(doc, sheet, plan_view, view3d_normal, view3d_exploded):
+    min_u = sheet.Outline.Min.U
+    max_u = sheet.Outline.Max.U
+    min_v = sheet.Outline.Min.V
+    max_v = sheet.Outline.Max.V
+    width = max_u - min_u
+    height = max_v - min_v
+    plan_pt = XYZ(min_u + width * 0.28, min_v + height * 0.72, 0)
+    normal_pt = XYZ(min_u + width * 0.72, min_v + height * 0.72, 0)
+    exploded_pt = XYZ(min_u + width * 0.72, min_v + height * 0.32, 0)
+
+    if not Viewport.CanAddViewToSheet(doc, sheet.Id, plan_view.Id):
+        raise Exception(
+            "Plan view cannot be placed on sheet: {}".format(plan_view.Name)
+        )
+    if not Viewport.CanAddViewToSheet(doc, sheet.Id, view3d_normal.Id):
+        raise Exception(
+            "3D normal view cannot be placed on sheet: {}".format(view3d_normal.Name)
+        )
+    if not Viewport.CanAddViewToSheet(doc, sheet.Id, view3d_exploded.Id):
+        raise Exception(
+            "3D exploded view cannot be placed on sheet: {}".format(
+                view3d_exploded.Name
+            )
+        )
+
+    Viewport.Create(doc, sheet.Id, plan_view.Id, plan_pt)
+    print(
+        "SHEET PLACE -> floor plan viewport placed:",
+        plan_view.Name,
+        plan_view.Id.IntegerValue,
+    )
+    Viewport.Create(doc, sheet.Id, view3d_normal.Id, normal_pt)
+    print(
+        "SHEET PLACE -> 3D normal viewport placed:",
+        view3d_normal.Name,
+        view3d_normal.Id.IntegerValue,
+    )
+    Viewport.Create(doc, sheet.Id, view3d_exploded.Id, exploded_pt)
+    print(
+        "SHEET PLACE -> 3D exploded viewport placed:",
+        view3d_exploded.Name,
+        view3d_exploded.Id.IntegerValue,
+    )
+
+
+def extract_prefab_prefix(text_value):
+    match = re.search(r"(\d+(?:\.\d+)+)", text_value or "")
+    return match.group(1) if match else ""
+
+
+def get_independent_tag_text(tag):
+    try:
+        return (tag.TagText or "").strip()
+    except Exception:
+        return ""
+
+
+def remove_stale_prefab_text_notes_in_view(doc, view, polygon, current_prefix):
+    removed = 0
+    notes = (
+        FilteredElementCollector(doc, view.Id)
+        .OfClass(TextNote)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for note in notes:
+        try:
+            txt = note.Text or ""
+            prefix = extract_prefab_prefix(txt)
+            if not prefix or prefix == current_prefix:
+                continue
+            if polygon is not None:
+                p = note.Coord
+                if not is_point_inside_polygon(XYZ(p.X, p.Y, 0), polygon):
+                    continue
+            doc.Delete(note.Id)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def remove_stale_prefab_pipe_tags_in_view(doc, view, scanned_pipe_ids, current_prefix):
+    removed = 0
+    for tag in get_pipe_tags_for_hosts_in_view(doc, view, set(scanned_pipe_ids)):
+        try:
+            if is_vertical_arrow_tag_type(tag.GetTypeId()):
+                continue
+            prefix = extract_prefab_prefix(get_independent_tag_text(tag))
+            if not prefix or prefix == current_prefix:
+                continue
+            doc.Delete(tag.Id)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def cleanup_stale_prefab_text_notes_only_in_view(doc, view, polygon, current_prefix):
+    removed_total = 0
+    with Transaction(doc, "Cleanup stale prefab text notes") as t:
+        t.Start()
+        removed_total += remove_stale_prefab_text_notes_in_view(
+            doc, view, polygon, current_prefix
+        )
+        t.Commit()
+    return removed_total
+
+
+def cleanup_stale_prefab_annotations_in_view(
+    doc, view, scanned_pipe_ids, polygon, current_prefix
+):
+    removed_total = 0
+    with Transaction(doc, "Cleanup stale prefab annotations") as t:
+        t.Start()
+        removed_total += remove_stale_prefab_text_notes_in_view(
+            doc, view, polygon, current_prefix
+        )
+        removed_total += remove_stale_prefab_pipe_tags_in_view(
+            doc, view, scanned_pipe_ids, current_prefix
+        )
+        t.Commit()
+    return removed_total
+
+
+def hard_sync_scanned_pipe_tags_from_source(
+    doc, source_view, target_view, scanned_pipe_ids
+):
+    source_tag_ids = [
+        tag.Id
+        for tag in get_pipe_tags_for_hosts_in_view(
+            doc, source_view, set(scanned_pipe_ids)
+        )
+    ]
+    copied = 0
+    with Transaction(doc, "Hard sync scanned pipe tags from source") as t:
+        t.Start()
+        for tag in get_pipe_tags_for_hosts_in_view(
+            doc, target_view, set(scanned_pipe_ids)
+        ):
+            try:
+                doc.Delete(tag.Id)
+            except Exception:
+                pass
+        if source_tag_ids:
+            try:
+                new_ids = ElementTransformUtils.CopyElements(
+                    source_view,
+                    List[ElementId](source_tag_ids),
+                    target_view,
+                    Transform.Identity,
+                    CopyPasteOptions(),
+                )
+                copied = len(new_ids) if new_ids else 0
+            except Exception as ex:
+                print("PLAN CLONE -> hard sync tag copy failed:", ex)
+        t.Commit()
+    return copied
+
+
+def sync_prefab_comments_for_current_run(doc, result):
+    current_prefix = extract_prefab_prefix(result.get("TextNote", "") or "")
+    if not current_prefix:
+        return {
+            "updated": 0,
+            "scanned_fittings": 0,
+            "written_fittings": 0,
+        }
+    updated = 0
+    scanned_fittings = 0
+    written_fittings = 0
+    with Transaction(doc, "Sync prefab comments for current run") as t:
+        t.Start()
+        for eData in result.get("Elements", []):
+            cat = eData.get("Category")
+            if cat not in ("Pipes", "Pipe Fittings"):
+                continue
+            if cat == "Pipe Fittings":
+                scanned_fittings += 1
+            eid = safe_int(eData.get("Id"), 0)
+            if eid <= 0:
+                continue
+            elem = doc.GetElement(ElementId(eid))
+            if not elem:
+                continue
+            p = elem.LookupParameter("Comments")
+            if not p or p.IsReadOnly:
+                continue
+            target_value = current_prefix
+            if cat == "Pipes":
+                target_value = (eData.get("NewCode") or current_prefix).strip()
+            try:
+                existing = p.AsString() or ""
+            except Exception:
+                existing = ""
+            if existing == target_value:
+                if cat == "Pipe Fittings":
+                    written_fittings += 1
+                continue
+            try:
+                p.Set(target_value)
+                updated += 1
+                if cat == "Pipe Fittings":
+                    written_fittings += 1
+            except Exception:
+                pass
+        t.Commit()
+    return {
+        "updated": updated,
+        "scanned_fittings": scanned_fittings,
+        "written_fittings": written_fittings,
+    }
+
+
+def get_schedule_field_by_bip(schedule, bip_value):
+    target_id = ElementId(int(bip_value))
+    for sched_field in schedule.Definition.GetSchedulableFields():
+        try:
+            pid = sched_field.ParameterId
+            if pid and pid.IntegerValue == target_id.IntegerValue:
+                return sched_field
+        except Exception:
+            continue
+    return None
+
+
+def get_schedule_field_by_name(schedule, field_name):
+    target = (field_name or "").strip().lower()
+    if not target:
+        return None
+    for sched_field in schedule.Definition.GetSchedulableFields():
+        try:
+            if sched_field.GetName(doc).strip().lower() == target:
+                return sched_field
+        except Exception:
+            continue
+    return None
+
+
+def add_schedule_field_by_name(schedule, field_name):
+    sched_field = get_schedule_field_by_name(schedule, field_name)
+    if sched_field is None:
+        return None
+    try:
+        return schedule.Definition.AddField(sched_field)
+    except Exception:
+        return None
+
+
+def remove_all_schedule_fields(schedule):
+    try:
+        field_order = list(schedule.Definition.GetFieldOrder())
+    except Exception:
+        field_order = []
+    for field_id in reversed(field_order):
+        try:
+            schedule.Definition.RemoveField(field_id)
+        except Exception:
+            pass
+
+
+def get_schedule_field_obj_by_name(schedule, field_name):
+    target = (field_name or "").strip().lower()
+    try:
+        field_order = list(schedule.Definition.GetFieldOrder())
+    except Exception:
+        field_order = []
+    for field_id in field_order:
+        try:
+            field = schedule.Definition.GetField(field_id)
+            heading = ""
+            try:
+                heading = field.GetName()
+            except Exception:
+                heading = ""
+            try:
+                col_heading = field.ColumnHeading or ""
+            except Exception:
+                col_heading = ""
+            if (
+                heading.strip().lower() == target
+                or col_heading.strip().lower() == target
+            ):
+                return field
+        except Exception:
+            continue
+    return None
+
+
+def get_schedule_field_id_by_name(schedule, field_name):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    return field.FieldId if field else None
+
+
+def set_schedule_field_hidden(schedule, field_name, is_hidden=True):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    try:
+        field.IsHidden = bool(is_hidden)
+        return True
+    except Exception:
+        return False
+
+
+def set_schedule_field_heading(schedule, field_name, heading):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    try:
+        field.ColumnHeading = heading
+        return True
+    except Exception:
+        return False
+
+
+def set_schedule_field_alignment_center(schedule, field_name):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    for attr_name in ["HorizontalAlignment", "HeadingOrientation"]:
+        try:
+            _ = getattr(field, attr_name)
+        except Exception:
+            continue
+    try:
+        field.HorizontalAlignment = ScheduleHorizontalAlignment.Center
+        return True
+    except Exception:
+        return False
+
+
+def set_schedule_length_field_to_mm(schedule, field_name):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    try:
+        fmt = FormatOptions(UnitTypeId.Millimeters)
+        field.SetFormatOptions(fmt)
+        return True
+    except Exception:
+        return False
+
+
+def remove_schedule_filters_by_field_names(schedule, field_names):
+    lowered = set([(x or "").strip().lower() for x in field_names if x])
+    defn = schedule.Definition
+    try:
+        filter_count = defn.GetFilterCount()
+    except Exception:
+        filter_count = 0
+    for i in range(filter_count - 1, -1, -1):
+        try:
+            filt = defn.GetFilter(i)
+            field = defn.GetField(filt.FieldId)
+            name_value = ""
+            try:
+                name_value = field.GetName()
+            except Exception:
+                name_value = field.ColumnHeading or ""
+            if name_value.strip().lower() in lowered:
+                defn.RemoveFilter(i)
+        except Exception:
+            continue
+
+
+def add_schedule_string_filter(schedule, field_name, filter_type, value):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    try:
+        schedule.Definition.AddFilter(ScheduleFilter(field.FieldId, filter_type, value))
+        return True
+    except Exception:
+        return False
+
+
+def add_schedule_numeric_filter(schedule, field_name, filter_type, value):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    try:
+        schedule.Definition.AddFilter(ScheduleFilter(field.FieldId, filter_type, value))
+        return True
+    except Exception:
+        try:
+            schedule.Definition.AddFilter(
+                ScheduleFilter(field.FieldId, filter_type, str(value))
+            )
+            return True
+        except Exception:
+            return False
+
+
+def clear_schedule_sorting(schedule):
+    try:
+        count = schedule.Definition.GetSortGroupFieldCount()
+    except Exception:
+        count = 0
+    for i in range(count - 1, -1, -1):
+        try:
+            schedule.Definition.RemoveSortGroupField(i)
+        except Exception:
+            pass
+
+
+def add_schedule_sort(
+    schedule, field_name, ascending=True, footer_mode=None, blank_line=False
+):
+    field = get_schedule_field_obj_by_name(schedule, field_name)
+    if field is None:
+        return False
+    try:
+        sort_field = ScheduleSortGroupField(field.FieldId)
+        sort_field.SortOrder = (
+            ScheduleSortOrder.Ascending if ascending else ScheduleSortOrder.Descending
+        )
+        if footer_mode is not None:
+            sort_field.ShowFooter = True
+            sort_field.ShowFooterTitle = True
+            sort_field.ShowFooterCount = True
+            if footer_mode == "totals":
+                try:
+                    sort_field.ShowFooterTotals = True
+                except Exception:
+                    pass
+        if blank_line:
+            sort_field.ShowBlankLine = True
+        schedule.Definition.AddSortGroupField(sort_field)
+        return True
+    except Exception:
+        return False
+
+
+def get_schedule_field_names(schedule):
+    names = []
+    try:
+        field_order = list(schedule.Definition.GetFieldOrder())
+    except Exception:
+        field_order = []
+    for field_id in field_order:
+        try:
+            field = schedule.Definition.GetField(field_id)
+            try:
+                names.append(field.GetName())
+            except Exception:
+                names.append(field.ColumnHeading or "")
+        except Exception:
+            continue
+    return names
+
+
+def get_schedule_filter_descriptions(schedule):
+    descriptions = []
+    defn = schedule.Definition
+    try:
+        count = defn.GetFilterCount()
+    except Exception:
+        count = 0
+    for i in range(count):
+        try:
+            filt = defn.GetFilter(i)
+            field = defn.GetField(filt.FieldId)
+            try:
+                field_name = field.GetName()
+            except Exception:
+                field_name = field.ColumnHeading or ""
+            value = ""
+            for getter_name in [
+                "GetStringValue",
+                "GetDoubleValue",
+                "GetElementIdValue",
+                "GetIntegerValue",
+            ]:
+                try:
+                    value = getattr(filt, getter_name)()
+                    break
+                except Exception:
+                    continue
+            descriptions.append("{} {} {}".format(field_name, filt.FilterType, value))
+        except Exception:
+            continue
+    return descriptions
+
+
+def get_schedule_sort_descriptions(schedule):
+    descriptions = []
+    try:
+        count = schedule.Definition.GetSortGroupFieldCount()
+    except Exception:
+        count = 0
+    for i in range(count):
+        try:
+            sort_field = schedule.Definition.GetSortGroupField(i)
+            field = schedule.Definition.GetField(sort_field.FieldId)
+            try:
+                field_name = field.GetName()
+            except Exception:
+                field_name = field.ColumnHeading or ""
+            descriptions.append(
+                "{} {} footer={} blank={}".format(
+                    field_name,
+                    sort_field.SortOrder,
+                    bool(getattr(sort_field, "ShowFooter", False)),
+                    bool(getattr(sort_field, "ShowBlankLine", False)),
+                )
+            )
+        except Exception:
+            continue
+    return descriptions
+
+
+def get_schedule_body_row_count(schedule):
+    try:
+        return schedule.GetTableData().GetSectionData(SectionType.Body).NumberOfRows
+    except Exception:
+        return -1
+
+
+def get_schedule_visible_element_count(schedule, allowed_bics=None):
+    allowed = set([int(x) for x in (allowed_bics or [])])
+    count = 0
+    try:
+        elems = (
+            FilteredElementCollector(doc, schedule.Id)
+            .WhereElementIsNotElementType()
+            .ToElements()
+        )
+    except Exception:
+        return 0
+    for elem in elems:
+        try:
+            if elem is None or elem.ViewSpecific:
+                continue
+        except Exception:
+            pass
+        if allowed:
+            try:
+                if elem.Category is None:
+                    continue
+                if elem.Category.Id.IntegerValue not in allowed:
+                    continue
+            except Exception:
+                continue
+        count += 1
+    return count
+
+
+def configure_fitting_schedule_visible_fields(schedule):
+    remove_all_schedule_fields(schedule)
+    visible_fields = [
+        ("Count", "n"),
+        ("RSen_P_c01_diameter", "DN1"),
+        ("RSen_P_c02_diameter", "DN2"),
+        ("RSen_P_c03_diameter", "DN3"),
+        ("RSen_P_c01_angle", "Angle"),
+        ("Description", "Description"),
+        ("RSen_C_info_technical", "Further info"),
+        ("RSen_C_code_article", "Articlenumber"),
+        ("RSen_C_code_gtin", "GTIN"),
+        ("RSen_S_net_mass", "Weight"),
+    ]
+    hidden_fields = ["option", "productrange", "Comments"]
+    for field_name, heading in visible_fields:
+        add_schedule_field_by_name(schedule, field_name)
+        set_schedule_field_heading(schedule, field_name, heading)
+    for field_name in hidden_fields:
+        add_schedule_field_by_name(schedule, field_name)
+        set_schedule_field_hidden(schedule, field_name, True)
+    set_schedule_field_alignment_center(schedule, "Count")
+
+
+def apply_fitting_schedule_filters_and_sorting(schedule, current_prefix):
+    remove_schedule_filters_by_field_names(
+        schedule,
+        [
+            "option",
+            "Description",
+            "RSen_C_code_article",
+            "productrange",
+            "Level",
+            "Reference Level",
+            "Comments",
+        ],
+    )
+    add_schedule_numeric_filter(schedule, "option", ScheduleFilterType.NotEqual, 0)
+    add_schedule_string_filter(
+        schedule, "Description", ScheduleFilterType.Contains, "ACO pipe"
+    )
+    add_schedule_string_filter(
+        schedule, "RSen_C_code_article", ScheduleFilterType.NotEqual, ""
+    )
+    add_schedule_string_filter(
+        schedule, "productrange", ScheduleFilterType.Equal, "Pipe systems"
+    )
+    add_schedule_string_filter(
+        schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+    )
+    clear_schedule_sorting(schedule)
+    add_schedule_sort(
+        schedule, "Description", True, footer_mode="totals", blank_line=True
+    )
+    add_schedule_sort(schedule, "RSen_P_c01_diameter", True)
+    add_schedule_sort(schedule, "RSen_P_c03_diameter", True)
+    add_schedule_sort(schedule, "RSen_C_code_article", True)
+    try:
+        schedule.Definition.IsItemized = False
+        schedule.Definition.ShowGrandTotal = False
+    except Exception:
+        pass
+
+
+def log_scanned_fitting_filter_check(result):
+    for eData in result.get("Elements", []):
+        if eData.get("Category") != "Pipe Fittings":
+            continue
+        eid = safe_int(eData.get("Id"), 0)
+        if eid <= 0:
+            continue
         elem = doc.GetElement(ElementId(eid))
         if not elem:
             continue
-        set_instance_comment(elem, code_norm)
-    t.Commit()
-except Exception:
-    rollback_transaction(t)
-    raise
-
-# --- Place the text note if not already placed ---
-if not result.get("TextNotePlaced", False):
-    (region_min, region_max) = get_region_bounding_box(gathered_elements)
-    view = doc.ActiveView
-    corner = region_min
-    ttn = Transaction(doc, "Place Text Note at Region Corner")
-    try:
-        ttn.Start()
-        nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
-        if nt:
-            opts = TextNoteOptions(nt.Id)
-            TextNote.Create(
-                doc,
-                doc.ActiveView.Id,
-                corner,
-                text_note_display or code_norm,
-                opts,
+        desc = get_param_text(elem, ["Description"])
+        option_val = get_param_text(elem, ["option"])
+        code_article = get_param_text(elem, ["RSen_C_code_article"])
+        productrange = get_param_text(elem, ["productrange"])
+        comments = get_param_text(elem, ["Comments"])
+        print(
+            "FITTING FILTER CHECK -> {} | Desc={} | option={} | code_article={} | productrange={} | comments={}".format(
+                eid,
+                desc or "",
+                option_val or "",
+                code_article or "",
+                productrange or "",
+                comments or "",
             )
-        ttn.Commit()
+        )
+
+
+def find_master_schedule(doc, name_tokens, reject_tokens=None):
+    reject_tokens = reject_tokens or []
+    best = None
+    best_score = -1
+    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements():
+        try:
+            if vs.IsTemplate:
+                continue
+            name_value = (vs.Name or "").lower()
+            if not all(token in name_value for token in name_tokens):
+                continue
+            if any(token in name_value for token in reject_tokens):
+                continue
+            score = len(name_tokens)
+            if "sheet" in name_value:
+                score += 1
+            if best is None or score > best_score:
+                best = vs
+                best_score = score
+        except Exception:
+            continue
+    return best
+
+
+def duplicate_schedule_view(doc, master_schedule, new_name):
+    new_id = master_schedule.Duplicate(ViewDuplicateOption.Duplicate)
+    schedule = doc.GetElement(new_id)
+    try:
+        schedule.Name = new_name
     except Exception:
-        rollback_transaction(ttn)
+        schedule.Name = "{} ({})".format(new_name, schedule.Id.IntegerValue)
+    return schedule
+
+
+def build_pipe_schedule_from_scratch(doc, schedule_name, current_prefix, source_view):
+    schedule = ViewSchedule.CreateSchedule(
+        doc, ElementId(BuiltInCategory.OST_PipeCurves)
+    )
+    try:
+        schedule.Name = schedule_name
+    except Exception:
+        schedule.Name = "{} ({})".format(schedule_name, schedule.Id.IntegerValue)
+    configure_pipe_schedule_tool_standard(schedule, current_prefix, source_view)
+    return schedule, "reconstructed"
+
+
+def configure_pipe_schedule_tool_standard(schedule, current_prefix, source_view):
+    remove_all_schedule_fields(schedule)
+    pipe_fields = [
+        "Segment Description",
+        "Size",
+        "Outside Diameter",
+        "Length",
+        "Inside Diameter",
+        "Roughness",
+        "Article number",
+        "Definition",
+        "GTIN",
+        "Weight",
+        "Manufacturer",
+        "Count",
+    ]
+    level_name = None
+    try:
+        level_name = (
+            source_view.GenLevel.Name if source_view and source_view.GenLevel else None
+        )
+    except Exception:
+        level_name = None
+    if level_name:
+        pipe_fields.append("Reference Level")
+    for field_name in pipe_fields:
+        add_schedule_field_by_name(schedule, field_name)
+    add_schedule_field_by_name(schedule, "Comments")
+    set_schedule_field_hidden(schedule, "Segment Description", True)
+    set_schedule_field_hidden(schedule, "Comments", True)
+    set_schedule_length_field_to_mm(schedule, "Length")
+    remove_schedule_filters_by_field_names(
+        schedule,
+        ["Segment Description", "Manufacturer", "Reference Level", "Level", "Comments"],
+    )
+    add_schedule_string_filter(
+        schedule,
+        "Segment Description",
+        ScheduleFilterType.Contains,
+        "ACO pipe 1.4301 EPDM",
+    )
+    add_schedule_string_filter(
+        schedule, "Manufacturer", ScheduleFilterType.Equal, "ACO"
+    )
+    add_schedule_string_filter(
+        schedule, "Segment Description", ScheduleFilterType.Contains, "single socket"
+    )
+    if level_name:
+        if not add_schedule_string_filter(
+            schedule, "Reference Level", ScheduleFilterType.Equal, level_name
+        ):
+            add_schedule_string_filter(
+                schedule, "Level", ScheduleFilterType.Equal, level_name
+            )
+    add_schedule_string_filter(
+        schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+    )
+    try:
+        schedule.Definition.IsItemized = False
+        schedule.Definition.ShowGrandTotal = True
+        schedule.Definition.ShowGrandTotalCount = False
+        schedule.Definition.ShowGrandTotalTitle = False
+    except Exception:
+        pass
+    clear_schedule_sorting(schedule)
+    add_schedule_sort(schedule, "Size", True, footer_mode="totals")
+    add_schedule_sort(schedule, "Article number", True)
+    try:
+        schedule.ShowHeaders = True
+        schedule.ShowTitle = True
+    except Exception:
+        pass
+    return schedule
+
+
+def build_fitting_schedule_from_scratch(
+    doc, schedule_name, current_prefix, source_view
+):
+    schedule = ViewSchedule.CreateSchedule(doc, ElementId.InvalidElementId)
+    try:
+        schedule.Name = schedule_name
+    except Exception:
+        schedule.Name = "{} ({})".format(schedule_name, schedule.Id.IntegerValue)
+    configure_fitting_schedule_visible_fields(schedule)
+    apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
+    try:
+        schedule.ShowHeaders = True
+        schedule.ShowTitle = True
+    except Exception:
+        pass
+    return schedule, "reconstructed"
+
+
+def apply_current_run_comments_filter(schedule, current_prefix):
+    remove_schedule_filters_by_field_names(schedule, ["Comments"])
+    add_schedule_field_by_name(schedule, "Comments")
+    set_schedule_field_hidden(schedule, "Comments", True)
+    return add_schedule_string_filter(
+        schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+    )
+
+
+def create_prefab_schedule(
+    doc, kind, sheet_code, current_prefix, source_view, runtime_config=None
+):
+    schedule = None
+    mode = "reconstructed"
+    level_name = ""
+    try:
+        level_name = (
+            (source_view.GenLevel.Name or "").lower()
+            if source_view and source_view.GenLevel
+            else ""
+        )
+    except Exception:
+        level_name = ""
+    selected_master = None
+    schedule_mode = (
+        runtime_config.get("schedule_mode")
+        if runtime_config
+        else "Ignore selected masters and use current fallback/build logic"
+    )
+    use_selected_master_as_is = schedule_mode == "Use selected master as-is"
+    use_selected_master_normalize = (
+        schedule_mode == "Use selected master, then normalize to tool standard"
+    )
+    use_selected_master = use_selected_master_as_is or use_selected_master_normalize
+    if runtime_config and use_selected_master:
+        key = (
+            "selected_pipe_schedule_master_id"
+            if kind == "pipe"
+            else "selected_fitting_schedule_master_id"
+        )
+        master_id = runtime_config.get(key)
+        if master_id:
+            try:
+                selected_master = doc.GetElement(ElementId(int(master_id)))
+            except Exception:
+                selected_master = None
+        if selected_master is None:
+            print(
+                "CONFIG RESOLVE -> {} schedule master: fallback existing build logic".format(
+                    kind
+                )
+            )
+    if kind == "pipe":
+        master = selected_master or find_master_schedule(doc, ["aco pipe"], ["fitting"])
+        if master is not None:
+            schedule = duplicate_schedule_view(
+                doc, master, "{} - Pipe Schedule".format(sheet_code)
+            )
+            mode = "duplicated_selected_master" if selected_master else "duplicated"
+            if selected_master:
+                if use_selected_master_normalize:
+                    configure_pipe_schedule_tool_standard(
+                        schedule, current_prefix, source_view
+                    )
+                    mode = "duplicated_selected_master_normalized"
+                else:
+                    apply_current_run_comments_filter(schedule, current_prefix)
+            else:
+                remove_schedule_filters_by_field_names(
+                    schedule, ["Reference Level", "Level", "Comments"]
+                )
+                add_schedule_field_by_name(schedule, "Comments")
+                set_schedule_field_hidden(schedule, "Comments", True)
+                if level_name:
+                    if not add_schedule_string_filter(
+                        schedule,
+                        "Reference Level",
+                        ScheduleFilterType.Equal,
+                        source_view.GenLevel.Name,
+                    ):
+                        add_schedule_string_filter(
+                            schedule,
+                            "Level",
+                            ScheduleFilterType.Equal,
+                            source_view.GenLevel.Name,
+                        )
+                add_schedule_string_filter(
+                    schedule, "Comments", ScheduleFilterType.BeginsWith, current_prefix
+                )
+        else:
+            schedule, mode = build_pipe_schedule_from_scratch(
+                doc,
+                "{} - Pipe Schedule".format(sheet_code),
+                current_prefix,
+                source_view,
+            )
+    else:
+        master = selected_master or find_master_schedule(doc, ["aco pipe fittings"])
+        if master is not None:
+            schedule = duplicate_schedule_view(
+                doc, master, "{} - Pipe Fittings Schedule".format(sheet_code)
+            )
+            mode = "duplicated_selected_master" if selected_master else "duplicated"
+            if selected_master:
+                if use_selected_master_normalize:
+                    configure_fitting_schedule_visible_fields(schedule)
+                    apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
+                    mode = "duplicated_selected_master_normalized"
+                else:
+                    apply_current_run_comments_filter(schedule, current_prefix)
+                duplicated_visible = get_schedule_visible_element_count(
+                    schedule, [BuiltInCategory.OST_PipeFitting]
+                )
+                print(
+                    "FITTING SCHEDULE -> duplicated visible elements: {}".format(
+                        duplicated_visible
+                    )
+                )
+                print("FITTING SCHEDULE -> fallback rebuild triggered: no")
+            else:
+                configure_fitting_schedule_visible_fields(schedule)
+                apply_fitting_schedule_filters_and_sorting(schedule, current_prefix)
+                duplicated_visible = get_schedule_visible_element_count(
+                    schedule, [BuiltInCategory.OST_PipeFitting]
+                )
+                print(
+                    "FITTING SCHEDULE -> duplicated visible elements: {}".format(
+                        duplicated_visible
+                    )
+                )
+                fallback_rebuild = duplicated_visible <= 0
+                print(
+                    "FITTING SCHEDULE -> fallback rebuild triggered: {}".format(
+                        "yes" if fallback_rebuild else "no"
+                    )
+                )
+                if fallback_rebuild:
+                    try:
+                        doc.Delete(schedule.Id)
+                    except Exception:
+                        pass
+                    schedule, mode = build_fitting_schedule_from_scratch(
+                        doc,
+                        "{} - Pipe Fittings Schedule".format(sheet_code),
+                        current_prefix,
+                        source_view,
+                    )
+        else:
+            print("FITTING SCHEDULE -> duplicated visible elements: 0")
+            print("FITTING SCHEDULE -> fallback rebuild triggered: yes")
+            schedule, mode = build_fitting_schedule_from_scratch(
+                doc,
+                "{} - Pipe Fittings Schedule".format(sheet_code),
+                current_prefix,
+                source_view,
+            )
+        print(
+            "FITTING SCHEDULE -> final field list: {}".format(
+                ", ".join(get_schedule_field_names(schedule))
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> final filters: {}".format(
+                " | ".join(get_schedule_filter_descriptions(schedule))
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> final sorting/grouping: {}".format(
+                " | ".join(get_schedule_sort_descriptions(schedule))
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> visible rows after config: {}".format(
+                get_schedule_body_row_count(schedule)
+            )
+        )
+        print(
+            "FITTING SCHEDULE -> final visible elements: {}".format(
+                get_schedule_visible_element_count(
+                    schedule, [BuiltInCategory.OST_PipeFitting]
+                )
+            )
+        )
+    return schedule, mode
+
+
+def add_schedule_field_if_available(schedule, bip_value):
+    sched_field = get_schedule_field_by_bip(schedule, bip_value)
+    if sched_field is None:
+        return None
+    try:
+        return schedule.Definition.AddField(sched_field)
+    except Exception:
+        return None
+
+
+def apply_schedule_template_if_available(doc, schedule, tokens):
+    lowered_tokens = [t.lower() for t in tokens if t]
+    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements():
+        try:
+            if not vs.IsTemplate:
+                continue
+            name_value = (vs.Name or "").lower()
+            if all(token in name_value for token in lowered_tokens):
+                schedule.ViewTemplateId = vs.Id
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def create_filtered_prefab_schedule(
+    doc, category_bic, schedule_name, current_prefix, template_tokens
+):
+    schedule = ViewSchedule.CreateSchedule(doc, ElementId(category_bic))
+    try:
+        schedule.Name = schedule_name
+    except Exception:
+        schedule.Name = "{} ({})".format(schedule_name, schedule.Id.IntegerValue)
+    try:
+        schedule.Definition.IsItemized = True
+    except Exception:
+        pass
+    add_schedule_field_if_available(
+        schedule, BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM
+    )
+    add_schedule_field_if_available(schedule, BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+    comments_field = add_schedule_field_if_available(
+        schedule, BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS
+    )
+    if comments_field is not None:
+        try:
+            schedule.Definition.AddFilter(
+                ScheduleFilter(
+                    comments_field.FieldId,
+                    ScheduleFilterType.BeginsWith,
+                    current_prefix,
+                )
+            )
+        except Exception:
+            try:
+                schedule.Definition.AddFilter(
+                    ScheduleFilter(
+                        comments_field.FieldId,
+                        ScheduleFilterType.Equal,
+                        current_prefix,
+                    )
+                )
+            except Exception:
+                pass
+    apply_schedule_template_if_available(doc, schedule, template_tokens)
+    return schedule
+
+
+def try_place_schedule_on_sheet(doc, sheet, schedule, point_xyz):
+    try:
+        ScheduleSheetInstance.Create(doc, sheet.Id, schedule.Id, point_xyz)
+        return True
+    except Exception as ex:
+        print(
+            "SCHEDULES -> schedule placement skipped for {}: {}".format(
+                schedule.Name, ex
+            )
+        )
+        return False
+
+
+def apply_prefab_changes_to_view(
+    doc,
+    uidoc,
+    target_view,
+    result,
+    polygon,
+    gathered_elements,
+    regular_pipe_tag_mode=None,
+):
+    """
+    Must:
+    - place/update prefab text note in target_view
+    - add/remove pipe tags in target_view
+    - not create sheet
+    - not duplicate any view
+    - commit changes in a real transaction
+    - return counts/debug info
+    """
+    print("APPLY PREFAB -> transaction start")
+    print(
+        "APPLY PREFAB -> target view:",
+        target_view.Name,
+        target_view.Id.IntegerValue,
+    )
+    if regular_pipe_tag_mode is not None:
+        apply_regular_pipe_tag_mode(regular_pipe_tag_mode)
+    scanned_pipes = []
+    scanned_pipe_ids = set()
+    for e in gathered_elements:
+        if (
+            e
+            and e.Category
+            and e.Category.Id.IntegerValue == int(BuiltInCategory.OST_PipeCurves)
+            and not is_excluded_nlrs_pipe(e)
+        ):
+            scanned_pipes.append(e)
+            scanned_pipe_ids.add(e.Id.IntegerValue)
+
+    print("APPLY PREFAB -> scanned pipe ids count:", len(scanned_pipe_ids))
+    resolved, missing_types = resolve_required_tag_symbols(doc)
+    sym_aco = resolved.get("ACO_PIPE")
+    sym_vert = resolved.get("VERT_ARROW")
+    sym_extra = resolved.get("EXTRA_HORIZONTAL")
+
+    created_count = 0
+    kept_count = 0
+    recreated_count = 0
+    deleted_count = 0
+    remove_count = 0
+    created_extra_count = 0
+    failures = []
+    text_note_done = False
+    original_template_id = None
+    template_detached = False
+    occupied_nonvert_heads = []
+    nonvertical_adjusted = 0
+    vertical_preserved = 0
+    t = Transaction(doc, "Apply prefab tags/text")
+    try:
+        t.Start()
+
+        try:
+            original_template_id = target_view.ViewTemplateId
+        except Exception:
+            original_template_id = ElementId.InvalidElementId
+        print(
+            "APPLY ONLY -> original template id:",
+            original_template_id.IntegerValue if original_template_id else -1,
+        )
+        try:
+            if (
+                original_template_id
+                and original_template_id != ElementId.InvalidElementId
+            ):
+                target_view.ViewTemplateId = ElementId.InvalidElementId
+                template_detached = True
+                print("APPLY ONLY -> template detached for tagging")
+        except Exception:
+            pass
+
+        raw_text = (result.get("TextNote", "") or "").strip()
+        if raw_text:
+            pminx, pminy, _, _ = polygon_bounds_xy(polygon)
+            note_pt = XYZ(pminx + XY_PAD, pminy + XY_PAD, 0)
+            prefab_re = re.compile(r"\d+(?:\.\d+)+")
+            notes = (
+                FilteredElementCollector(doc, target_view.Id)
+                .OfClass(TextNote)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+            target_note = None
+            for n in notes:
+                try:
+                    txt = n.Text or ""
+                    p = n.Coord
+                    if prefab_re.search(txt) and is_point_inside_polygon(
+                        XYZ(p.X, p.Y, 0), polygon
+                    ):
+                        target_note = n
+                        break
+                except Exception:
+                    continue
+            if target_note:
+                target_note.Text = raw_text
+                text_note_done = True
+            else:
+                nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+                if nt:
+                    TextNote.Create(
+                        doc, target_view.Id, note_pt, raw_text, TextNoteOptions(nt.Id)
+                    )
+                    text_note_done = True
+
+        existing_by_host = collect_pipe_tags_by_host(target_view, scanned_pipe_ids)
+        extra_targets, verticals = find_extra_horizontal_targets(scanned_pipes)
+        print("FLOOR PLAN -> vertical pipes:", len(verticals))
+        print("FLOOR PLAN -> extra horizontal-connected targets:", len(extra_targets))
+        print(
+            "FLOOR PLAN -> extra horizontal target ids:",
+            sorted(list(extra_targets))[:20],
+        )
+        print(
+            "APPLY PREFAB -> existing mapped pipe tags count:",
+            len(existing_by_host),
+        )
+        for p in scanned_pipes:
+            desired_kind = resolve_pipe_tag_kind(p)
+            host_tags = existing_by_host.get(p.Id.IntegerValue, [])
+            matching_tag = None
+            extra_tags = []
+            for tag in host_tags:
+                if matching_tag is None and tag_matches_kind(tag, desired_kind):
+                    matching_tag = tag
+                else:
+                    extra_tags.append(tag)
+            for extra_tag in extra_tags:
+                try:
+                    doc.Delete(extra_tag.Id)
+                    deleted_count += 1
+                except Exception:
+                    pass
+            if matching_tag is not None:
+                kept_count += 1
+                continue
+            is_vert = desired_kind == "VERT_ARROW"
+            if is_vert:
+                sym = sym_vert
+                use_leader = bool(TAGCFG_VERD.get("leader", False))
+                use_offset_mm = TAGCFG_VERD.get("offset_mm", 0)
+            else:
+                sym = sym_aco
+                use_leader = bool(TAGCFG_ACO.get("leader", True))
+                use_offset_mm = TAGCFG_ACO.get("offset_mm", 400)
+            if sym is None:
+                failures.append(p.Id.IntegerValue)
+                continue
+            for old_tag in host_tags:
+                try:
+                    doc.Delete(old_tag.Id)
+                    deleted_count += 1
+                except Exception:
+                    pass
+            try:
+                pt = _midpoint_or_center(p, target_view)
+                tag = IndependentTag.Create(
+                    doc,
+                    target_view.Id,
+                    Reference(p),
+                    use_leader,
+                    TagMode.TM_ADDBY_CATEGORY,
+                    TagOrientation.Horizontal,
+                    pt,
+                )
+                tag.ChangeTypeId(sym.Id)
+                if use_leader:
+                    try:
+                        tag.HasLeader = True
+                    except Exception:
+                        pass
+                if is_vert:
+                    vertical_preserved += 1
+                elif use_offset_mm and use_offset_mm > 0:
+                    head_pt = choose_plan_tag_head(
+                        p,
+                        target_view,
+                        pt,
+                        max(320, use_offset_mm),
+                        occupied_nonvert_heads,
+                    )
+                    try:
+                        tag.TagHeadPosition = head_pt
+                        occupied_nonvert_heads.append(head_pt)
+                        nonvertical_adjusted += 1
+                    except Exception:
+                        pass
+                if host_tags:
+                    recreated_count += 1
+                else:
+                    created_count += 1
+            except Exception as ex:
+                print(
+                    "APPLY PREFAB -> tag create failed for {}: {}".format(
+                        p.Id.IntegerValue, ex
+                    )
+                )
+                failures.append(p.Id.IntegerValue)
+
+        for host_id in sorted(extra_targets):
+            pipe = doc.GetElement(ElementId(host_id))
+            if not pipe:
+                continue
+            existing_extra = find_specific_tag_on_host_in_view(
+                doc,
+                target_view,
+                pipe.Id,
+                TAGCFG_EXTRA_H["family"],
+                TAGCFG_EXTRA_H["type"],
+            )
+            if existing_extra is not None:
+                continue
+            if sym_extra is None:
+                continue
+            try:
+                pt = _midpoint_or_center(pipe, target_view)
+                extra_tag = IndependentTag.Create(
+                    doc,
+                    target_view.Id,
+                    Reference(pipe),
+                    bool(TAGCFG_EXTRA_H.get("leader", True)),
+                    TagMode.TM_ADDBY_CATEGORY,
+                    TagOrientation.Horizontal,
+                    pt,
+                )
+                extra_tag.ChangeTypeId(sym_extra.Id)
+                off = view_offset_vector(
+                    target_view, TAGCFG_EXTRA_H.get("offset_mm", 350)
+                )
+                try:
+                    extra_tag.HasLeader = True
+                except Exception:
+                    pass
+                try:
+                    head_pt = choose_plan_tag_head(
+                        pipe,
+                        target_view,
+                        pt,
+                        max(340, TAGCFG_EXTRA_H.get("offset_mm", 350)),
+                        occupied_nonvert_heads,
+                    )
+                    extra_tag.TagHeadPosition = head_pt
+                    occupied_nonvert_heads.append(head_pt)
+                except Exception:
+                    pass
+                created_extra_count += 1
+            except Exception as ex:
+                print(
+                    "FLOOR PLAN -> extra horizontal tag create failed for {}: {}".format(
+                        host_id, ex
+                    )
+                )
+
+        doc.Regenerate()
+        print(
+            "APPLY PREFAB -> counts before commit: keep={}, create={}, recreate={}, delete={}, remove={}".format(
+                kept_count, created_count, recreated_count, deleted_count, remove_count
+            )
+        )
+        print("FLOOR PLAN -> nonvertical tags adjusted:", nonvertical_adjusted)
+        print("FLOOR PLAN -> vertical tags preserved:", vertical_preserved)
+        print("FLOOR PLAN -> extra horizontal tag created:", created_extra_count)
+        t.Commit()
+        print("APPLY PREFAB -> transaction committed")
+    except Exception:
+        try:
+            if t.HasStarted():
+                t.RollBack()
+        except Exception:
+            pass
         raise
 
-region_min, region_max = get_region_bounding_box(scanned_elems)
-boundary_source_view = uidoc.ActiveView
+    post_count = count_pipe_tags_in_view(doc, target_view)
+    print("APPLY PREFAB -> pipe tags visible in target view after commit:", post_count)
+    print("APPLY PREFAB -> kept tags count:", kept_count)
+    print("APPLY PREFAB -> recreated tags count:", recreated_count)
+    print("APPLY PREFAB -> created tags count:", created_count)
+    print("APPLY PREFAB -> deleted tags count:", deleted_count)
+    print("FLOOR PLAN -> extra horizontal tag created:", created_extra_count)
+    if template_detached:
+        print("APPLY ONLY -> template left detached after apply-only")
 
-
-def run_sheet_creation_workflow(
-    base_code, scanned_ids, scanned_elems, region_min, region_max, source_view
-):
-    source_plan = resolve_dup_source_plan_view(
-        doc, source_view, preferred_name_contains="V00 - C00_Prefab Sets"
-    )
-    if source_plan is None:
+    if missing_types:
         TaskDialog.Show(
-            "Sheet Generator",
-            "No valid primary ViewPlan was found for duplication.",
+            get_runtime_window_title(),
+            "Could not find required tag types:\n- {}".format(
+                "\n- ".join(sorted(missing_types))
+            ),
+        )
+    if failures:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Tag creation failed for pipe ids:\n- {}".format(
+                "\n- ".join([str(x) for x in sorted(set(failures))])
+            ),
+        )
+
+    return {
+        "target_view_name": target_view.Name,
+        "target_view_id": target_view.Id.IntegerValue,
+        "kept_tags": kept_count,
+        "added_tags": created_count,
+        "recreated_tags": recreated_count,
+        "removed_tags": remove_count,
+        "deleted_tags": deleted_count,
+        "text_note_placed": text_note_done,
+        "template_detached": template_detached,
+        "scanned_pipe_ids": sorted(list(scanned_pipe_ids)),
+        "extra_horizontal_tags_created": created_extra_count,
+    }
+
+
+def main():
+    print("WINDOW TITLE USED -> {}".format(get_runtime_window_title()))
+    scanned_source_view = uidoc.ActiveView
+    scanned_source_view_id = scanned_source_view.Id
+    print(
+        "SCANNED SOURCE VIEW:",
+        scanned_source_view.Name,
+        scanned_source_view_id.IntegerValue,
+    )
+    gathered_elements, polygon = select_boundary_and_gather()
+    if not gathered_elements:
+        MessageBox.Show(
+            "No elements were gathered. Cancelled.", get_runtime_window_title()
         )
         return
 
-    orig = source_plan
+    filtered = filter_relevant_elements(gathered_elements)
+    if not filtered:
+        MessageBox.Show(
+            "No relevant elements found in region.", get_runtime_window_title()
+        )
+        return
 
-    # grab the original crop box transform so the region maps to the same coordinate system
-    orig_bb = orig.CropBox
-    orig_trans = orig_bb.Transform
+    result = show_element_editor(
+        filtered, region_elements=gathered_elements, region_polygon=polygon
+    )
+    if result is None:
+        return
 
-    duplicate_option = ViewDuplicateOption.WithDetailing
+    runtime_config = prompt_run_configuration()
+    if runtime_config is None:
+        return
+    regular_pipe_tag_mode = runtime_config.get("regular_tag_mode_config")
 
-    primary_view_id = "n/a"
-    if hasattr(orig, "GetPrimaryViewId"):
-        try:
-            primary_view_id = orig.GetPrimaryViewId().IntegerValue
-        except Exception:
-            primary_view_id = "n/a"
+    workflow_choice = choose_post_editor_workflow()
+    if workflow_choice == "cancel":
+        return
 
-    duplicate_debug_info = (
-        "Source view before duplicate:\n"
-        "Id: {}\n"
-        "Name: {}\n"
-        "ViewType: {}\n"
-        "IsTemplate: {}\n"
-        "PrimaryViewId: {}".format(
-            orig.Id.IntegerValue,
-            orig.Name,
-            orig.ViewType,
-            orig.IsTemplate,
-            primary_view_id,
+    uidoc.Selection.SetElementIds(List[ElementId]())
+
+    baseCode = result["TextNote"]
+    for eData in result["Elements"]:
+        if eData["Category"] == "Pipe Fittings":
+            eData["NewCode"] = baseCode
+
+    if not result.get("TextNotePlaced", False):
+        base_raw = (result.get("TextNote", "") or "").strip()
+        m = re.search(r"([\d\.]+)", base_raw)
+        base = m.group(1) if m else "0"
+        pipe_entries = []
+        for idx, eData in enumerate(result["Elements"]):
+            if eData["Category"] == "Pipes":
+                elem = doc.GetElement(ElementId(int(str(eData["Id"]))))
+                if elem:
+                    bb = elem.get_BoundingBox(uidoc.ActiveView)
+                    if bb:
+                        center = XYZ(
+                            (bb.Min.X + bb.Max.X) / 2.0,
+                            (bb.Min.Y + bb.Max.Y) / 2.0,
+                            (bb.Min.Z + bb.Max.Z) / 2.0,
+                        )
+                        pipe_entries.append((idx, center))
+        pipe_entries.sort(key=lambda x: (x[1].X, x[1].Y))
+        ctr = 1
+        for i, _ in pipe_entries:
+            result["Elements"][i]["NewCode"] = base + "." + str(ctr)
+            ctr += 1
+        for eData in result["Elements"]:
+            if eData["Category"] == "Pipe Fittings":
+                eData["NewCode"] = base
+
+    source_view = scanned_source_view
+    if not isinstance(source_view, ViewPlan):
+        MessageBox.Show(
+            "Active view is not a plan/callout view.", get_runtime_window_title()
+        )
+        return
+
+    resolved_syms, missing_req = resolve_required_tag_symbols(doc)
+    if missing_req:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Could not find required tag types:\n- " + "\n- ".join(missing_req),
+        )
+
+    apply_info = apply_prefab_changes_to_view(
+        doc,
+        uidoc,
+        source_view,
+        result,
+        polygon,
+        gathered_elements,
+        regular_pipe_tag_mode,
+    )
+
+    comment_sync_stats = sync_prefab_comments_for_current_run(doc, result)
+    print(
+        "FITTING COMMENTS -> scanned fittings count: {}".format(
+            comment_sync_stats.get("scanned_fittings", 0)
         )
     )
-    print(duplicate_debug_info)
-    TaskDialog.Show("Sheet Generator Debug", duplicate_debug_info)
+    print(
+        "FITTING COMMENTS -> comments written successfully: {}".format(
+            comment_sync_stats.get("written_fittings", 0)
+        )
+    )
+    log_scanned_fitting_filter_check(result)
+
+    if workflow_choice == "apply_only":
+        target_view = source_view
+        try:
+            if uidoc.ActiveView.Id != target_view.Id:
+                uidoc.ActiveView = target_view
+        except Exception as ex:
+            print("APPLY ONLY -> failed to activate target view:", ex)
+
+        scanned_pipe_ids = set(apply_info.get("scanned_pipe_ids", []))
+        final_tag_ids = get_pipe_tag_ids_for_hosts_in_view(
+            doc, target_view, scanned_pipe_ids
+        )
+        print("APPLY ONLY -> before success dialog")
+        try:
+            print(
+                "APPLY ONLY -> active view now:",
+                uidoc.ActiveView.Name,
+                uidoc.ActiveView.Id.IntegerValue,
+            )
+        except Exception as ex:
+            print("APPLY ONLY -> active view read failed:", ex)
+        print(
+            "APPLY ONLY -> target view now:",
+            target_view.Name,
+            target_view.Id.IntegerValue,
+        )
+        print("APPLY ONLY -> tag ids before popup:", final_tag_ids)
+        print("APPLY ONLY -> final tag count:", len(final_tag_ids))
+        try:
+            print(
+                "APPLY ONLY -> target view template id:",
+                target_view.ViewTemplateId.IntegerValue,
+            )
+            print("APPLY ONLY -> target view is template:", target_view.IsTemplate)
+        except Exception as ex:
+            print("APPLY ONLY -> template info read failed:", ex)
+        pipe_tag_cat = Category.GetCategory(doc, BuiltInCategory.OST_PipeTags)
+        if pipe_tag_cat:
+            try:
+                print(
+                    "APPLY ONLY -> pipe tag category hidden:",
+                    target_view.GetCategoryHidden(pipe_tag_cat.Id),
+                )
+            except Exception as ex:
+                print("APPLY ONLY -> failed hidden check:", ex)
+
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Prefab text and tags were applied to the current scanned view:\n{}\n\nKept tags: {}\nAdded tags: {}\nRemoved tags: {}\nText note placed: {}\nTemplate detached: {}".format(
+                target_view.Name,
+                apply_info.get("kept_tags", 0),
+                apply_info.get("added_tags", 0),
+                apply_info.get("removed_tags", 0),
+                apply_info.get("text_note_placed", False),
+                apply_info.get("template_detached", False),
+            ),
+        )
+        post_popup_tag_ids = get_pipe_tag_ids_for_hosts_in_view(
+            doc, target_view, scanned_pipe_ids
+        )
+        print("APPLY ONLY -> success dialog closed")
+        print("APPLY ONLY -> tag ids after popup returns:", post_popup_tag_ids)
+        print("APPLY ONLY -> tag count after popup returns:", len(post_popup_tag_ids))
+        try:
+            print(
+                "APPLY ONLY -> final template id before return:",
+                target_view.ViewTemplateId.IntegerValue,
+            )
+        except Exception as ex:
+            print("APPLY ONLY -> final template id read failed:", ex)
+        if post_popup_tag_ids:
+            try:
+                uidoc.ActiveView = target_view
+            except Exception as ex:
+                print("APPLY ONLY -> failed to reactivate target view:", ex)
+            try:
+                uidoc.RefreshActiveView()
+            except Exception as ex:
+                print("APPLY ONLY -> refresh active view failed:", ex)
+        print("APPLY ONLY -> returning cleanly from main")
+        return
+
+    m = re.search(r"([\d\.]+)", result["TextNote"])
+    base = m.group(1) if m else (result["TextNote"] or "").strip()
+    current_prefix = base
+    scanned_scope_ids = set()
+    scanned_pipe_ids = set(apply_info.get("scanned_pipe_ids", []))
+    for elem in gathered_elements:
+        try:
+            if not elem or not elem.Category:
+                continue
+            cat_id = elem.Category.Id.IntegerValue
+            if cat_id in (
+                int(BuiltInCategory.OST_PipeCurves),
+                int(BuiltInCategory.OST_PipeFitting),
+            ):
+                scanned_scope_ids.add(elem.Id.IntegerValue)
+        except Exception:
+            continue
+    print("CLEANUP -> current prefab prefix: {}".format(current_prefix))
+    print("CLEANUP -> scanned scope elements: {}".format(len(scanned_scope_ids)))
+    source_tag_count_before_cleanup = count_pipe_tags_for_scanned_pipes(
+        doc, source_view, scanned_pipe_ids
+    )
+    protected_source_tags = len(
+        get_pipe_tags_for_hosts_in_view(doc, source_view, scanned_pipe_ids)
+    )
+    print(
+        "SOURCE TAG PROTECT -> before cleanup count: {}".format(
+            source_tag_count_before_cleanup
+        )
+    )
+    print(
+        "SOURCE TAG PROTECT -> skipped protected source tags: {}".format(
+            protected_source_tags
+        )
+    )
+    print(
+        "SOURCE TAG PROTECT -> expected scanned pipe tag count: {}".format(
+            len(scanned_pipe_ids)
+        )
+    )
+    source_cleanup_removed = cleanup_stale_prefab_text_notes_only_in_view(
+        doc, source_view, polygon, current_prefix
+    )
+    source_tag_count_after_cleanup = count_pipe_tags_for_scanned_pipes(
+        doc, source_view, scanned_pipe_ids
+    )
+    print("CLEANUP -> stale removed source: {}".format(source_cleanup_removed))
+    print(
+        "SOURCE TAG PROTECT -> after cleanup count: {}".format(
+            source_tag_count_after_cleanup
+        )
+    )
+
     all_tbs = list(
         FilteredElementCollector(doc)
         .OfCategory(BuiltInCategory.OST_TitleBlocks)
         .OfClass(FamilySymbol)
         .ToElements()
     )
-    if not all_tbs:
-        MessageBox.Show("No title-block types found.", "Error")
+    selected_titleblock = None
+    try:
+        selected_titleblock_id = runtime_config.get("selected_titleblock_id")
+        if selected_titleblock_id:
+            selected_titleblock = doc.GetElement(ElementId(int(selected_titleblock_id)))
+    except Exception:
+        selected_titleblock = None
+    if selected_titleblock is not None:
+        all_tbs = [selected_titleblock]
+        print(
+            "RESOLVE -> titleblock resolved/fallback using runtime selection: {}".format(
+                get_symbol_display(selected_titleblock)
+            )
+        )
+    elif not all_tbs:
+        MessageBox.Show("No title-block types found.", get_runtime_window_title())
         return
 
     class TBPicker(Form):
         def __init__(self, tbs):
             self.tbs = tbs
-            self.Text = "Choose a Title-Block"
-            self.ClientSize = Size(300, 350)
-
+            self.Text = "{} - Choose a Title-Block".format(get_runtime_window_title())
+            self.ClientSize = Size(340, 360)
             self.lb = ListBox()
-            self.lb.Bounds = Rectangle(10, 10, 280, 280)
+            self.lb.Bounds = Rectangle(10, 10, 320, 300)
             for sym in tbs:
-                fam = sym.FamilyName
+                fam = sym.Family.Name if sym.Family else ""
                 type_name = (
                     sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
                     or ""
                 )
                 self.lb.Items.Add(fam + " - " + type_name)
             self.Controls.Add(self.lb)
-
             ok = Button(
-                Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 300)
+                Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 320)
             )
             ca = Button(
                 Text="Cancel",
                 DialogResult=DialogResult.Cancel,
-                Location=Point(100, 300),
+                Location=Point(100, 320),
             )
             self.Controls.Add(ok)
             self.Controls.Add(ca)
@@ -2614,213 +7441,408 @@ def run_sheet_creation_workflow(
     existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
     existing_numbers = {s.SheetNumber for s in existing_sheets}
 
-    picker = TBPicker(all_tbs)
-    if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
-        MessageBox.Show("Sheet creation cancelled.", "Info")
-        return
+    if selected_titleblock is not None:
+        title_block = selected_titleblock
+    else:
+        picker = TBPicker(all_tbs)
+        if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
+            MessageBox.Show(
+                "Sheet creation cancelled. Tags/text are kept.",
+                get_runtime_window_title(),
+            )
+            return
+        title_block = all_tbs[picker.lb.SelectedIndex]
+    sheet_code = base
+    if sheet_code in existing_numbers:
+        sheet_code = "{} ({})".format(base, source_view.Id.IntegerValue)
 
-    title_block = all_tbs[picker.lb.SelectedIndex]
-    titleblock_type_id = title_block.Id
-    if not titleblock_type_id:
-        print("User cancelled titleblock selection.")
-        return
-
-    tg = TransactionGroup(doc, "Prefab Sheet Creation")
     try:
-        tg.Start()
+        if hasattr(title_block, "IsActive") and (not title_block.IsActive):
+            with Transaction(doc, "Activate title block") as t_act:
+                t_act.Start()
+                title_block.Activate()
+                t_act.Commit()
+    except:
+        pass
 
-        new_view = None
-        view3d = None
-        sheet = None
-        tb_center = None
-
-        with Tx(doc, "Prefab - Create Views"):
-            require_modifiable(doc, "Prefab - Create Views (tx start)")
-            new_view, route_used = duplicate_or_recreate_plan_view(
-                doc, orig, duplicate_option, base_code
-            )
-            print("Plan view created via: {}".format(route_used))
-            require_modifiable(doc, "Prefab - Create Views / ViewTemplateId")
-            new_view.ViewTemplateId = ElementId.InvalidElementId
-            require_modifiable(doc, "Prefab - Create Views / Discipline")
-            new_view.Discipline = ViewDiscipline.Coordination
-            require_modifiable(doc, "Prefab - Create Views / Scale")
-            new_view.Scale = 25
-
-            bb = BoundingBoxXYZ()
-            bb.Min = region_min
-            bb.Max = region_max
-            bb.Transform = orig_trans
-            require_modifiable(doc, "Prefab - Create Views / CropBoxActive")
-            new_view.CropBoxActive = True
-            require_modifiable(doc, "Prefab - Create Views / CropBoxVisible")
-            new_view.CropBoxVisible = True
-            annoParam = new_view.get_Parameter(
-                BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE
-            )
-            if annoParam and not annoParam.IsReadOnly:
-                require_modifiable(doc, "Prefab - Create Views / AnnotationCrop")
-                annoParam.Set(1)
-            require_modifiable(doc, "Prefab - Create Views / CropBox")
-            new_view.CropBox = bb
-            param = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
-            if param and not param.IsReadOnly:
-                require_modifiable(doc, "Prefab - Create Views / CropRegionVisible")
-                param.Set(0)
-            cat_drag_controls = doc.Settings.Categories.get_Item(
-                BuiltInCategory.OST_ConnectorElem
-            )
-            if cat_drag_controls and new_view.CanCategoryBeHidden(cat_drag_controls.Id):
-                require_modifiable(doc, "Prefab - Create Views / HideConnectors")
-                new_view.SetCategoryHidden(cat_drag_controls.Id, True)
-
-            all3ds = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
-            v3d_type = next(
-                v for v in all3ds if v.ViewFamily == ViewFamily.ThreeDimensional
-            )
-            require_modifiable(doc, "Prefab - Create Views / Create3D")
-            view3d = View3D.CreateIsometric(doc, v3d_type.Id)
-            view3d = ensure_orthographic_3d_view(doc, view3d)
-            try:
-                require_modifiable(doc, "Prefab - Create Views / 3DName")
-                view3d.Name = "{} - Sheet".format(base_code)
-            except Exception as ex:
-                print("3D view naming failed for {}: {}".format(base_code, ex))
-            require_modifiable(doc, "Prefab - Create Views / 3DDiscipline")
-            view3d.Discipline = ViewDiscipline.Architectural
-            require_modifiable(doc, "Prefab - Create Views / 3DScale")
-            view3d.Scale = 25
-            section_bb = BoundingBoxXYZ()
-            section_bb.Min = region_min
-            section_bb.Max = region_max
-            require_modifiable(doc, "Prefab - Create Views / SetSectionBox")
-            view3d.SetSectionBox(section_bb)
-            require_modifiable(doc, "Prefab - Create Views / IsSectionBoxActive")
-            view3d.IsSectionBoxActive = True
-            section_box = view3d.GetSectionBox()
-            if section_box:
-                require_modifiable(doc, "Prefab - Create Views / SectionBoxEnabled")
-                section_box.Enabled = True
-
-        with Tx(doc, "Prefab - Create Sheet"):
-            if base_code in existing_numbers:
-                raise Exception("Sheet already exists: {}".format(base_code))
-            require_modifiable(doc, "Prefab - Create Sheet / ViewSheet.Create")
-            sheet = ViewSheet.Create(doc, titleblock_type_id)
-            require_modifiable(doc, "Prefab - Create Sheet / SheetNumber")
-            sheet.SheetNumber = base_code
-            require_modifiable(doc, "Prefab - Create Sheet / SheetName")
-            sheet.Name = "Prefab " + base_code
-
-            titleblock_inst = next(
-                (
-                    e
-                    for e in FilteredElementCollector(doc, sheet.Id)
-                    .OfClass(FamilyInstance)
-                    .ToElements()
-                    if e.Symbol.Id == titleblock_type_id
-                ),
-                None,
-            )
-            tb_bb = titleblock_inst.get_BoundingBox(sheet) if titleblock_inst else None
-            if not tb_bb:
-                raise Exception("Could not retrieve title block bounding box.")
-
-            tb_center = XYZ(
-                (tb_bb.Min.X + tb_bb.Max.X) / 2,
-                (tb_bb.Min.Y + tb_bb.Max.Y) / 2,
-                0,
-            )
-            require_modifiable(doc, "Prefab - Create Sheet / PlanViewport")
-            Viewport.Create(doc, sheet.Id, new_view.Id, tb_center)
-            require_modifiable(doc, "Prefab - Create Sheet / 3DViewport")
-            Viewport.Create(
-                doc,
-                sheet.Id,
-                view3d.Id,
-                XYZ(tb_center.X + 0.25, tb_center.Y + 0.25, 0),
-            )
-
-        detected_systems = detect_systems(doc, scanned_ids)
-        with Tx(doc, "Prefab - Schedules"):
-            require_modifiable(doc, "Prefab - Schedules (tx start)")
-            created_schedule_ids = duplicate_schedules_for_systems(
-                doc, detected_systems, base_code
-            )
-
-            uMin, uMax = sheet.Outline.Min.U, sheet.Outline.Max.U
-            vMin, vMax = sheet.Outline.Min.V, sheet.Outline.Max.V
-            w, h = (uMax - uMin), (vMax - vMin)
-            x = uMin + 0.05 * w
-            y_start = vMax - 0.35 * h
-            spacing = 0.12 * h
-            for idx, sched_id in enumerate(created_schedule_ids):
-                y = y_start - idx * spacing
-                require_modifiable(doc, "Prefab - Schedules / PlaceSchedule")
-                ScheduleSheetInstance.Create(doc, sheet.Id, sched_id, XYZ(x, y, 0))
-
-        with Tx(doc, "Center Views and Schedules on Sheet"):
-            require_modifiable(doc, "Center Views and Schedules on Sheet (tx start)")
-            viewports = (
-                FilteredElementCollector(doc, sheet.Id).OfClass(Viewport).ToElements()
-            )
-            for vp in viewports:
-                require_modifiable(doc, "Center Views and Schedules / SetBoxCenter")
-                vp.SetBoxCenter(tb_center)
-
-        tg.Assimilate()
-
-        # ---- Phase B: annotate 3D AFTER creation is committed ----
-        if ANNOTATE_3D and view3d:
-            prev_view = uidoc.ActiveView
-            if view3d.IsTemplate:
-                print("3D tagging aborted: view is a template")
-            elif isinstance(view3d, View3D) and view3d.IsPerspective:
-                print("3D tagging aborted: perspective 3D cannot be tagged")
-            else:
-                try:
-                    uidoc.RequestViewChange(view3d)
-                    ui_yield(250)
-                    uidoc.ActiveView = view3d
-                    ui_yield(250)
-                except Exception as ex:
-                    print("WARNING: Could not activate 3D view: {}".format(ex))
-
-                try:
-                    with Tx(doc, "Prefab - Place 3D Tags (post-commit)"):
-                        require_modifiable(
-                            doc, "Prefab - Place 3D Tags (post-commit tx start)"
-                        )
-                        annotate_3d_view(
-                            doc, view3d, scanned_elems, base_code, source_view
-                        )
-                except Exception as ex:
-                    print("3D tagging failed post-commit: {}".format(ex))
-
-            try:
-                _activate_view(uidoc, prev_view)
-                ui_yield(120)
-                doc.Regenerate()
-            except Exception:
-                pass
-    except Exception as ex:
-        print("Sheet workflow failed: {}".format(ex))
+    try:
+        target_view = source_view
+        print(
+            "SHEET MODE -> using existing scanned source view:",
+            target_view.Name,
+            target_view.Id.IntegerValue,
+        )
+        print("SHEET MODE -> source view type:", target_view.ViewType)
+        print(
+            "SHEET MODE -> source view template id:",
+            target_view.ViewTemplateId.IntegerValue,
+        )
         try:
-            tg.RollBack()
+            print(
+                "SHEET MODE -> primary view id:",
+                target_view.GetPrimaryViewId().IntegerValue,
+            )
         except Exception:
-            pass
-        TaskDialog.Show("Sheet Generator", "Sheet creation failed.\n\n{}".format(ex))
-        return
+            print("SHEET MODE -> primary view id: n/a")
+
+        scanned_pipe_ids = apply_info.get("scanned_pipe_ids", [])
+        pre_sheet_tag_count = count_pipe_tags_for_scanned_pipes(
+            doc, target_view, scanned_pipe_ids
+        )
+        print(("PRE-SHEET SOURCE PIPE TAG COUNT:", pre_sheet_tag_count))
+        if pre_sheet_tag_count != len(scanned_pipe_ids):
+            print(
+                "WARNING: source scanned view does not contain all expected pipe tags before clone"
+            )
+
+        clone_name = "{} - Sheet".format(sheet_code)
+        sheet_view = create_sheet_safe_plan_from_scanned_view(
+            doc, target_view, clone_name
+        )
+        clone_cleanup_removed = cleanup_stale_prefab_annotations_in_view(
+            doc, sheet_view, scanned_pipe_ids, polygon, current_prefix
+        )
+        clone_tag_count_after_cleanup = count_pipe_tags_for_scanned_pipes(
+            doc, sheet_view, scanned_pipe_ids
+        )
+        print("CLEANUP -> stale removed cloned plan: {}".format(clone_cleanup_removed))
+        print(
+            "PLAN CLONE -> clone pipe tag count after cleanup:",
+            clone_tag_count_after_cleanup,
+        )
+        clone_hard_sync_copied = hard_sync_scanned_pipe_tags_from_source(
+            doc, target_view, sheet_view, scanned_pipe_ids
+        )
+        clone_tag_count_after_sync = count_pipe_tags_for_scanned_pipes(
+            doc, sheet_view, scanned_pipe_ids
+        )
+        print("PLAN CLONE -> hard sync copied tag count:", clone_hard_sync_copied)
+        print(
+            "PLAN CLONE -> clone scanned pipe tag count after hard sync:",
+            clone_tag_count_after_sync,
+        )
+        print("CREATED FLOOR PLAN CLONE:", sheet_view.Name, sheet_view.Id.IntegerValue)
+        print(
+            "SHEET MODE -> source scanned pipe tag count:",
+            pre_sheet_tag_count,
+        )
+        print(
+            "SHEET MODE -> clone scanned pipe tag count:",
+            count_pipe_tags_for_scanned_pipes(doc, sheet_view, scanned_pipe_ids),
+        )
+
+        code_map = {}
+        for e_data in result.get("Elements", []):
+            if e_data.get("Category") == "Pipes":
+                eid = safe_int(e_data.get("Id"), 0)
+                if eid > 0:
+                    code_map[eid] = e_data.get("NewCode") or ""
+
+        (
+            view3d_normal,
+            normal_pipe_count,
+            normal_fitting_count,
+            excluded_nlrs_normal,
+            normal_locked,
+        ) = create_prefab_3d_normal_view(doc, sheet_code, gathered_elements)
+        normal_cleanup_removed = cleanup_stale_prefab_annotations_in_view(
+            doc, view3d_normal, scanned_pipe_ids, None, current_prefix
+        )
+        print("CLEANUP -> stale removed normal 3D: {}".format(normal_cleanup_removed))
+        normal_annot = annotate_prefab_3d_view(
+            doc, uidoc, view3d_normal, gathered_elements, code_map
+        )
+        print(
+            "3D NORMAL -> annotation mode:",
+            normal_annot.get("mode"),
+            "tags={}".format(normal_annot.get("tags")),
+            "text={}".format(normal_annot.get("text")),
+        )
+
+        (
+            view3d_exploded,
+            explode_mode,
+            exploded_pipe_count,
+            exploded_fitting_count,
+            exploded_group_count,
+            excluded_nlrs_exploded,
+            exploded_locked,
+        ) = create_prefab_3d_exploded_view(doc, sheet_code, gathered_elements)
+        exploded_cleanup_removed = cleanup_stale_prefab_annotations_in_view(
+            doc, view3d_exploded, scanned_pipe_ids, None, current_prefix
+        )
+        print(
+            "CLEANUP -> stale removed exploded 3D: {}".format(exploded_cleanup_removed)
+        )
+        expl_annot = annotate_exploded_3d_with_real_tags(
+            doc, view3d_exploded, gathered_elements, code_map
+        )
+        print(
+            "3D EXPLODED -> annotation mode:",
+            expl_annot.get("mode"),
+            "tags={}".format(expl_annot.get("tags")),
+            "text={}".format(expl_annot.get("text")),
+        )
+
+        with Transaction(doc, "Create sheet & place plan (safe)") as t3:
+            t3.Start()
+            sheet = ViewSheet.Create(doc, title_block.Id)
+            sheet.SheetNumber = sheet_code
+            sheet.Name = "Prefab " + sheet_code
+
+            place_prefab_views_on_sheet(
+                doc, sheet, sheet_view, view3d_normal, view3d_exploded
+            )
+            t3.Commit()
+
+        print("SCHEDULES -> creation start")
+        pipe_schedule = None
+        fitting_schedule = None
+        pipe_schedule_placed = False
+        fitting_schedule_placed = False
+        pipe_schedule_mode = "reconstructed"
+        fitting_schedule_mode = "reconstructed"
+        with Transaction(doc, "Create prefab schedules") as t4:
+            t4.Start()
+            try:
+                pipe_schedule, pipe_schedule_mode = create_prefab_schedule(
+                    doc,
+                    "pipe",
+                    sheet_code,
+                    current_prefix,
+                    source_view,
+                    runtime_config,
+                )
+            except Exception as ex:
+                print("SCHEDULES -> pipe schedule build failed:", ex)
+                pipe_schedule = None
+            try:
+                fitting_schedule, fitting_schedule_mode = create_prefab_schedule(
+                    doc,
+                    "fitting",
+                    sheet_code,
+                    current_prefix,
+                    source_view,
+                    runtime_config,
+                )
+            except Exception as ex:
+                print("SCHEDULES -> fitting schedule build failed:", ex)
+                fitting_schedule = None
+            print(
+                "SCHEDULES -> pipe master schedule result: {}".format(
+                    pipe_schedule_mode
+                )
+            )
+            print(
+                "SCHEDULES -> fitting master schedule result: {}".format(
+                    fitting_schedule_mode
+                )
+            )
+            print(
+                "SCHEDULES -> pipe schedule created: {}".format(
+                    "{}/{}".format(pipe_schedule.Name, pipe_schedule.Id.IntegerValue)
+                    if pipe_schedule
+                    else "NONE"
+                )
+            )
+            print(
+                "SCHEDULES -> fitting schedule created: {}".format(
+                    "{}/{}".format(
+                        fitting_schedule.Name, fitting_schedule.Id.IntegerValue
+                    )
+                    if fitting_schedule
+                    else "NONE"
+                )
+            )
+            min_u = sheet.Outline.Min.U
+            max_u = sheet.Outline.Max.U
+            min_v = sheet.Outline.Min.V
+            max_v = sheet.Outline.Max.V
+            width = max_u - min_u
+            height = max_v - min_v
+            if pipe_schedule is not None:
+                pipe_schedule_placed = try_place_schedule_on_sheet(
+                    doc,
+                    sheet,
+                    pipe_schedule,
+                    XYZ(min_u + width * 0.26, min_v + height * 0.33, 0),
+                )
+            if fitting_schedule is not None:
+                fitting_schedule_placed = try_place_schedule_on_sheet(
+                    doc,
+                    sheet,
+                    fitting_schedule,
+                    XYZ(min_u + width * 0.26, min_v + height * 0.16, 0),
+                )
+            t4.Commit()
+        if pipe_schedule is not None:
+            print(
+                "SCHEDULES -> pipe final field list: {}".format(
+                    ", ".join(get_schedule_field_names(pipe_schedule))
+                )
+            )
+            print(
+                "SCHEDULES -> pipe final filters: {}".format(
+                    " | ".join(get_schedule_filter_descriptions(pipe_schedule))
+                )
+            )
+            print(
+                "SCHEDULES -> pipe final sorting/grouping: {}".format(
+                    " | ".join(get_schedule_sort_descriptions(pipe_schedule))
+                )
+            )
+            print(
+                "SCHEDULES -> pipe row count after creation: {}".format(
+                    get_schedule_body_row_count(pipe_schedule)
+                )
+            )
+        if fitting_schedule is not None:
+            print(
+                "SCHEDULES -> fitting final field list: {}".format(
+                    ", ".join(get_schedule_field_names(fitting_schedule))
+                )
+            )
+            print(
+                "SCHEDULES -> fitting final filters: {}".format(
+                    " | ".join(get_schedule_filter_descriptions(fitting_schedule))
+                )
+            )
+            print(
+                "SCHEDULES -> fitting final sorting/grouping: {}".format(
+                    " | ".join(get_schedule_sort_descriptions(fitting_schedule))
+                )
+            )
+            print(
+                "SCHEDULES -> fitting row count after creation: {}".format(
+                    get_schedule_body_row_count(fitting_schedule)
+                )
+            )
+        print(
+            "SCHEDULES -> pipe schedule placed: {}".format(
+                "yes" if pipe_schedule_placed else "no"
+            )
+        )
+        print(
+            "SCHEDULES -> fitting schedule placed: {}".format(
+                "yes" if fitting_schedule_placed else "no"
+            )
+        )
+        print("SCHEDULES -> creation end")
+        final_clone_tag_count_on_sheet = count_pipe_tags_for_scanned_pipes(
+            doc, sheet_view, scanned_pipe_ids
+        )
+        print(
+            "PLAN CLONE -> final clone pipe tag count placed on sheet:",
+            final_clone_tag_count_on_sheet,
+        )
+        MessageBox.Show(
+            "Prefab text and tags were applied to the current scanned view.\nSheet contains the floor plan clone, 3D normal, and 3D exploded views.\nSource view: {}\nSheet view: {}\n3D normal: {}\n3D exploded: {}\n\nSheet: {}\nPipe schedule: {}\nFitting schedule: {}".format(
+                target_view.Name,
+                sheet_view.Name,
+                view3d_normal.Name,
+                view3d_exploded.Name,
+                sheet.SheetNumber,
+                pipe_schedule.Name if pipe_schedule else "failed",
+                fitting_schedule.Name if fitting_schedule else "failed",
+            ),
+            get_runtime_window_title(),
+        )
+        regular_pipe_tag_count = count_pipe_tags_for_scanned_pipes(
+            doc, target_view, scanned_pipe_ids
+        )
+        extra_horizontal_tag_count = count_specific_pipe_tags_in_view(
+            doc, target_view, TAGCFG_EXTRA_H["family"], TAGCFG_EXTRA_H["type"]
+        )
+        print("WINDOW TITLE USED -> {}".format(get_runtime_window_title()))
+        print("FINAL -> floor plan regular pipe tags:", regular_pipe_tag_count)
+        print("FINAL -> floor plan extra horizontal tags:", extra_horizontal_tag_count)
+        print("FINAL -> floor plan extra tags:", extra_horizontal_tag_count)
+        print("FINAL -> 3D normal locked:", normal_locked)
+        print("FINAL -> 3D normal real tags:", normal_annot.get("tags", 0))
+        print("FINAL -> 3D normal extra tags:", normal_annot.get("extra_real", 0))
+        print("FINAL -> 3D exploded locked:", exploded_locked)
+        print("FINAL -> 3D exploded real tags:", expl_annot.get("tags", 0))
+        print("FINAL -> 3D exploded extra tags:", expl_annot.get("extra_real", 0))
+        print(
+            "FINAL -> 3D normal vertical no-leader:",
+            normal_annot.get("vertical_no_leader", 0),
+        )
+        print(
+            "FINAL -> 3D exploded vertical no-leader:",
+            len(expl_annot.get("vertical_tag_ids", [])),
+        )
+        print(
+            "FINAL -> 3D exploded regular leader tags:",
+            expl_annot.get("regular_leader", 0),
+        )
+        print(
+            "FINAL -> 3D exploded extra leader tags:",
+            expl_annot.get("extra_leader", 0),
+        )
+        print("FINAL -> 3D normal excluded NLRS pipes:", excluded_nlrs_normal)
+        print("FINAL -> 3D exploded excluded NLRS pipes:", excluded_nlrs_exploded)
+        print(
+            "FINAL -> 3D normal vertical on-host tags:",
+            normal_annot.get("vertical_onhost", 0),
+        )
+        print(
+            "FINAL -> 3D exploded vertical on-host tags:",
+            expl_annot.get("vertical_onhost", 0),
+        )
+        print(
+            "FINAL -> 3D exploded vertical tag ids:",
+            expl_annot.get("vertical_tag_ids", []),
+        )
+        for dist_mm in getattr(expl_annot, "get", lambda *a, **k: [])(
+            "sample_head_distances", []
+        )[:5]:
+            print("FINAL -> exploded sample tag distance mm:", dist_mm)
+        print("FINAL -> 3D normal filtered pipes:", normal_pipe_count)
+        print("FINAL -> 3D normal filtered fittings:", normal_fitting_count)
+        print("FINAL -> 3D exploded filtered pipes:", exploded_pipe_count)
+        print("FINAL -> 3D exploded filtered fittings:", exploded_fitting_count)
+        print("FINAL -> 3D exploded connected groups:", exploded_group_count)
+    except Exception as ex:
+        TaskDialog.Show(
+            get_runtime_window_title(),
+            "Sheet creation failed, but tags/text are kept.\n\n{}".format(ex),
+        )
 
 
-if not proceed_with_sheet_creation:
-    MessageBox.Show("Tags/text placed. Sheet creation skipped.", "Info")
-else:
-    run_sheet_creation_workflow(
-        code_norm,
-        scanned_ids,
-        scanned_elems,
-        region_min,
-        region_max,
-        boundary_source_view,
+print(
+    "HAS cleanup_stale_prefab_text_notes_only_in_view = {}".format(
+        "cleanup_stale_prefab_text_notes_only_in_view" in globals()
     )
+)
+print(
+    "HAS get_schedule_visible_element_count = {}".format(
+        "get_schedule_visible_element_count" in globals()
+    )
+)
+print("WINDOW TITLE USED -> {}".format(get_runtime_window_title()))
+print("PROFILE PATH -> {}".format(get_run_profile_path()))
+print(
+    "HAS run config dialog = {}".format(
+        "prompt_run_configuration" in globals() and "RunConfigurationForm" in globals()
+    )
+)
+print(
+    "HAS schedule mode selector = {}".format(
+        "RunConfigurationForm" in globals()
+        and hasattr(RunConfigurationForm, "SCHEDULE_MODE_FALLBACK")
+    )
+)
+print(
+    "HAS exploded fitting numbering = {}".format(
+        "annotate_exploded_3d_with_real_tags" in globals()
+    )
+)
+print(
+    "HAS project profile persistence = {}".format(
+        "load_project_profile" in globals()
+        and "save_project_profile" in globals()
+        and "get_project_profile_key" in globals()
+    )
+)
+
+main()
